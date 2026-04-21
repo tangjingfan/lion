@@ -81,37 +81,28 @@ def _semantic_to_rgb(semantic: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def _annotate_semantic(
-    img,
+def _collect_semantic_legend(
     sem_id: np.ndarray,
     sem_name: np.ndarray,
     *,
     min_area_frac: float = 0.005,
-) -> None:
-    """Overlay MP40 category names at the centroid of each category's region.
+) -> list[tuple]:
+    """Return [(name, (r, g, b), (cx_frac, cy_frac)), ...] sorted by area desc.
 
-    Draws in place on ``img`` (already resized to display dimensions).
-    Categories covering less than ``min_area_frac`` of the frame are skipped
-    to avoid clutter.
+    Colors are derived from the same hash used in ``_semantic_to_rgb`` so the
+    legend swatches match the colors drawn on the semantic image. The centroid
+    is returned as fractions of the raw image size so the caller can scale it
+    to the displayed panel dimensions.
     """
-    from PIL import ImageDraw, ImageFont
-
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 13)
-    except Exception:
-        font = ImageFont.load_default()
-
+    sem_id = np.asarray(sem_id, dtype=np.int64)
     raw_h, raw_w = sem_id.shape[:2]
-    scale_x = img.width / raw_w
-    scale_y = img.height / raw_h
     total_px = raw_h * raw_w
     min_area = max(1, int(total_px * min_area_frac))
 
-    unique_ids = np.unique(sem_id)
-    for uid in unique_ids:
-        if uid < 0:
+    entries: list[tuple] = []
+    for uid in np.unique(sem_id):
+        uid_int = int(uid)
+        if uid_int < 0:
             continue
         mask = sem_id == uid
         area = int(mask.sum())
@@ -121,15 +112,47 @@ def _annotate_semantic(
         name = str(sem_name[ys[0], xs[0]])
         if not name:
             continue
-        cx = int(xs.mean() * scale_x)
-        cy = int(ys.mean() * scale_y)
-        # 1-px black outline + white fill for readability over any colour
-        for dx, dy in ((-1, -1), (-1, 1), (1, -1), (1, 1),
-                       (-1, 0), (1, 0), (0, -1), (0, 1)):
-            draw.text((cx + dx, cy + dy), name, fill=(0, 0, 0), font=font,
-                      anchor="mm")
-        draw.text((cx, cy), name, fill=(255, 255, 255), font=font,
-                  anchor="mm")
+        color = (
+            (uid_int * 37) % 255,
+            (uid_int * 17 + 73) % 255,
+            (uid_int * 29 + 151) % 255,
+        )
+        centroid = (float(xs.mean() / raw_w), float(ys.mean() / raw_h))
+        entries.append((name, color, area, centroid))
+
+    entries.sort(key=lambda e: -e[2])
+    return [(name, color, centroid) for name, color, _, centroid in entries]
+
+
+def _mark_semantic_numbers(img, legend: list[tuple]) -> None:
+    """Draw circled index markers on the semantic image at each category's centroid.
+
+    ``legend`` is the output of :func:`_collect_semantic_legend`; the marker
+    number matches the entry's 1-based index in that list.
+    """
+    from PIL import ImageDraw, ImageFont
+
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+
+    r = 11  # circle radius
+    for idx, (_, color, (cx_frac, cy_frac)) in enumerate(legend, start=1):
+        cx = int(cx_frac * img.width)
+        cy = int(cy_frac * img.height)
+        # use white text on dark fill if the category colour is bright, else
+        # dark text on white fill — always contrasting against the tag
+        luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        bg   = (20, 20, 25) if luma > 140 else (240, 240, 240)
+        fg   = (240, 240, 240) if luma > 140 else (20, 20, 25)
+        draw.ellipse(
+            [(cx - r, cy - r), (cx + r, cy + r)],
+            fill=bg, outline=color, width=3,
+        )
+        draw.text((cx, cy), str(idx), fill=fg, font=font, anchor="mm")
 
 
 class EpisodeVisualizer:
@@ -206,13 +229,16 @@ def _compose(
         depth_img = depth_img.resize((obs_w, obs_h), Image.BILINEAR)
         _draw_label(depth_img, "DEPTH")
         extra_panels.append(depth_img)
-    if "semantic" in obs:
-        semantic_img = Image.fromarray(_semantic_to_rgb(obs["semantic"]))
+    sem_src = obs.get("semantic_id", obs.get("semantic"))
+    legend: list[tuple] = []
+    if sem_src is not None:
+        semantic_img = Image.fromarray(_semantic_to_rgb(sem_src))
         semantic_img = semantic_img.resize((obs_w, obs_h), Image.NEAREST)
         if "semantic_id" in obs and "semantic_name" in obs:
-            _annotate_semantic(
-                semantic_img, obs["semantic_id"], obs["semantic_name"]
+            legend = _collect_semantic_legend(
+                obs["semantic_id"], obs["semantic_name"]
             )
+            _mark_semantic_numbers(semantic_img, legend)
         _draw_label(semantic_img, "SEMANTIC")
         extra_panels.append(semantic_img)
 
@@ -267,6 +293,24 @@ def _compose(
     for text, colour, bold in lines:
         draw.text((6, y), text, fill=colour, font=font_bold if bold else font)
         y += line_h
+
+    # ── semantic legend: index + colour swatch + MP40 category name ──
+    if legend:
+        y += line_h // 2
+        draw.text((6, y), "CATEGORIES:", fill=_ACCENT, font=font_bold)
+        y += line_h
+        sw = 12
+        for idx, (name, color, _centroid) in enumerate(legend, start=1):
+            if y + line_h > panel_h - 4:
+                break
+            draw.text((6, y), f"{idx:>2}", fill=_FG, font=font_bold)
+            sw_x = 6 + 18
+            draw.rectangle(
+                [(sw_x, y + 2), (sw_x + sw, y + 2 + sw)],
+                fill=color, outline=(60, 60, 70),
+            )
+            draw.text((sw_x + sw + 6, y), name, fill=_FG, font=font)
+            y += line_h
 
     # ── stitch: [360° panorama | info panel] ─────────────────────────
     canvas = Image.new("RGB", (obs_w + info_w, panel_h))
