@@ -1,0 +1,23 @@
+# ============================================================
+#  LION-Bench — Sub-instruction rewrite config
+# ============================================================
+
+# Gemini model to use
+model: gemini-2.5-flash
+
+# Parallel API workers
+max_workers: 4
+
+# Sampling temperature (lower = more deterministic)
+temperature: 0.2
+
+# Max output tokens per request
+max_tokens: 4096
+
+# Retry settings for failed API calls
+max_retries: 3
+retry_delay: 2.0   # seconds between retries
+
+# Filter out landmarks the LLM deems too ambiguous or unlocatable
+# (e.g. "doorway", "wall", "area").  Set to true to enable filtering.
+filter: true
