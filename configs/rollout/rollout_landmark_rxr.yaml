@@ -78,7 +78,7 @@ agent:
 #    run_name defaults to the split name (e.g. "val_unseen").
 # ============================================================
 output:
-  base_dir: /home/fan/project/lion/results/
+  base_dir: /home/fan/project/LION/results/
   run_name: null          # null → derived from data_path filename (e.g. "val_unseen")
 
   save_json: true         # results.json  (per-episode metrics)

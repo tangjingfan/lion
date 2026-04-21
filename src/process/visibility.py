@@ -154,17 +154,21 @@ class VisibilityChecker:
         backend.enable_physics     = True   # required for cast_ray
 
         if self._rgb_cfg:
+            # Equirectangular rgb_viz: full 360° horizontal, vfov from aspect ratio.
+            viz_w  = self._rgb_cfg["width"]
+            viz_h  = self._rgb_cfg["height"]
+            viz_vfov = viz_h / viz_w * 360.0
             render_cfg = {
                 "height": 0.88,
                 "radius": 0.18,
                 "sensor_height": self._sensor_h,
                 "rgb": {
-                    "width": self._rgb_cfg["width"],
-                    "height": self._rgb_cfg["height"],
+                    "width": viz_w,
+                    "height": viz_h,
                     "hfov": self._rgb_cfg.get("hfov", 90),
-                    "viz_width": self._rgb_cfg["width"],
-                    "viz_height": self._rgb_cfg["height"],
-                    "vfov": self._rgb_cfg["height"] / self._rgb_cfg["width"] * 360.0,
+                    "viz_width": viz_w,
+                    "viz_height": viz_h,
+                    "vfov": viz_vfov,
                 },
                 "depth": {
                     "width": self._rgb_cfg.get("depth_width", self._rgb_cfg["width"]),

@@ -528,9 +528,10 @@ def save_subpath_viz(
     episode_id: int = 0,
     scan: str = "",
 ) -> None:
-    """Render and save a 3-panel PNG for one sub-path visibility check.
+    """Render and save a PNG for one sub-path visibility check.
 
-    Layout: [start→end view | end→start view | info panel]
+    Layout: [start→end view      | info panel]
+            [end→start back-trace|           ]
     """
     from PIL import Image
 
@@ -540,21 +541,22 @@ def save_subpath_viz(
     rgb_e = checker.render_rgb(pos_end,   h_e2s)
 
     img_h, img_w = rgb_s.shape[:2]
-    info_w = max(280, img_w)
+    stacked_h = img_h * 2
+    info_w = max(280, img_w // 2)
 
-    left = Image.fromarray(rgb_s)
-    _draw_label(left, "START  →  END")
-    mid = Image.fromarray(rgb_e)
-    _draw_label(mid, "END  →  START  (back-trace)")
+    top = Image.fromarray(rgb_s)
+    _draw_label(top, "START  →  END")
+    bottom = Image.fromarray(rgb_e)
+    _draw_label(bottom, "END  →  START  (back-trace)")
 
-    info = _make_vis_info_panel(info_w, img_h, result,
+    info = _make_vis_info_panel(info_w, stacked_h, result,
                                 sub_idx, sub_total, sub_instruction,
                                 episode_id, scan)
 
-    canvas = Image.new("RGB", (img_w * 2 + info_w, img_h), color=_VIS_BG)
-    canvas.paste(left, (0, 0))
-    canvas.paste(mid,  (img_w, 0))
-    canvas.paste(info, (img_w * 2, 0))
+    canvas = Image.new("RGB", (img_w + info_w, stacked_h), color=_VIS_BG)
+    canvas.paste(top,    (0, 0))
+    canvas.paste(bottom, (0, img_h))
+    canvas.paste(info,   (img_w, 0))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out_path)
 

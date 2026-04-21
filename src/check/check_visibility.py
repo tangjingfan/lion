@@ -10,7 +10,7 @@ Usage
 
 Output
 ------
-  results/val_unseen/visibility.json
+  results/val_unseen/visibility/visibility.json
   results/val_unseen/visibility/{instruction_id}/sub_NN.png
 """
 
@@ -76,18 +76,19 @@ def main() -> None:
     run_name = (out_cfg.get("run_name")
                 or Path(cfg["dataset"]["data_path"]).stem.replace("LandmarkRxR_", ""))
     out_dir   = base_dir / run_name
-    json_path = out_dir / "visibility.json"
     viz_root  = out_dir / "visibility"
+    json_path = viz_root / "visibility.json"
 
     sensor_h = cfg["env"].get("sensor_height", 1.5)
-    env_rgb  = cfg["env"].get("rgb", {})
     env_depth = cfg["env"].get("depth", {})
+    # Equirectangular panorama: 2:1 aspect (360° × 180°).
+    pano_w   = int(cfg["env"].get("panorama_width", 1024))
+    pano_h   = pano_w // 2
     rgb_cfg  = {
-        "width":  env_rgb.get("width",  256),
-        "height": env_rgb.get("height", env_rgb.get("width", 256)),
-        "hfov":   90,
-        "depth_width": env_depth.get("width", env_rgb.get("width", 256)),
-        "depth_height": env_depth.get("height", env_depth.get("width", 256)),
+        "width":  pano_w,
+        "height": pano_h,
+        "depth_width": env_depth.get("width", pano_w),
+        "depth_height": env_depth.get("height", pano_h),
         "depth_hfov": env_depth.get("hfov", 90),
         "min_depth": env_depth.get("min_depth"),
         "max_depth": env_depth.get("max_depth"),
@@ -122,7 +123,7 @@ def main() -> None:
     print(f"  blocked   : {summary['blocked']}")
     print(f"  obstacles : {dict(cat_counts.most_common(5))}")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
     with open(json_path, "w") as f:
         json.dump({"summary": summary, "episodes": all_results}, f, indent=2)
     print(f"\nJSON  → {json_path}")

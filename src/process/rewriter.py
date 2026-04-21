@@ -112,9 +112,18 @@ For EACH segment produce FOUR fields:
      A single sentence: "Go to the <landmark>."
 
   4. SPATIAL_INSTRUCTION
-     Movement-only description using ONLY:
+     The most concise movement cue needed BEFORE reaching the landmark, built
+     ONLY from these atoms:
        • "Go forward"  •  "Turn left"  •  "Turn right"  •  "Turn around"
-     1–2 short sentences. No compass directions, no landmark names, no "stop".
+     Hard constraints:
+       • At most TWO atoms, separated by ". ". Prefer ONE whenever possible.
+       • No repetition ("Go forward. Go forward." is forbidden — collapse to "Go forward.").
+       • If a turn is present, drop the trailing "Go forward" (the
+         landmark_instruction already implies walking to the landmark).
+         Example: "Turn right. Go forward." → "Turn right."
+       • If the segment is pure straight motion, output exactly "Go forward."
+       • No compass directions, landmark names, quantities, adverbs, or "stop".
+     Each atom must be one of the four listed above — nothing else.
 
   5. KEEP
      true  — the landmark is specific and locatable (a named object, piece of furniture,
@@ -136,14 +145,14 @@ Example:
     "landmark": "teapot on the table",
     "landmark_category": "object",
     "landmark_instruction": "Go to the teapot on the table.",
-    "spatial_instruction": "Turn right. Go forward.",
+    "spatial_instruction": "Turn right.",
     "keep": true
   },
   {
     "landmark": "corridor",
     "landmark_category": "spatial",
     "landmark_instruction": "Go to the corridor.",
-    "spatial_instruction": "Go forward. Turn left.",
+    "spatial_instruction": "Turn left.",
     "keep": true
   },
   {
