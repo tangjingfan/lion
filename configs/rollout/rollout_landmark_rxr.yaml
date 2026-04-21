@@ -1,0 +1,109 @@
+# ============================================================
+#  LION-Bench  —  Landmark-RxR rollout config
+# ============================================================
+
+dataset:
+  # Path to the Landmark-RxR split JSON
+  data_path: /home/fan/project/Landmark-RxR/LandmarkRxR_val_unseen.json
+
+  # Optional: directory of {scan}_connectivity.json files (R2R standard).
+  # When set, positions come from the JSON height field (accurate navmesh level).
+  # Falls back to .house file parsing when a scan's JSON is missing.
+  connectivity_json_dir: /home/fan/project/data/connectivity/
+
+# ============================================================
+#  Scene selection
+#    include: [] means ALL scenes
+#    list specific scan IDs to restrict evaluation to those scenes
+# ============================================================
+scenes:
+  scenes_dir: /home/fan/project/VLN_dataset/data/scene_datasets/
+  include: []     # e.g. [X7HyMhZNoso, S9hNv5qa7GM]
+  exclude: []     # scenes to skip even if in include (or all)
+
+# ============================================================
+#  Episode selection
+#    All filters are ANDed together.
+#    Empty list / null means "no restriction on this axis".
+# ============================================================
+selection:
+  instruction_ids: []   # e.g. [19199, 19200] — int instruction_ids
+  from_yaml: null       # path to a replay YAML; overrides instruction_ids
+  languages: []         # e.g. [en-US] — filter by language field
+  max_episodes: null    # integer cap on total episodes (null = no cap)
+
+# ============================================================
+#  Environment  (Habitat rgbds_agent: RGB + depth + semantic)
+# ============================================================
+env:
+  # Composes Habitat-Lab's built-in:
+  # habitat.simulator.agents.rgbds_agent
+  habitat_config: configs/habitat/rgbds_sim.yaml
+  # Must point at MP3D's scene_dataset_config.json so Habitat-Sim loads the
+  # `<scan>_semantic.ply` meshes — otherwise the semantic sensor returns zeros.
+  scene_dataset: /home/fan/project/VLN_dataset/data/scene_datasets/mp3d/mp3d.scene_dataset_config.json
+
+  # Navmesh agent geometry
+  height: 0.88      # metres
+  radius: 0.18      # metres
+
+  # Camera sensor height above navmesh (agent base).
+  # Matterport panoramas are captured at ~1.5 m above the floor
+  # (connectivity JSON `height` field: mean 1.48 m, range 1.24–1.54 m).
+  sensor_height: 1.5    # metres
+
+  # RGB + Semantic cameras (equirectangular, see configs/habitat/rgbds_sim.yaml).
+  # Single knob: panorama width. Height is auto-derived as width // 2 so the
+  # image stays at the 2:1 aspect that a 360°×180° equirect projection needs.
+  # Depth is disabled — the depth_sensor from rgbds_agent is stripped at runtime.
+  panorama_width: 1024
+
+  # Episode limits
+  max_steps: 500
+  success_distance: 3.0   # metres to goal node to count as success
+
+  # Discrete action sizes (match CL_CoTNav)
+  forward_step_size: 0.25  # metres
+  turn_angle: 15.0         # degrees
+
+# ============================================================
+#  Agent
+# ============================================================
+agent:
+  type: oracle  # "dummy" = random actions | "oracle" = GT geodesic follower
+
+# ============================================================
+#  Output
+#    Final results go to:  {base_dir}/{run_name}/
+#    run_name defaults to the split name (e.g. "val_unseen").
+# ============================================================
+output:
+  base_dir: /home/fan/project/lion/results/
+  run_name: null          # null → derived from data_path filename (e.g. "val_unseen")
+
+  save_json: true         # results.json  (per-episode metrics)
+  save_replay_yaml: true  # replay.yaml   (exact instruction_ids run)
+
+  # ── Rollout visualization ──────────────────────────────────
+  #  Output goes to:  {base_dir}/{run_name}/rollout_viz/{instruction_id}/step_NNNN.png
+  #  Each PNG: RGB observation plus depth/semantic strips | episode info
+  viz:
+    enabled: true         # set to true to enable
+    frame_skip: 1         # save every Nth step (1 = every step)
+    info_width: 300       # info panel width in pixels
+
+# ============================================================
+#  Visibility check  (scripts/visibility.sh)
+# ============================================================
+visibility:
+  viz: true               # render sub-path PNGs alongside the JSON
+
+# ============================================================
+#  Landmark uniqueness check  (scripts/uniqueness.sh)
+# ============================================================
+uniqueness:
+  render_obs: true       # render observation strip at each sub-path end
+  rewritten_path: null    # path to rewrite JSON; null = <out_dir>/sub_instructions_rewritten.json
+  # render resolution (used when render_obs: true)
+  img_width:  320
+  img_height: 512

@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - /habitat: habitat_config_base
+  - /habitat/simulator/sensor_setups@habitat.simulator.agents.rgbds_agent: rgbds_agent
+  # Swap pinhole (CameraSensorSpec) for equirectangular (EquirectangularSensorSpec)
+  # across all three sensors in the rgbds_agent suite. Equirect sensors give a
+  # full 360° panorama; `hfov` / `sensor_subtype` are not used.
+  - override /habitat/simulator/sim_sensors@habitat.simulator.agents.rgbds_agent.sim_sensors.rgb_sensor: equirect_rgb_sensor
+  - override /habitat/simulator/sim_sensors@habitat.simulator.agents.rgbds_agent.sim_sensors.depth_sensor: equirect_depth_sensor
+  - override /habitat/simulator/sim_sensors@habitat.simulator.agents.rgbds_agent.sim_sensors.semantic_sensor: equirect_semantic_sensor
+  - _self_
+
+habitat:
+  simulator:
+    agents_order:
+      - rgbds_agent

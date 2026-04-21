@@ -1,0 +1,38 @@
+# ============================================================
+#  LION-Bench  —  Episode selection / replay file
+#
+#  Use this file to:
+#    1. Replay an exact previous run  (pass via selection.from_yaml)
+#    2. Hand-pick specific episodes   (edit instruction_ids below)
+#    3. Restrict to certain scenes    (edit scans below)
+#
+#  In rollout_landmark_rxr.yaml set:
+#    selection:
+#      from_yaml: /path/to/this/file.yaml
+# ============================================================
+
+# Original split this selection was drawn from
+split: val_unseen
+
+# Scenes to include ([] = same as parent config / no restriction)
+scans: []
+
+# Language filter ([] = no restriction)
+languages: []
+
+# Explicit list of instruction_ids to run.
+# These are integers matching the "instruction_id" field in LandmarkRxR_*.json.
+# Generated automatically by rollout.py when save_replay_yaml: true,
+# or fill in manually for a custom subset.
+instruction_ids:
+  - 19199   # X7HyMhZNoso  en-IN
+  - 80252   # oLBMNvg9in8  en-IN
+  - 1124    # QUCTc6BB5sX  en-IN
+  - 47455   # 2azQ1b91cZZ  en-US
+  - 40079   # TbHJrupSAjP  en-IN
+  - 101     # EU6Fwq7SyZv  en-IN
+  - 9215    # zsNo4HB9uLZ  en-US
+  - 17383   # Z6MFQCViBuw  en-US
+  - 72503   # x8F5xyUWy9e  en-US
+  - 72124   # 8194nk5LbLH  en-IN
+  - 3940    # pLe4wQe7qrG  en-IN

@@ -1,0 +1,31 @@
+# All instruction_ids from scan X7HyMhZNoso in LandmarkRxR_val_unseen
+# 468 instructions across all languages
+# Original split this selection was drawn from
+split: val_unseen
+
+# Scenes to include ([] = same as parent config / no restriction)
+scans: []
+
+# Language filter ([] = no restriction)
+languages: []
+
+instruction_ids:
+  - 274
+  - 275
+  - 556
+  - 678
+  - 836
+  - 837
+  - 881
+  - 882
+  - 1237
+  - 1238
+  - 1239
+  - 1240
+  - 2663
+  - 2664
+  - 3291
+  - 3292
+  - 4932
+  - 4933
+  - 5061
