@@ -1,0 +1,21 @@
+# ============================================================
+#  LION-Bench — Sub-path partition config
+# ============================================================
+#
+# The partition splits each sub-trajectory into a spatial portion
+# (accomplishing the turn / short forward) and a landmark portion
+# (walking to the landmark).
+
+# ── Turn detection (degrees) ───────────────────────────────────
+# Absolute heading change (vs. the sub-path's start heading) that
+# qualifies an edge as the turn edge.
+turn_thresh_deg:   45.0    # used for "turn left" / "turn right"
+around_thresh_deg: 120.0   # used for "turn around"
+
+# ── Forward distance (metres) ──────────────────────────────────
+# Length of the "move forward" segment that defines the spatial portion:
+#   • turn-*   sub-paths: after the detected turn edge, walk forward
+#                         this far before placing the partition.
+#   • forward  sub-paths: partition at the first node whose cumulative
+#                         distance from the start reaches this value.
+forward_distance_m: 1.0
