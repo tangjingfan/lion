@@ -1,0 +1,68 @@
+# ============================================================
+#  LION-Bench — Selection / experiment YAML  (template)
+# ============================================================
+#  Selection YAMLs are the per-experiment customization layer.  The rollout
+#  YAML in configs/rollout/ holds Habitat / simulator infrastructure only;
+#  everything experiment-specific (which episodes, which agent, run name,
+#  viz toggles, filter / visibility / uniqueness tuning, ...) goes here.
+#
+#  Two ways to override cfg:
+#
+#  1) Flat shortcuts — concise aliases for the most common selection-y
+#     keys.  These get remapped to nested cfg locations:
+#
+#        scans            → cfg.scenes.include
+#        languages        → cfg.selection.languages
+#        instruction_ids  → cfg.selection.instruction_ids
+#        sub_paths        → cfg.selection.sub_paths
+#        max_episodes     → cfg.selection.max_episodes
+#        expname          → cfg.output.expname
+#        run_name         → cfg.output.run_name
+#        split            → informational only (not applied)
+#
+#  2) Nested keys — anything else is deep-merged into cfg as-is, so you
+#     can override any rollout cfg field with full nesting.  See examples
+#     below.
+#
+#  Empty list / null values are treated as "no override" — they do NOT
+#  silently clear rollout defaults.
+# ============================================================
+
+# Original split this selection was drawn from (informational).
+split: val_unseen
+
+# Run identity — drives the output folder name.
+#   results/{split}_{expname}/  (when expname is set)
+#   results/{run_name}/         (when run_name is set explicitly)
+expname: example     # e.g. → results/val_unseen_example/
+
+# ── Episode selection ───────────────────────────────────────────
+scans: []                 # restrict to these scan IDs (e.g. [X7HyMhZNoso])
+languages: []             # restrict to these languages (e.g. [en-US])
+instruction_ids: []       # explicit list of instruction_ids
+max_episodes: null        # cap total episodes (null = no cap)
+
+# ── Agent ───────────────────────────────────────────────────────
+agent:
+  type: oracle            # "dummy" | "oracle" (your real agent: subclass BaseAgent)
+
+# ── Rollout output controls ─────────────────────────────────────
+output:
+  save_json:        true  # write per-episode results.json
+  save_replay_yaml: true  # write the exact instruction_ids run
+  viz:
+    enabled: true         # save per-step PNGs under rollout_viz/
+    frame_skip: 1
+    info_width: 300
+    sub_advance_radius: 0.5
+
+# ── Visibility check tuning (scripts/visibility.sh) ─────────────
+visibility:
+  viz: true               # render sub-path PNGs alongside the JSON
+
+# ── Landmark uniqueness check tuning (scripts/uniqueness.sh) ────
+uniqueness:
+  render_obs: true        # render observation strip at each sub-path end
+  rewritten_path: null    # null = <out_dir>/rewrite/sub_instructions_rewritten.json
+  img_width:  320
+  img_height: 512

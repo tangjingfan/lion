@@ -110,24 +110,11 @@ def main() -> None:
         pkl_path=cfg["dataset"].get("connectivity_pkl"),
     )
 
-    sensor_h = cfg["env"].get("sensor_height", 1.5)
-    env_rgb = cfg["env"].get("rgb", {})
-    env_depth = cfg["env"].get("depth", {})
-    # Equirectangular: width = full 360° axis (4× the per-view width), height from vfov
-    viz_vfov = env_rgb.get("vfov", 90)
-    eq_w     = img_w * 4
-    eq_h     = round(eq_w * viz_vfov / 360.0)
-    rgb_cfg  = {
-        "width": eq_w,
-        "height": eq_h,
-        "depth_width": env_depth.get("width", img_w),
-        "depth_height": env_depth.get("height", img_h),
-        "depth_hfov": env_depth.get("hfov", 90),
-        "min_depth": env_depth.get("min_depth"),
-        "max_depth": env_depth.get("max_depth"),
-    } if render_obs else None
-    obs_dir  = obs_root if render_obs else None
-    checker  = VisibilityChecker(scenes_dir, sensor_height=sensor_h, rgb_cfg=rgb_cfg)
+    # VisibilityChecker now follows the rollout's rgbds_agent setup; the sim
+    # always has rgb + semantic equirectangular sensors at eye height.
+    # ``render_obs`` only toggles whether per-sub-path PNGs are saved.
+    obs_dir = obs_root if render_obs else None
+    checker = VisibilityChecker(cfg["env"], scenes_dir)
     t0 = time.time()
 
     all_results = run_landmark_uniqueness_check(

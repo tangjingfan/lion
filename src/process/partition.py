@@ -3,25 +3,35 @@ Sub-path partition: split each sub-trajectory into a spatial portion
 (accomplishing the turn / short forward) and a landmark portion
 (walking to the landmark).
 
-The partition point is a node index ``p`` within the sub-path, such that:
-    spatial_part  = nodes[0 : p+1]
-    landmark_part = nodes[p   : K+1]
-(they share the boundary node ``p``).
+The partition point is a *continuous* position along the sub-path, reported
+via a ceiling node index ``p`` and an interpolation factor ``alpha``:
 
-The rule is driven by the rewritten ``spatial_instruction``:
-  • "Turn left" / "Turn right" — find the first edge whose heading differs
-    from the start heading by more than TURN_THRESH_DEG, mark that as the
-    turn node, then advance forward until the accumulated distance
-    (starting from the turn edge's destination) reaches FORWARD_DISTANCE_M.
-  • "Turn around"              — same but with AROUND_THRESH_DEG.
-  • "Go forward"               — partition at the first node whose
-    cumulative distance from node 0 reaches FORWARD_DISTANCE_M.
+    partition_pos = (1-alpha) * pos[p-1] + alpha * pos[p]
+
+  • ``alpha == 1.0`` ⇒ partition lies exactly on MP3D node ``p``
+  • ``alpha ∈ (0, 1)`` ⇒ partition is a *virtual* point on edge
+    ``(p-1) → p``; its node id is encoded from the 3-D position as
+    ``virt:{x:+.4f}_{y:+.4f}_{z:+.4f}`` (see :func:`_virt_id`).
+
+The rule is driven by the *geometry* of the sub-path (not the instruction
+text — rewritten instructions can be wrong about left/right/forward):
+  • Find the first edge whose heading differs from the start heading by
+    more than TURN_THRESH_DEG — classify as ``around`` if the magnitude
+    also exceeds AROUND_THRESH_DEG, else ``left``/``right`` by sign.
+  • If such a turn edge exists, advance forward from its destination
+    until the accumulated distance reaches FORWARD_DISTANCE_M.
+  • Otherwise treat the sub-path as pure forward and partition at the
+    point whose cumulative distance from node 0 equals FORWARD_DISTANCE_M.
+
+The ``spatial_instruction`` text is still parsed (``instruction_kind``)
+and compared against the geometric ``kind`` (``direction_mismatch`` flag)
+so dataset-level instruction errors surface in the output.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -45,6 +55,7 @@ def signed_angle_diff(a: float, b: float) -> float:
 
 
 def _classify_spatial(spatial: str) -> str:
+    """Parse the kind {around|left|right|forward} from the instruction text."""
     s = (spatial or "").lower()
     if "turn around" in s:
         return "around"
@@ -57,6 +68,36 @@ def _classify_spatial(spatial: str) -> str:
     return "forward"  # unknown → treat as forward
 
 
+_KIND_TO_INSTRUCTION = {
+    "forward": "Go forward.",
+    "left":    "Turn left.",
+    "right":   "Turn right.",
+    "around":  "Turn around.",
+}
+
+
+def _classify_by_geometry(
+    turn_deltas: Sequence[float],
+    turn_thresh_deg: float,
+    around_thresh_deg: float,
+) -> Tuple[str, Optional[int]]:
+    """Infer ``(kind, turn_k)`` from edge-heading deltas.
+
+    Returns the first edge whose ``|Δ|`` exceeds ``turn_thresh_deg``, and
+    the kind inferred from that edge's signed delta (positive ⇒ right,
+    negative ⇒ left, ``|Δ| > around_thresh_deg`` ⇒ around).  If no such
+    edge exists, returns ``("forward", None)``.
+    """
+    turn_rad   = math.radians(turn_thresh_deg)
+    around_rad = math.radians(around_thresh_deg)
+    for k, d in enumerate(turn_deltas):
+        if abs(d) > turn_rad:
+            if abs(d) > around_rad:
+                return "around", k
+            return ("right" if d > 0 else "left"), k
+    return "forward", None
+
+
 def _edge_lengths(positions: Sequence[np.ndarray]) -> List[float]:
     """Euclidean length of each consecutive edge (length K = len(positions)-1)."""
     return [
@@ -65,24 +106,50 @@ def _edge_lengths(positions: Sequence[np.ndarray]) -> List[float]:
     ]
 
 
-def _forward_partition_from(
+def _virt_id(pos: np.ndarray) -> str:
+    """Encode a 3-D position as a virtual node id.  The ``virt:`` prefix
+    and the ``_``/``:`` separators cannot appear in MP3D hex node ids, so
+    these never collide with real nodes in ``scan_db``.
+    """
+    return "virt:{:+.4f}_{:+.4f}_{:+.4f}".format(
+        float(pos[0]), float(pos[1]), float(pos[2]),
+    )
+
+
+def _forward_partition_point_from(
     start_idx: int,
+    positions: Sequence[np.ndarray],
     edge_lengths: Sequence[float],
     distance_m: float,
-) -> int:
-    """Smallest index ``p ≥ start_idx`` such that cumulative edge length
-    from ``start_idx`` to ``p`` reaches ``distance_m``.  Clamps to K when
-    the remaining sub-path is shorter than ``distance_m``.
+) -> Tuple[int, float, np.ndarray]:
+    """Walk ``distance_m`` forward from ``positions[start_idx]`` along the
+    sub-path edges; return ``(partition_idx, alpha, pos)``:
+
+      • ``partition_idx`` — smallest node index whose cumulative distance
+        from ``start_idx`` reaches ``distance_m``.  Clamps to ``K`` when
+        the remaining path is shorter than ``distance_m``.
+      • ``alpha ∈ [0, 1]`` — fraction along edge ``(partition_idx-1) → partition_idx``.
+        1.0 means partition sits exactly on node ``partition_idx``; values
+        in (0, 1) mean partition is strictly between two nodes (virtual).
+      • ``pos`` — interpolated 3-D position of the partition point.
     """
     K = len(edge_lengths)
-    if start_idx >= K:
-        return K
+    if start_idx >= K or distance_m <= 0.0:
+        # No room to walk forward, or zero distance requested.
+        return start_idx, 1.0, np.asarray(positions[start_idx], dtype=float).copy()
+
     acc = 0.0
     for k in range(start_idx, K):
-        acc += edge_lengths[k]
-        if acc >= distance_m:
-            return k + 1
-    return K
+        edge_len = edge_lengths[k]
+        if acc + edge_len >= distance_m:
+            remaining = distance_m - acc
+            alpha = remaining / edge_len if edge_len > 0.0 else 1.0
+            pos = positions[k] + alpha * (positions[k + 1] - positions[k])
+            return k + 1, float(alpha), np.asarray(pos, dtype=float)
+        acc += edge_len
+
+    # Sub-path shorter than requested distance — clamp to last node.
+    return K, 1.0, np.asarray(positions[K], dtype=float).copy()
 
 
 def partition_subpath(
@@ -98,26 +165,40 @@ def partition_subpath(
     Returns
     -------
     dict with:
-      partition_idx  int       — node index in [0, K]
-      turn_node_idx  int|None  — where the turn was detected (None for "forward")
-      kind           str       — "left" | "right" | "around" | "forward"
-      edge_headings  list[float]
-      edge_lengths   list[float] — Euclidean length (m) of each edge
-      turn_deltas    list[float] — signed diff of each edge heading vs start
-      reason         str        — human-readable explanation
+      partition_idx       int          — ceiling node index in [0, K]
+      partition_alpha     float        — fraction along edge (p-1)→p, in [0, 1]
+      partition_pos       list[float]  — interpolated 3-D position [x, y, z]
+      turn_node_idx       int|None     — edge where the turn was detected
+      kind                str          — geometric kind: left|right|around|forward
+      instruction_kind    str          — kind parsed from the instruction text
+      direction_mismatch  bool         — True when the two disagree
+      geometric_spatial_instruction
+                          str          — authoritative spatial text derived from
+                                         geometry: "Go forward." / "Turn left."
+                                         / "Turn right." / "Turn around."
+      edge_headings       list[float]
+      edge_lengths        list[float]  — Euclidean length (m) of each edge
+      turn_deltas         list[float]  — signed diff of each edge heading vs start
+      reason              str          — human-readable explanation
     """
     K = len(positions) - 1
-    kind = _classify_spatial(spatial)
+    instruction_kind = _classify_spatial(spatial)
 
     if K <= 0:
+        pos0 = np.asarray(positions[0], dtype=float).copy() if positions else np.zeros(3)
         return {
-            "partition_idx": 0,
-            "turn_node_idx": None,
-            "kind":          kind,
-            "edge_headings": [],
-            "edge_lengths":  [],
-            "turn_deltas":   [],
-            "reason":        "degenerate sub-path (<2 nodes)",
+            "partition_idx":      0,
+            "partition_alpha":    1.0,
+            "partition_pos":      pos0.tolist(),
+            "turn_node_idx":      None,
+            "kind":               "forward",
+            "instruction_kind":   instruction_kind,
+            "direction_mismatch": False,  # no geometry to compare against
+            "geometric_spatial_instruction": _KIND_TO_INSTRUCTION["forward"],
+            "edge_headings":      [],
+            "edge_lengths":       [],
+            "turn_deltas":        [],
+            "reason":             "degenerate sub-path (<2 nodes)",
         }
 
     edge_headings: List[float] = [
@@ -128,53 +209,51 @@ def partition_subpath(
         signed_angle_diff(h, start_heading) for h in edge_headings
     ]
 
-    if kind == "forward":
-        p = _forward_partition_from(0, edge_lengths, forward_distance_m)
-        return {
-            "partition_idx": p,
-            "turn_node_idx": None,
-            "kind":          kind,
-            "edge_headings": edge_headings,
-            "edge_lengths":  edge_lengths,
-            "turn_deltas":   turn_deltas,
-            "reason":        f"forward {forward_distance_m:.2f} m → p={p}",
-        }
-
-    thresh_rad = math.radians(
-        around_thresh_deg if kind == "around" else turn_thresh_deg
+    # Authoritative classification comes from geometry, not the instruction.
+    kind, turn_k = _classify_by_geometry(
+        turn_deltas, turn_thresh_deg, around_thresh_deg,
     )
-    turn_k: Optional[int] = None
-    for k, d in enumerate(turn_deltas):
-        if abs(d) > thresh_rad:
-            turn_k = k
-            break
+    direction_mismatch = (kind != instruction_kind)
 
     if turn_k is None:
-        # No clear turn detected; fall back to walking forward from start.
-        p = _forward_partition_from(0, edge_lengths, forward_distance_m)
-        return {
-            "partition_idx": p,
-            "turn_node_idx": None,
-            "kind":          kind,
-            "edge_headings": edge_headings,
-            "edge_lengths":  edge_lengths,
-            "turn_deltas":   turn_deltas,
-            "reason":        f"no edge exceeded {math.degrees(thresh_rad):.0f}°; "
-                             f"fell back to forward {forward_distance_m:.2f} m → p={p}",
-        }
+        # No turn in geometry → plain forward rule from node 0.
+        start_idx = 0
+        base_reason = f"no edge exceeded {turn_thresh_deg:.0f}°; " \
+                      f"forward {forward_distance_m:.2f} m"
+    else:
+        # Walk forward from the turn edge's destination node.
+        start_idx = turn_k + 1
+        base_reason = (
+            f"turn at edge {turn_k} "
+            f"(Δ={math.degrees(turn_deltas[turn_k]):+.0f}° ⇒ {kind}); "
+            f"+{forward_distance_m:.2f} m forward"
+        )
 
-    # Start accumulating forward distance from the turn edge's destination node.
-    p = _forward_partition_from(turn_k + 1, edge_lengths, forward_distance_m)
+    p, alpha, pos = _forward_partition_point_from(
+        start_idx, positions, edge_lengths, forward_distance_m,
+    )
+    reason = f"{base_reason} → p={p}, α={alpha:.2f}"
+    if direction_mismatch:
+        reason += f"  ⚠ instruction_kind={instruction_kind}"
+
+    turn_delta_deg = (
+        float(math.degrees(turn_deltas[turn_k])) if turn_k is not None else None
+    )
+
     return {
-        "partition_idx": p,
-        "turn_node_idx": turn_k,
-        "kind":          kind,
-        "edge_headings": edge_headings,
-        "edge_lengths":  edge_lengths,
-        "turn_deltas":   turn_deltas,
-        "reason":        f"turn at edge {turn_k} "
-                         f"(Δ={math.degrees(turn_deltas[turn_k]):+.0f}°); "
-                         f"+{forward_distance_m:.2f} m forward → p={p}",
+        "partition_idx":      p,
+        "partition_alpha":    alpha,
+        "partition_pos":      [float(pos[0]), float(pos[1]), float(pos[2])],
+        "turn_node_idx":      turn_k,
+        "turn_delta_deg":     turn_delta_deg,
+        "kind":               kind,
+        "instruction_kind":   instruction_kind,
+        "direction_mismatch": direction_mismatch,
+        "geometric_spatial_instruction": _KIND_TO_INSTRUCTION[kind],
+        "edge_headings":      edge_headings,
+        "edge_lengths":       edge_lengths,
+        "turn_deltas":        turn_deltas,
+        "reason":             reason,
     }
 
 
@@ -241,9 +320,26 @@ def partition_episode(
             around_thresh_deg=around_thresh_deg,
             forward_distance_m=forward_distance_m,
         )
+
+        # Build the two path segments; they share the partition point
+        # (a real MP3D node when alpha==1.0, else a virtual "virt:..." node).
+        p     = out["partition_idx"]
+        alpha = out["partition_alpha"]
+        if alpha >= 1.0 - 1e-9 or p == 0:
+            out["partition_on_edge"] = None
+            spatial_seg  = list(sub_nodes[: p + 1])
+            landmark_seg = list(sub_nodes[p:])
+        else:
+            vid = _virt_id(np.asarray(out["partition_pos"]))
+            out["partition_on_edge"] = [sub_nodes[p - 1], sub_nodes[p]]
+            spatial_seg  = list(sub_nodes[:p]) + [vid]
+            landmark_seg = [vid] + list(sub_nodes[p:])
+
         out.update({
             "sub_idx":             i,
             "sub_path_nodes":      list(sub_nodes),
+            "spatial_path":        spatial_seg,
+            "landmark_path":       landmark_seg,
             "start_heading":       start_heading,
             "spatial_instruction": spatial,
             "landmark":            rw.get("landmark", ""),

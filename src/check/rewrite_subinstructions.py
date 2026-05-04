@@ -28,6 +28,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from src.check._filter_utils import get_run_dir, resolve_selection
 from src.dataset.landmark_rxr import episodes_from_config
 from src.process.rewriter import make_client, run_rewriter
 
@@ -73,8 +74,7 @@ def main() -> None:
         print("ERROR: Provide --api_key or set GEMINI_API_KEY environment variable.")
         sys.exit(1)
 
-    if args.from_yaml:
-        cfg.setdefault("selection", {})["from_yaml"] = args.from_yaml
+    resolve_selection(cfg, args.from_yaml)
 
     episodes = episodes_from_config(cfg)
     if not episodes:
@@ -82,11 +82,7 @@ def main() -> None:
         return
     print(f"Rewriting {len(episodes)} episode(s) | model={model} | workers={max_workers} | filter={filter_ambiguous}")
 
-    out_cfg      = cfg.get("output", {})
-    base_dir     = Path(out_cfg.get("base_dir", "results")).expanduser()
-    run_name     = (out_cfg.get("run_name")
-                    or Path(cfg["dataset"]["data_path"]).stem.replace("LandmarkRxR_", ""))
-    out_dir      = base_dir / run_name / "rewrite"
+    out_dir      = get_run_dir(cfg) / "rewrite"
     suffix       = "_filtered" if filter_ambiguous else ""
     json_path    = out_dir / f"sub_instructions_rewritten{suffix}.json"
     mapping_path = out_dir / f"landmark_mapping{suffix}.json"

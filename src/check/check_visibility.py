@@ -79,22 +79,13 @@ def main() -> None:
     viz_root  = out_dir / "visibility"
     json_path = viz_root / "visibility.json"
 
-    sensor_h = cfg["env"].get("sensor_height", 1.5)
-    env_depth = cfg["env"].get("depth", {})
-    # Equirectangular panorama: 2:1 aspect (360° × 180°).
-    pano_w   = int(cfg["env"].get("panorama_width", 1024))
-    pano_h   = pano_w // 2
-    rgb_cfg  = {
-        "width":  pano_w,
-        "height": pano_h,
-        "depth_width": env_depth.get("width", pano_w),
-        "depth_height": env_depth.get("height", pano_h),
-        "depth_hfov": env_depth.get("hfov", 90),
-        "min_depth": env_depth.get("min_depth"),
-        "max_depth": env_depth.get("max_depth"),
-    } if do_viz else None
+    # VisibilityChecker now uses Habitat-Lab's rgbds_agent (same as rollout),
+    # so it always has rgb + semantic equirectangular sensors available.
+    # ``do_viz`` only controls whether per-sub-path PNGs are saved.
+    pano_w  = int(cfg["env"].get("panorama_width", 1024))
+    rgb_cfg = {"width": pano_w, "height": pano_w // 2} if do_viz else None
 
-    checker = VisibilityChecker(scenes_dir, sensor_height=sensor_h, rgb_cfg=rgb_cfg)
+    checker = VisibilityChecker(cfg["env"], scenes_dir)
     t0 = time.time()
 
     all_results = run_visibility_check(

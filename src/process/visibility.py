@@ -1,39 +1,72 @@
 """
 Sub-path visibility checker for Landmark-RxR.
 
-For each sub-path (start_node → end_node), back-traces a ray from the
-end-point's eye position toward the start-point and records whether any
-obstacle blocks the line of sight.
+Uses Habitat-Lab's ``rgbds_agent`` (same setup as rollout) so visibility /
+uniqueness checks render exactly what the rollout agent perceives — RGB and
+semantic equirectangular panoramas at eye height.  Two complementary
+strategies are exposed:
 
-Requires habitat-sim built with Bullet physics (--bullet).
-
-Usage
------
-    python src/check/check_visibility.py \
-        --config configs/rollout/rollout_landmark_rxr.yaml
+  • ``check`` / ``check_landmark_uniqueness`` — raycast-based line-of-sight
+    and AABB visibility (precise, slower).
+  • ``check_landmark_visibility_semantic`` — counts distinct instance ids
+    of the landmark category in the semantic panorama (fast, matches what
+    the agent's semantic sensor would actually report).
 
 API
 ---
     from src.process.visibility import VisibilityChecker
 
-    checker = VisibilityChecker(scenes_dir, sensor_height=1.5,
-                                rgb_cfg={"width": 256, "height": 256, "hfov": 90})
+    checker = VisibilityChecker(env_cfg, scenes_dir)
     checker.load_scene(scene_file)
-    result = checker.check(pos_a, pos_b)          # navmesh-level positions
-    checker.save_subpath_viz(pos_start, pos_end,  # render + compose PNG
-                             result, out_path, sub_instruction="...")
+    los  = checker.check(pos_a, pos_b)              # raycast line-of-sight
+    vis  = checker.check_landmark_visibility_semantic(pos_end, "bath",
+                                                       ["bath"])
     checker.close()
 """
 
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from src.env.rgbd_agent import make_rgbd_agent_config
+
+# ── Habitat-Lab bootstrapping ────────────────────────────────────────────
+def _ensure_habitat_lab_importable() -> None:
+    """Add the vendored habitat-lab/ to sys.path if not already importable."""
+    try:
+        import habitat  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    habitat_lab_src = (
+        Path(__file__).resolve().parents[2]
+        / "external" / "habitat-lab" / "habitat-lab"
+    )
+    if habitat_lab_src.exists():
+        sys.path.insert(0, str(habitat_lab_src))
+
+
+def _configure_sensor(
+    sensor_cfg: Any,
+    overrides:  Dict[str, Any],
+    sensor_height: float,
+) -> None:
+    """Patch a Habitat-Lab sensor config in place: position + size/fov fields."""
+    sensor_cfg.position = overrides.get("position", [0.0, sensor_height, 0.0])
+    for key in (
+        "width", "height", "hfov", "orientation",
+        "min_depth", "max_depth", "normalize_depth", "sensor_subtype",
+    ):
+        if key in overrides and hasattr(sensor_cfg, key):
+            value = overrides[key]
+            if key in {"width", "height", "hfov"}:
+                value = int(round(value))
+            setattr(sensor_cfg, key, value)
 
 # MP3D .house file room-type code → human-readable name
 _MP3D_ROOM_TYPES: Dict[str, str] = {
@@ -106,41 +139,52 @@ def match_room(landmark: str, room_list: List[str]) -> Optional[str]:
 
 
 class VisibilityChecker:
-    """Habitat-sim wrapper for eye-level raycasting and optional RGB rendering.
+    """Habitat-Lab wrapper that mirrors rollout's ``rgbds_agent`` setup.
+
+    The simulator is created the same way as :class:`HabitatEnv`: load the
+    same ``rgbds_sim.yaml``, strip the depth sensor, configure RGB and
+    semantic equirectangular sensors at eye height.  Physics is enabled so
+    raycasts (``check`` and ``check_landmark_uniqueness``) still work.
 
     Parameters
     ----------
+    env_cfg:
+        The ``env`` block of the rollout YAML (``cfg["env"]``).  Provides
+        ``habitat_config``, ``scene_dataset``, ``height``/``radius``,
+        ``sensor_height``, ``panorama_width``, ``forward_step_size``,
+        ``turn_angle``.
     scenes_dir:
-        Root of the scene_datasets directory (same as rollout config).
-    sensor_height:
-        Camera height above navmesh in metres.
-    rgb_cfg:
-        Optional dict with keys ``width``, ``height``, ``hfov`` (degrees).
-        When provided the sim includes an RGB-D rendering agent so that
-        render_observation(), render_rgb(), and save_subpath_viz() can be
-        called.
+        Root of the scene_datasets directory (``cfg["scenes"]["scenes_dir"]``).
     """
 
     def __init__(
         self,
+        env_cfg:    Dict[str, Any],
         scenes_dir: str,
-        sensor_height: float = 1.5,
-        rgb_cfg: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self._scenes_dir = scenes_dir.rstrip("/")
-        self._sensor_h   = sensor_height
-        self._rgb_cfg    = rgb_cfg
-        self._sim        = None
-        self._scene_file = None
+        self._env_cfg     = env_cfg
+        self._scenes_dir  = scenes_dir.rstrip("/")
+        self._sensor_h    = float(env_cfg.get("sensor_height", 1.5))
+        self._sim         = None
+        self._scene_file  = None
+        # Instance-id → MP40 category id / name lookup tables (rebuilt per scene).
+        self._sem_id_map:    Optional[np.ndarray] = None
+        self._sem_name_map:  Optional[np.ndarray] = None
+        # name (lower) → cat_id index for fast pixel-mask lookup.
+        self._name_to_cat_id: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     #  Lifecycle
     # ------------------------------------------------------------------
 
     def load_scene(self, scene_file: str) -> None:
-        """(Re-)initialise the simulator for a new scene."""
-        import habitat_sim
+        """(Re-)initialise the Habitat-Lab simulator for a new scene.
 
+        Mirrors :meth:`HabitatEnv._init_sim` step-for-step: load
+        ``rgbds_sim.yaml``, set scene + dataset, strip depth, resize the
+        rgb/semantic sensors to a 360° panorama at ``sensor_height``, and
+        enable physics so cast_ray works.
+        """
         full_path = f"{self._scenes_dir}/{scene_file}"
         if self._scene_file == full_path and self._sim is not None:
             return
@@ -148,58 +192,106 @@ class VisibilityChecker:
         if self._sim is not None:
             self._sim.close()
 
-        backend = habitat_sim.SimulatorConfiguration()
-        backend.scene_id           = full_path
-        backend.load_semantic_mesh = True
-        backend.enable_physics     = True   # required for cast_ray
+        _ensure_habitat_lab_importable()
+        from habitat.config import read_write
+        from habitat.config.default import get_config
+        from habitat.sims import make_sim
 
-        if self._rgb_cfg:
-            # Equirectangular rgb_viz: full 360° horizontal, vfov from aspect ratio.
-            viz_w  = self._rgb_cfg["width"]
-            viz_h  = self._rgb_cfg["height"]
-            viz_vfov = viz_h / viz_w * 360.0
-            render_cfg = {
-                "height": 0.88,
-                "radius": 0.18,
-                "sensor_height": self._sensor_h,
-                "rgb": {
-                    "width": viz_w,
-                    "height": viz_h,
-                    "hfov": self._rgb_cfg.get("hfov", 90),
-                    "viz_width": viz_w,
-                    "viz_height": viz_h,
-                    "vfov": viz_vfov,
-                },
-                "depth": {
-                    "width": self._rgb_cfg.get("depth_width", self._rgb_cfg["width"]),
-                    "height": self._rgb_cfg.get("depth_height", self._rgb_cfg["height"]),
-                    "hfov": self._rgb_cfg.get("depth_hfov", self._rgb_cfg.get("hfov", 90)),
-                    "min_depth": self._rgb_cfg.get("min_depth"),
-                    "max_depth": self._rgb_cfg.get("max_depth"),
-                },
-            }
-            agent_cfg = make_rgbd_agent_config(
-                habitat_sim,
-                render_cfg,
-                include_rgb=False,
-                include_rgb_viz=True,
-                include_depth=True,
-                include_actions=False,
-            )
-        else:
-            agent_cfg = habitat_sim.agent.AgentConfiguration()
-            agent_cfg.sensor_specifications = []
+        env_cfg = self._env_cfg
+        config_path = env_cfg.get("habitat_config",
+                                  "configs/habitat/rgbds_sim.yaml")
+        cfg     = get_config(config_path)
+        sim_cfg = cfg.habitat.simulator
 
-        self._sim        = habitat_sim.Simulator(
-            habitat_sim.Configuration(backend, [agent_cfg])
-        )
+        with read_write(sim_cfg):
+            sim_cfg.scene             = full_path
+            sim_cfg.scene_dataset     = env_cfg.get("scene_dataset", "default")
+            sim_cfg.forward_step_size = env_cfg.get("forward_step_size", 0.25)
+            sim_cfg.turn_angle        = int(round(env_cfg.get("turn_angle", 15.0)))
+            sim_cfg.default_agent_id  = 0
+            sim_cfg.agents_order      = ["rgbds_agent"]
+            # Required so cast_ray returns hit results below.
+            sim_cfg.enable_physics    = True
+
+            agent_cfg = sim_cfg.agents["rgbds_agent"]
+            agent_cfg.height = env_cfg.get("height", 0.88)
+            agent_cfg.radius = env_cfg.get("radius", 0.18)
+
+            # Depth is unused — strip it so Habitat-Sim doesn't allocate a
+            # depth render target.
+            if "depth_sensor" in agent_cfg.sim_sensors:
+                del agent_cfg.sim_sensors.depth_sensor
+
+            pano_w = int(env_cfg.get("panorama_width", 1024))
+            pano_h = pano_w // 2  # equirect: 2:1 aspect
+            pano_overrides = {"width": pano_w, "height": pano_h}
+
+            _configure_sensor(agent_cfg.sim_sensors.rgb_sensor,
+                              pano_overrides, self._sensor_h)
+            _configure_sensor(agent_cfg.sim_sensors.semantic_sensor,
+                              pano_overrides, self._sensor_h)
+
+        self._sim        = make_sim(sim_cfg.type, config=sim_cfg)
         self._scene_file = full_path
+        self._build_semantic_mapping()
 
     def close(self) -> None:
         if self._sim is not None:
             self._sim.close()
-            self._sim        = None
-            self._scene_file = None
+            self._sim          = None
+            self._scene_file   = None
+            self._sem_id_map   = None
+            self._sem_name_map = None
+            self._name_to_cat_id = {}
+
+    # ------------------------------------------------------------------
+    #  Semantic mapping
+    # ------------------------------------------------------------------
+
+    def _build_semantic_mapping(self) -> None:
+        """Cache instance-id → (category_id, category_name) tables.
+
+        Mirrors :meth:`HabitatEnv._build_semantic_mapping` so that
+        Habitat-Sim's raw semantic sensor (instance ids) can be translated
+        to MP40 category names per pixel.
+        """
+        self._sem_id_map     = None
+        self._sem_name_map   = None
+        self._name_to_cat_id = {}
+        if self._sim is None:
+            return
+
+        scene = self._sim.semantic_annotations()
+        if scene is None or not getattr(scene, "objects", None):
+            return
+
+        pairs: List[tuple] = []
+        for obj in scene.objects:
+            if obj is None:
+                continue
+            try:
+                inst_id = int(obj.id.split("_")[-1])
+            except (AttributeError, ValueError):
+                continue
+            cat = obj.category
+            cat_id   = cat.index()
+            cat_name = cat.name()
+            pairs.append((inst_id, cat_id, cat_name))
+            if cat_name:
+                self._name_to_cat_id[cat_name.lower()] = cat_id
+
+        if not pairs:
+            return
+
+        max_id = max(p[0] for p in pairs)
+        id_map   = np.full(max_id + 1, -1, dtype=np.int32)
+        name_map = np.full(max_id + 1, "", dtype=object)
+        for inst_id, cat_id, cat_name in pairs:
+            id_map[inst_id]   = cat_id
+            name_map[inst_id] = cat_name
+
+        self._sem_id_map   = id_map
+        self._sem_name_map = name_map
 
     # ------------------------------------------------------------------
     #  Core visibility check
@@ -376,6 +468,147 @@ class VisibilityChecker:
         }
 
     # ------------------------------------------------------------------
+    #  Semantic-image visibility (panorama-based, rgbds_agent native)
+    # ------------------------------------------------------------------
+
+    def check_landmark_visibility_semantic(
+        self,
+        pos:             np.ndarray,
+        landmark:        str,
+        semantic_labels: Optional[List[str]] = None,
+        heading:         float = 0.0,
+        min_pixel_count: int   = 50,
+    ) -> Dict[str, Any]:
+        """Render a 360° semantic panorama at *pos* and count distinct
+        instance ids whose MP40 category matches the landmark.
+
+        Faster and more aligned with what the rollout agent perceives than
+        the raycast-based :meth:`check_landmark_uniqueness`: a single render
+        replaces N raycasts.  Heading mostly only changes which side of the
+        panorama the landmark falls on, so any heading works for visibility
+        / counting (default 0.0).
+
+        Matching strategy:
+          1. Exact category match against each label in *semantic_labels*.
+          2. Substring match on the raw *landmark* phrase as a fallback.
+
+        Instance ids whose pixel count is below ``min_pixel_count`` are
+        treated as noise (e.g. a sliver visible through a doorway) and
+        excluded from the visibility count.
+
+        Returns
+        -------
+        dict with:
+          visible           bool         — at least one instance survives
+          n_instances       int          — distinct instances after filtering
+          pixel_count       int          — total matching pixels
+          pixel_fraction    float        — pixel_count / total
+          matched_category  str | None
+          matched_by        "semantic_label" | "phrase_fallback" | None
+          instances         list[dict]   — [{"id": int, "n_pixels": int}, ...]
+        """
+        if self._sim is None:
+            raise RuntimeError("Call load_scene() before check_landmark_visibility_semantic().")
+        if self._sem_id_map is None or not self._name_to_cat_id:
+            return {
+                "visible":          False,
+                "n_instances":      0,
+                "pixel_count":      0,
+                "pixel_fraction":   0.0,
+                "matched_category": None,
+                "matched_by":       None,
+                "instances":        [],
+                "note":             "semantic mapping unavailable",
+            }
+
+        # ── 1. Pick the target MP40 category id ─────────────────────────
+        target_cat_id: int = -1
+        matched_cat:   Optional[str] = None
+        matched_by:    Optional[str] = None
+
+        for label in (semantic_labels or []):
+            if not label:
+                continue
+            key = label.lower().strip()
+            if key in ("unknown", ""):
+                continue
+            if key in self._name_to_cat_id:
+                target_cat_id = self._name_to_cat_id[key]
+                matched_cat   = key
+                matched_by    = "semantic_label"
+                break
+            # Loose substring match against scene category names.
+            for cat_name, cat_id in self._name_to_cat_id.items():
+                if key in cat_name or cat_name in key:
+                    target_cat_id = cat_id
+                    matched_cat   = cat_name
+                    matched_by    = "semantic_label"
+                    break
+            if target_cat_id >= 0:
+                break
+
+        if target_cat_id < 0:
+            lm_lower = landmark.lower().strip()
+            for cat_name, cat_id in self._name_to_cat_id.items():
+                if not cat_name:
+                    continue
+                if cat_name in lm_lower or lm_lower in cat_name:
+                    target_cat_id = cat_id
+                    matched_cat   = cat_name
+                    matched_by    = "phrase_fallback"
+                    break
+
+        if target_cat_id < 0:
+            return {
+                "visible":          False,
+                "n_instances":      0,
+                "pixel_count":      0,
+                "pixel_fraction":   0.0,
+                "matched_category": None,
+                "matched_by":       None,
+                "instances":        [],
+                "note":             f"no MP40 category matches '{landmark}'",
+            }
+
+        # ── 2. Render + map instance ids → category ids per pixel ───────
+        sem = self.render_semantic(pos, heading)             # (H, W) int32
+        sem_clip = np.clip(sem, 0, len(self._sem_id_map) - 1)
+        cat_image = self._sem_id_map[sem_clip]               # (H, W) cat ids
+
+        target_mask = (cat_image == target_cat_id)
+        target_pixels = int(target_mask.sum())
+        if target_pixels == 0:
+            return {
+                "visible":          False,
+                "n_instances":      0,
+                "pixel_count":      0,
+                "pixel_fraction":   0.0,
+                "matched_category": matched_cat,
+                "matched_by":       matched_by,
+                "instances":        [],
+            }
+
+        # ── 3. Count distinct instance ids; drop tiny ones as noise ─────
+        instance_ids, counts = np.unique(sem[target_mask], return_counts=True)
+        instances: List[Dict[str, int]] = []
+        kept_pixels = 0
+        for iid, n in zip(instance_ids, counts):
+            n = int(n)
+            if n >= min_pixel_count:
+                instances.append({"id": int(iid), "n_pixels": n})
+                kept_pixels += n
+
+        return {
+            "visible":          len(instances) > 0,
+            "n_instances":      len(instances),
+            "pixel_count":      kept_pixels,
+            "pixel_fraction":   float(kept_pixels) / float(sem.size),
+            "matched_category": matched_cat,
+            "matched_by":       matched_by,
+            "instances":        instances,
+        }
+
+    # ------------------------------------------------------------------
     #  Episode-level helper
     # ------------------------------------------------------------------
 
@@ -421,7 +654,7 @@ class VisibilityChecker:
     # ------------------------------------------------------------------
 
     def render_observation(self, pos: np.ndarray, heading: float) -> Dict[str, np.ndarray]:
-        """Place the RGB-D rendering agent and capture configured sensors.
+        """Place the agent and capture the rgbds_agent sensors.
 
         Parameters
         ----------
@@ -434,17 +667,18 @@ class VisibilityChecker:
 
         Returns
         -------
-        dict with ``rgb_viz`` and ``depth`` arrays.
+        dict with:
+          ``rgb``      — (H, W, 3) uint8  equirectangular RGB panorama
+          ``semantic`` — (H, W)    int32  raw Habitat-Sim instance ids
+          ``rgb_viz``  — alias for ``rgb`` (back-compat with viz.py callers)
         """
         if self._sim is None:
             raise RuntimeError("Call load_scene() before render_observation().")
-        if not self._rgb_cfg:
-            raise RuntimeError("Pass rgb_cfg to VisibilityChecker to enable rendering.")
 
         import habitat_sim
         import quaternion as qt
 
-        agent = self._sim.initialize_agent(0)
+        agent = self._sim.get_agent(0)
         state = habitat_sim.AgentState()
         state.position = np.array(pos, dtype=np.float32)
         half = -heading / 2.0
@@ -453,23 +687,31 @@ class VisibilityChecker:
 
         raw = self._sim.get_sensor_observations()
         obs: Dict[str, np.ndarray] = {}
-        if "rgb_viz" in raw:
-            obs["rgb_viz"] = raw["rgb_viz"][..., :3].astype(np.uint8)
         if "rgb" in raw:
-            obs["rgb"] = raw["rgb"][..., :3].astype(np.uint8)
-        if "depth" in raw:
-            obs["depth"] = raw["depth"].astype(np.float32)
+            rgb = raw["rgb"][..., :3].astype(np.uint8)
+            obs["rgb"]     = rgb
+            obs["rgb_viz"] = rgb            # alias for viz.py callers
+        if "semantic" in raw:
+            obs["semantic"] = np.asarray(raw["semantic"], dtype=np.int32)
         return obs
 
     def render_rgb(self, pos: np.ndarray, heading: float) -> np.ndarray:
-        """Place the RGB-D rendering agent and capture the RGB panorama."""
-        obs = self.render_observation(pos, heading)
-        rgb = obs.get("rgb_viz")
+        """Capture the RGB equirectangular panorama at *pos*."""
+        rgb = self.render_observation(pos, heading).get("rgb")
         if rgb is None:
-            rgb = obs.get("rgb")
-        if rgb is None:
-            raise RuntimeError("RGB rendering sensor is not configured.")
+            raise RuntimeError("RGB sensor not in observation.")
         return rgb
+
+    def render_semantic(self, pos: np.ndarray, heading: float = 0.0) -> np.ndarray:
+        """Capture the raw semantic equirectangular panorama at *pos*.
+
+        Returns instance ids per pixel (int32).  Use ``self._sem_id_map`` /
+        ``self._sem_name_map`` to translate to MP40 categories.
+        """
+        sem = self.render_observation(pos, heading).get("semantic")
+        if sem is None:
+            raise RuntimeError("Semantic sensor not in observation.")
+        return sem
 
     # ------------------------------------------------------------------
     #  Internal

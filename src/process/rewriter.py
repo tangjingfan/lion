@@ -101,6 +101,18 @@ For EACH segment produce FOUR fields:
      by the end of this segment (e.g. "door", "teapot on the table", "corridor",
      "bathroom"). A short noun phrase — no articles, no verbs.
 
+     PREFERENCE — when the segment mentions BOTH a transitional spatial
+     feature (doorway, threshold, archway, hallway) AND one or more concrete
+     physical objects that are visible / called out at the stopping point
+     (bath, table, railing, sofa, fridge, ...), pick the **concrete object**
+     as the landmark.  Reasoning: concrete objects map more reliably to the
+     scene's MP3D semantic categories and are more distinctive anchors than
+     transitional spaces.  Even when the text reads "stop at the doorway",
+     if it then says "you can see a bath" or "to the right is a railing",
+     prefer the concrete object — the spatial feature is the path, the
+     object is the anchor.  Pick the most specific / distinctive object
+     when several are mentioned.
+
   2. LANDMARK_CATEGORY
      Classify the landmark as exactly one of:
        • "object"   — a physical item or fixture (door, mirror, sofa, teapot, stairs)
@@ -163,6 +175,25 @@ Example:
     "keep": false
   }
 ]
+
+Example of the PREFERENCE rule (concrete object over spatial feature):
+
+  Sub-instruction:
+    "Exit the bedroom and turn left and you'll stop at the next doorway on
+    the left, it's a bathroom, you can see a bath. To the right now is just
+    the railing, you're done."
+
+  Even though the text says "stop at the next doorway", the segment then
+  calls out two concrete objects visible at the stopping point — a bath
+  and a railing.  Pick the more distinctive one as the landmark.
+
+  → {
+      "landmark": "bath",
+      "landmark_category": "object",
+      "landmark_instruction": "Go to the bath.",
+      "spatial_instruction": "Turn left.",
+      "keep": true
+    }
 """
 
 

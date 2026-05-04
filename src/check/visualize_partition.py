@@ -15,8 +15,8 @@ Usage
 
 Output
 ------
-  results/val_unseen/partition/{instruction_id}.png
-  results/val_unseen/partition/partition.json
+  results/val_unseen/partition/{instruction_id}/{instruction_id}.png
+  results/val_unseen/partition/{instruction_id}/partition.json
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from src.check._filter_utils import get_run_dir, resolve_selection
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import _mp3d_to_habitat, load_connectivity
 from src.process.partition import partition_episode
@@ -101,57 +102,80 @@ def _heading_arrow(ax, x: float, y: float, heading: float,
     )
 
 
-def _draw_tape(ax_tape, K: int, p_idx: int) -> None:
-    """Action tape: numbered boxes for each node, partition split visible."""
+def _draw_tape(ax_tape, K: int, p_idx: int, alpha: float = 1.0) -> None:
+    """Action tape: numbered boxes for each node, partition split visible.
+
+    With ``alpha ∈ (0, 1)`` the partition sits *between* nodes ``p-1`` and
+    ``p``; a diamond marker is drawn on the connector at that fractional
+    x-coordinate.  With ``alpha == 1.0`` (on-node), node ``p_idx`` is
+    outlined as the shared boundary.
+    """
     ax_tape.set_xlim(-0.5, K + 0.5)
     ax_tape.set_ylim(-0.8, 0.8)
     ax_tape.axis("off")
 
+    virtual = alpha < 1.0 - 1e-9 and 0 < p_idx <= K
+    part_x  = (p_idx - 1) + alpha if virtual else float(p_idx)
+
     # Region labels
-    if p_idx >= 0:
-        ax_tape.text(p_idx / 2.0, 0.75, "SPATIAL",
+    if part_x > 0:
+        ax_tape.text(part_x / 2.0, 0.75, "SPATIAL",
                      fontsize=7, color=_COLOUR_SPATIAL, fontweight="bold",
                      ha="center", va="center")
-    if p_idx < K:
-        ax_tape.text((p_idx + K) / 2.0, 0.75, "LANDMARK",
+    if part_x < K:
+        ax_tape.text((part_x + K) / 2.0, 0.75, "LANDMARK",
                      fontsize=7, color=_COLOUR_LANDMARK, fontweight="bold",
                      ha="center", va="center")
 
     # Connector
     ax_tape.plot([0, K], [0, 0], color="#bbb", lw=1.2, zorder=1)
 
-    # Node boxes
+    # Node boxes — spatial if strictly before partition; landmark if after.
     for i in range(K + 1):
-        role_spatial = i <= p_idx
+        if virtual:
+            role_spatial = i < p_idx
+        else:
+            role_spatial = i <= p_idx
         fc = _COLOUR_SPATIAL if role_spatial else _COLOUR_LANDMARK
-        ec = "black" if i == p_idx else "white"
-        lw = 2.2   if i == p_idx else 1.0
+        on_boundary = (not virtual) and (i == p_idx)
+        ec = "black" if on_boundary else "white"
+        lw = 2.2   if on_boundary else 1.0
         ax_tape.scatter([i], [0], s=280, facecolor=fc,
                         edgecolor=ec, lw=lw, zorder=2)
         ax_tape.text(i, 0, str(i), ha="center", va="center",
                      fontsize=8, fontweight="bold", color="white", zorder=3)
 
-    # Partition callout
-    if 0 <= p_idx <= K:
-        ax_tape.annotate("partition", xy=(p_idx, -0.25),
-                         xytext=(p_idx, -0.7),
-                         fontsize=7, color="black", ha="center", va="top",
-                         arrowprops=dict(arrowstyle="-", color="black", lw=0.8))
+    # Partition marker — diamond on edge for virtual, at node for on-node.
+    if virtual:
+        ax_tape.scatter([part_x], [0], s=140, marker="D",
+                        facecolor="black", edgecolor="white", lw=1.2, zorder=4)
+    ax_tape.annotate("partition", xy=(part_x, -0.25),
+                     xytext=(part_x, -0.7),
+                     fontsize=7, color="black", ha="center", va="top",
+                     arrowprops=dict(arrowstyle="-", color="black", lw=0.8))
 
 
 def _draw_subpath_map(ax, part: Dict, scan_db: Dict[str, np.ndarray]) -> None:
     """Zoomed top-down 2-D map of a single sub-path."""
-    nodes  = part["sub_path_nodes"]
-    p_idx  = part["partition_idx"]
-    coords = np.array([_xy(scan_db[n]) for n in nodes])
-    K      = len(nodes) - 1
+    nodes   = part["sub_path_nodes"]
+    p_idx   = part["partition_idx"]
+    alpha   = float(part.get("partition_alpha", 1.0))
+    coords  = np.array([_xy(scan_db[n]) for n in nodes])
+    K       = len(nodes) - 1
+    virtual = alpha < 1.0 - 1e-9 and 0 < p_idx <= K
 
     # Edge arrows (dest colored by role of destination node); distance + Δ°
     deltas = part.get("turn_deltas") or []
     for k in range(K):
         x0, y0 = coords[k]
         x1, y1 = coords[k + 1]
-        dest_is_spatial = (k + 1) <= p_idx
+        # Edges strictly before partition edge → spatial;
+        # strictly after → landmark; the partition edge itself (only when
+        # virtual) is drawn landmark (the post-partition half dominates).
+        if virtual:
+            dest_is_spatial = (k + 1) < p_idx
+        else:
+            dest_is_spatial = (k + 1) <= p_idx
         ec = _COLOUR_SPATIAL if dest_is_spatial else _COLOUR_LANDMARK
         ax.annotate(
             "", xy=(x1, y1), xytext=(x0, y0),
@@ -170,14 +194,33 @@ def _draw_subpath_map(ax, part: Dict, scan_db: Dict[str, np.ndarray]) -> None:
 
     # Node markers: numbered circles, filled by role
     for i, (x, y) in enumerate(coords):
-        role_spatial = i <= p_idx
+        if virtual:
+            role_spatial = i < p_idx
+        else:
+            role_spatial = i <= p_idx
         fc = _COLOUR_SPATIAL if role_spatial else _COLOUR_LANDMARK
-        ec = "black" if i == p_idx else "white"
-        lw = 2.8   if i == p_idx else 1.4
+        on_boundary = (not virtual) and (i == p_idx)
+        ec = "black" if on_boundary else "white"
+        lw = 2.8   if on_boundary else 1.4
         ax.scatter([x], [y], s=640, facecolor=fc,
                    edgecolor=ec, lw=lw, zorder=4)
         ax.text(x, y, str(i), ha="center", va="center",
                 fontsize=11, fontweight="bold", color="white", zorder=5)
+
+    # Virtual partition marker: diamond on the edge at the interpolated point.
+    if virtual:
+        x_prev, y_prev = coords[p_idx - 1]
+        x_next, y_next = coords[p_idx]
+        px = (1.0 - alpha) * x_prev + alpha * x_next
+        py = (1.0 - alpha) * y_prev + alpha * y_next
+        ax.scatter([px], [py], s=260, marker="D",
+                   facecolor="black", edgecolor="white", lw=1.8, zorder=7)
+        ax.annotate(f"α={alpha:.2f}", xy=(px, py),
+                    xytext=(10, 10), textcoords="offset points",
+                    fontsize=7, color="black",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                              ec="#888", lw=0.5),
+                    zorder=7)
 
     # Start-heading arrow at node 0 (labeled with absolute heading in degrees)
     x0, y0 = coords[0]
@@ -224,7 +267,8 @@ def _draw_subpath_panel(fig, outer_gs_cell, part: Dict,
 
     K     = len(part["sub_path_nodes"]) - 1
     p_idx = part["partition_idx"]
-    _draw_tape(ax_tape, K, p_idx)
+    alpha = float(part.get("partition_alpha", 1.0))
+    _draw_tape(ax_tape, K, p_idx, alpha)
     _draw_subpath_map(ax_map, part, scan_db)
 
     kind    = part["kind"]
@@ -233,7 +277,10 @@ def _draw_subpath_panel(fig, outer_gs_cell, part: Dict,
     title   = f"[{part['sub_idx']}] {spatial}"
     if lm:
         title += f"  →  {lm}"
-    title += f"      p={p_idx}/{K}  ·  {kind}"
+    if alpha < 1.0 - 1e-9 and 0 < p_idx <= K:
+        title += f"      p={p_idx - 1}+{alpha:.2f}/{K}  ·  {kind}  ·  virtual"
+    else:
+        title += f"      p={p_idx}/{K}  ·  {kind}"
     ax_tape.set_title(title, fontsize=9, pad=4)
 
 
@@ -349,8 +396,7 @@ def main() -> None:
     args = parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    if args.from_yaml:
-        cfg.setdefault("selection", {})["from_yaml"] = args.from_yaml
+    resolve_selection(cfg, args.from_yaml)
 
     part_cfg_path = Path(args.partition_config)
     if part_cfg_path.exists():
@@ -371,11 +417,7 @@ def main() -> None:
         print("No episodes matched. Exiting.")
         return
 
-    out_cfg  = cfg.get("output", {})
-    base_dir = Path(out_cfg.get("base_dir", "results")).expanduser()
-    run_name = (out_cfg.get("run_name")
-                or Path(cfg["dataset"]["data_path"]).stem.replace("LandmarkRxR_", ""))
-    out_dir  = base_dir / run_name
+    out_dir  = get_run_dir(cfg)
     part_dir = out_dir / "partition"
 
     # Load rewritten sub-instructions (spatial instructions come from here)
@@ -417,7 +459,6 @@ def main() -> None:
 
     adjacency_cache: Dict[str, List[Tuple[str, str]]] = {}
 
-    all_results: Dict[str, Dict] = {}
     for idx, ep in enumerate(episodes, 1):
         scan_db = db.get(ep.scan, {})
         if ep.scan not in adjacency_cache:
@@ -429,30 +470,53 @@ def main() -> None:
             ep_rewritten = rewritten.get("episodes", {}).get(str(ep.instruction_id))
 
         partitions = partition_episode(ep, scan_db, ep_rewritten, **part_kwargs)
-        all_results[str(ep.instruction_id)] = {
-            "scan":       ep.scan,
+
+        # Collect virtual (off-connectivity) partition nodes for this episode.
+        # When partition is virtual, spatial_path[-1] holds the "virt:..." id.
+        ep_virtual: Dict[str, List[float]] = {}
+        for p in partitions:
+            if p.get("partition_on_edge") is not None:
+                sp = p.get("spatial_path") or []
+                pos = p.get("partition_pos")
+                if sp and pos is not None:
+                    ep_virtual[sp[-1]] = list(pos)
+
+        # Fields stripped from the final JSON: heavy per-edge arrays (only
+        # needed for drawing) and the low-level partition_* metadata (all
+        # derivable from spatial_path / landmark_path).
+        _drop = {
+            "edge_headings", "edge_lengths", "turn_deltas",
+            "partition_idx", "partition_alpha", "partition_pos",
+            "partition_on_edge",
+        }
+        ep_payload = {
+            "instruction_id": ep.instruction_id,
+            "scan":           ep.scan,
             "partitions": [
                 {k: (v if k != "sub_path_nodes" else list(v))
-                 for k, v in p.items()
-                 if k not in {"edge_headings", "edge_lengths", "turn_deltas"}}
+                 for k, v in p.items() if k not in _drop}
                 for p in partitions
             ],
+            "virtual_nodes": ep_virtual,
         }
 
-        out_path = part_dir / f"{ep.instruction_id}.png"
+        # One folder per instruction_id, containing its PNG and partition.json.
+        ep_dir = part_dir / str(ep.instruction_id)
+        ep_dir.mkdir(parents=True, exist_ok=True)
+        out_png  = ep_dir / f"{ep.instruction_id}.png"
+        out_json = ep_dir / "partition.json"
+        with open(out_json, "w") as f:
+            json.dump(ep_payload, f, indent=2)
         try:
             draw_episode(ep, scan_db, adjacency_cache[ep.scan],
-                         partitions, out_path)
+                         partitions, out_png)
             print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  "
-                  f"scan={ep.scan}  → {out_path.name}")
+                  f"scan={ep.scan}  → {ep_dir.name}/")
         except Exception as exc:
             print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  FAIL: {exc}")
 
-    part_dir.mkdir(parents=True, exist_ok=True)
-    with open(part_dir / "partition.json", "w") as f:
-        json.dump({"episodes": all_results}, f, indent=2)
-    print(f"\nPNGs  → {part_dir}/{{instruction_id}}.png")
-    print(f"JSON  → {part_dir}/partition.json")
+    print(f"\nPer-episode outputs  → {part_dir}/<instruction_id>/"
+          f"{{<instruction_id>.png, partition.json}}")
 
 
 if __name__ == "__main__":

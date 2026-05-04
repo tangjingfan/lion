@@ -2,7 +2,10 @@
 Episode visualizer for LION-Bench.
 
 Saves one PNG per step to:
-    {out_dir}/viz/{instruction_id}/step_NNNN.png
+    {out_dir}/viz/{instruction_id}/{sub_idx:03d}/{step:04d}.png
+
+Each sub-trajectory gets its own folder (``001``, ``002``, ...) and the
+step counter restarts at ``0000`` whenever the agent enters a new sub-path.
 
 Layout: two panels side by side, height matches the actual RGB observation.
     ┌──────────────────┬──────────────────┐
@@ -165,15 +168,19 @@ class EpisodeVisualizer:
 
         self._episode: Optional[LandmarkRxREpisode] = None
         self._ep_dir: Optional[Path] = None
+        self._sub_dir: Optional[Path] = None
+        self._sub_idx: int = 0
         self._step: int = 0
 
     def on_reset(self, episode: LandmarkRxREpisode, obs: Dict[str, Any]) -> None:
         if not self._enabled:
             return
         self._episode = episode
+        self._sub_idx = 0
         self._step = 0
         self._ep_dir = self._viz_dir / str(episode.instruction_id)
-        self._ep_dir.mkdir(parents=True, exist_ok=True)
+        self._sub_dir = self._ep_dir / f"{self._sub_idx + 1:03d}"
+        self._sub_dir.mkdir(parents=True, exist_ok=True)
         self._save(obs, action=None)
 
     def on_step(
@@ -182,12 +189,19 @@ class EpisodeVisualizer:
         obs: Dict[str, Any],
         done: bool,
         metrics: Optional[Dict[str, Any]] = None,
+        sub_idx: Optional[int] = None,
     ) -> None:
         if not self._enabled:
             return
-        self._step += 1
-        if self._step % self._frame_skip != 0 and not done:
-            return
+        if sub_idx is not None and sub_idx != self._sub_idx:
+            self._sub_idx = sub_idx
+            self._step = 0
+            self._sub_dir = self._ep_dir / f"{self._sub_idx + 1:03d}"
+            self._sub_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._step += 1
+            if self._step % self._frame_skip != 0 and not done:
+                return
         self._save(obs, action=action)
 
     def on_episode_end(self, metrics: Dict[str, float]) -> None:
@@ -201,8 +215,10 @@ class EpisodeVisualizer:
             step=self._step,
             action=action,
             info_w=self._info_w,
+            sub_idx=self._sub_idx,
+            sub_total=len(self._episode.sub_paths) if self._episode else 1,
         )
-        Image.fromarray(canvas).save(self._ep_dir / f"{self._step:04d}.png")
+        Image.fromarray(canvas).save(self._sub_dir / f"{self._step:04d}.png")
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +231,8 @@ def _compose(
     step: int,
     action: Optional[int],
     info_w: int,
+    sub_idx: int = 0,
+    sub_total: int = 1,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw, ImageFont
 
@@ -273,6 +291,7 @@ def _compose(
         lines += [
             (f"scan     : {episode.scan}", _FG, False),
             (f"instr_id : {episode.instruction_id}", _ACCENT, True),
+            (f"sub-path : {sub_idx + 1:03d} / {sub_total:03d}", _ACCENT, True),
             ("", _FG, False),
         ]
 

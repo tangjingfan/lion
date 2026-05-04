@@ -41,6 +41,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.agent.base_agent import BaseAgent, build_agent
+from src.check._filter_utils import (
+    apply_selection_yaml,
+    get_run_dir,
+    resolve_selection,
+)
 from src.dataset.landmark_rxr import LandmarkRxREpisode, episodes_from_config
 from src.env.connectivity import load_connectivity
 from src.env.habitat_env import HabitatEnv
@@ -55,39 +60,6 @@ from src.viz import EpisodeVisualizer
 def load_config(config_path: str) -> dict:
     with open(config_path) as f:
         return yaml.safe_load(f)
-
-
-def apply_selection_file(cfg: dict, selection_path: str) -> dict:
-    """Merge a ``configs/selection/*.yaml`` file into ``cfg`` in place.
-
-    Schema mirrors the files already in ``configs/selection/``:
-
-        split: val_unseen           # informational, ignored by loader
-        scans: [X7HyMhZNoso, ...]   # → cfg["scenes"]["include"]
-        languages: [en-US]          # → cfg["selection"]["languages"]
-        instruction_ids: [19199]    # → cfg["selection"]["instruction_ids"]
-        max_episodes: 10            # → cfg["selection"]["max_episodes"]
-
-    Empty lists / null values are treated as "don't restrict" and leave
-    the parent config untouched — mirrors the comment convention in the
-    existing selection files.
-    """
-    with open(selection_path) as f:
-        sel_yaml = yaml.safe_load(f) or {}
-
-    selection = cfg.setdefault("selection", {})
-    for key in ("instruction_ids", "languages"):
-        val = sel_yaml.get(key)
-        if val:  # non-empty list
-            selection[key] = val
-    if sel_yaml.get("max_episodes") is not None:
-        selection["max_episodes"] = sel_yaml["max_episodes"]
-
-    scans = sel_yaml.get("scans")
-    if scans:
-        cfg.setdefault("scenes", {})["include"] = scans
-
-    return cfg
 
 
 def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
@@ -112,15 +84,7 @@ def apply_cli_overrides(cfg: dict, args: argparse.Namespace) -> dict:
 
 
 def make_output_dir(cfg: dict) -> Path:
-    out_cfg = cfg.get("output", {})
-    base = Path(out_cfg.get("base_dir", "results")).expanduser()
-    if out_cfg.get("run_name"):
-        run_name = out_cfg["run_name"]
-    else:
-        # derive from the dataset split filename, e.g. "LandmarkRxR_val_unseen" → "val_unseen"
-        data_stem = Path(cfg["dataset"]["data_path"]).stem  # e.g. LandmarkRxR_val_unseen
-        run_name = data_stem.replace("LandmarkRxR_", "")
-    out_dir = base / run_name
+    out_dir = get_run_dir(cfg)
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -128,6 +92,23 @@ def make_output_dir(cfg: dict) -> Path:
 # ---------------------------------------------------------------------------
 #  Rollout loop
 # ---------------------------------------------------------------------------
+
+def _sub_path_end_indices(episode: LandmarkRxREpisode) -> List[int]:
+    """Return path-node indices that mark the END of each sub-path.
+
+    Sub-paths are stored as overlapping node-id slices of ``episode.path``
+    (the last node of sub-path k equals the first node of sub-path k+1),
+    so each sub-path of length N contributes N-1 edges.  Walking those
+    edge counts along the full path gives the index of the last node of
+    each sub-path.
+    """
+    indices: List[int] = []
+    cursor = 0
+    for sub in episode.sub_paths:
+        cursor += max(0, len(sub) - 1)
+        indices.append(cursor)
+    return indices
+
 
 def run_rollout(
     episodes: List[LandmarkRxREpisode],
@@ -144,6 +125,9 @@ def run_rollout(
     viz_enabled = viz_cfg.get("enabled", False)
     viz_dir = out_dir / "rollout_viz"
     viz = EpisodeVisualizer(viz_dir, viz_cfg) if viz_enabled else None
+    # Distance (m) within which we consider the agent to have "reached"
+    # a sub-path boundary node and advance to the next sub-folder.
+    sub_advance_radius = float(viz_cfg.get("sub_advance_radius", 0.5))
 
     per_episode_metrics: Dict[str, Dict] = {}
     per_episode_results: Dict[str, Dict] = {}
@@ -165,6 +149,13 @@ def run_rollout(
 
         agent_positions: List[np.ndarray] = [obs["position"].copy()]
 
+        # Pre-compute boundary positions (in 3-D, navmesh height) so we can
+        # detect when the agent crosses from one sub-path into the next.
+        end_indices = _sub_path_end_indices(episode)
+        ref_path = [np.asarray(p, dtype=np.float32) for p in episode.reference_path]
+        sub_idx = 0
+        n_sub   = len(end_indices)
+
         # --- episode loop ---
         done = False
         info: Dict[str, Any] = {}
@@ -172,8 +163,20 @@ def run_rollout(
             action = agent.step(obs)
             obs, done, info = env.step(action)
             agent_positions.append(obs["position"].copy())
+
+            # Advance sub_idx if the agent has reached the end node of the
+            # current sub-path (last sub-path stays "current" until done).
+            while sub_idx < n_sub - 1:
+                end_node = ref_path[end_indices[sub_idx]]
+                if np.linalg.norm(obs["position"] - end_node) < sub_advance_radius:
+                    sub_idx += 1
+                else:
+                    break
+
             if viz:
-                viz.on_step(action, obs, done, metrics=info if done else None)
+                viz.on_step(action, obs, done,
+                            metrics=info if done else None,
+                            sub_idx=sub_idx)
 
         # --- metrics ---
         ep_metrics = compute_episode_metrics(
@@ -282,8 +285,12 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     if args.selection:
-        cfg = apply_selection_file(cfg, args.selection)
+        apply_selection_yaml(cfg, args.selection)
     cfg = apply_cli_overrides(cfg, args)
+    # Eagerly merge whichever selection ended up active (CLI --from_yaml or
+    # cfg.selection.from_yaml from the YAML) so cfg.output.expname etc. are
+    # populated before make_output_dir reads them.
+    resolve_selection(cfg)
 
     out_dir = make_output_dir(cfg)
     print(f"Output directory: {out_dir}")

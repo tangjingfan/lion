@@ -18,4 +18,4 @@ around_thresh_deg: 120.0   # used for "turn around"
 #                         this far before placing the partition.
 #   • forward  sub-paths: partition at the first node whose cumulative
 #                         distance from the start reaches this value.
-forward_distance_m: 1.0
+forward_distance_m: 0.3

@@ -3,6 +3,9 @@
 # Original split this selection was drawn from
 split: val_unseen
 
+# Run identity → results/val_unseen_one_scene_full/
+expname: one_scene_full
+
 # Scenes to include ([] = same as parent config / no restriction)
 scans: []
 
