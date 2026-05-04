@@ -9,12 +9,13 @@ exposes (e.g. "refrigerator" rather than "fridge", "stairs" rather than
 
 It can also read a selection / filter YAML, infer which scenes are used by the
 selected instructions, and dump the MP3D ``.house`` object vocabulary for those
-scenes.  Always writes a JSON dump per scan under
-``results/scene_categories/``; the console listing is just a preview.
+scenes.  By default, writes JSON dumps under the current experiment's
+``{output.base_dir}/{run_name}/scene_categories/`` folder; the console listing
+is just a preview.
 
 Usage
 -----
-  # One scan (writes results/scene_categories/X7HyMhZNoso.json)
+  # One scan (writes under {output.base_dir}/{run_name}/scene_categories/)
   python src/check/list_scene_categories.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
       --scan X7HyMhZNoso
@@ -50,7 +51,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import apply_selection_yaml, resolve_selection
+from src.check._filter_utils import apply_selection_yaml, get_run_dir, resolve_selection
 from src.dataset.landmark_rxr import episodes_from_config
 from src.process.rewriter import parse_house_objects
 from src.process.visibility import VisibilityChecker
@@ -125,8 +126,8 @@ def main() -> None:
                     help="Sort alphabetically (default: by instance count).")
     ap.add_argument("--out_dir", default=None,
                     help="Where to write per-scan JSONs.  Default: "
-                         "results/scene_categories/ relative to "
-                         "output.base_dir in the rollout cfg.")
+                         "{output.base_dir}/{run_name}/scene_categories, "
+                         "where run_name is derived from expname.")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -139,8 +140,7 @@ def main() -> None:
         re.compile(args.grep, re.IGNORECASE) if args.grep else None
     )
 
-    base_dir = Path(cfg.get("output", {}).get("base_dir", "results")).expanduser()
-    out_dir  = Path(args.out_dir) if args.out_dir else base_dir / "scene_categories"
+    out_dir = Path(args.out_dir) if args.out_dir else get_run_dir(cfg) / "scene_categories"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     scenes_dir = cfg["scenes"]["scenes_dir"]

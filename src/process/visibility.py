@@ -489,8 +489,10 @@ class VisibilityChecker:
         / counting (default 0.0).
 
         Matching strategy:
-          1. Exact category match against each label in *semantic_labels*.
-          2. Substring match on the raw *landmark* phrase as a fallback.
+          1. Match every label in *semantic_labels* and aggregate all matched
+             MP40 categories.
+          2. Substring match on the raw *landmark* phrase as a fallback when
+             no semantic label matches.
 
         Instance ids whose pixel count is below ``min_pixel_count`` are
         treated as noise (e.g. a sliver visible through a doorway) and
@@ -503,9 +505,11 @@ class VisibilityChecker:
           n_instances       int          — distinct instances after filtering
           pixel_count       int          — total matching pixels
           pixel_fraction    float        — pixel_count / total
-          matched_category  str | None
+          matched_category  str | None  — first matched category, for legacy callers
+          matched_categories list[str]  — all matched categories that were counted
           matched_by        "semantic_label" | "phrase_fallback" | None
-          instances         list[dict]   — [{"id": int, "n_pixels": int}, ...]
+          instances         list[dict]   — [{"id": int, "category": str,
+                                             "n_pixels": int}, ...]
         """
         if self._sim is None:
             raise RuntimeError("Call load_scene() before check_landmark_visibility_semantic().")
@@ -516,15 +520,22 @@ class VisibilityChecker:
                 "pixel_count":      0,
                 "pixel_fraction":   0.0,
                 "matched_category": None,
+                "matched_categories": [],
                 "matched_by":       None,
                 "instances":        [],
                 "note":             "semantic mapping unavailable",
             }
 
-        # ── 1. Pick the target MP40 category id ─────────────────────────
-        target_cat_id: int = -1
-        matched_cat:   Optional[str] = None
-        matched_by:    Optional[str] = None
+        # ── 1. Pick target MP40 category ids ────────────────────────────
+        target_cat_ids: List[int] = []
+        matched_cats:   List[str] = []
+        matched_by:     Optional[str] = None
+
+        def _add_match(cat_name: str, cat_id: int) -> None:
+            if cat_id in target_cat_ids:
+                return
+            target_cat_ids.append(cat_id)
+            matched_cats.append(cat_name)
 
         for label in (semantic_labels or []):
             if not label:
@@ -533,38 +544,34 @@ class VisibilityChecker:
             if key in ("unknown", ""):
                 continue
             if key in self._name_to_cat_id:
-                target_cat_id = self._name_to_cat_id[key]
-                matched_cat   = key
-                matched_by    = "semantic_label"
-                break
+                _add_match(key, self._name_to_cat_id[key])
+                matched_by = "semantic_label"
+                continue
             # Loose substring match against scene category names.
             for cat_name, cat_id in self._name_to_cat_id.items():
                 if key in cat_name or cat_name in key:
-                    target_cat_id = cat_id
-                    matched_cat   = cat_name
-                    matched_by    = "semantic_label"
+                    _add_match(cat_name, cat_id)
+                    matched_by = "semantic_label"
                     break
-            if target_cat_id >= 0:
-                break
 
-        if target_cat_id < 0:
+        if not target_cat_ids:
             lm_lower = landmark.lower().strip()
             for cat_name, cat_id in self._name_to_cat_id.items():
                 if not cat_name:
                     continue
                 if cat_name in lm_lower or lm_lower in cat_name:
-                    target_cat_id = cat_id
-                    matched_cat   = cat_name
-                    matched_by    = "phrase_fallback"
+                    _add_match(cat_name, cat_id)
+                    matched_by = "phrase_fallback"
                     break
 
-        if target_cat_id < 0:
+        if not target_cat_ids:
             return {
                 "visible":          False,
                 "n_instances":      0,
                 "pixel_count":      0,
                 "pixel_fraction":   0.0,
                 "matched_category": None,
+                "matched_categories": [],
                 "matched_by":       None,
                 "instances":        [],
                 "note":             f"no MP40 category matches '{landmark}'",
@@ -575,7 +582,7 @@ class VisibilityChecker:
         sem_clip = np.clip(sem, 0, len(self._sem_id_map) - 1)
         cat_image = self._sem_id_map[sem_clip]               # (H, W) cat ids
 
-        target_mask = (cat_image == target_cat_id)
+        target_mask = np.isin(cat_image, target_cat_ids)
         target_pixels = int(target_mask.sum())
         if target_pixels == 0:
             return {
@@ -583,19 +590,26 @@ class VisibilityChecker:
                 "n_instances":      0,
                 "pixel_count":      0,
                 "pixel_fraction":   0.0,
-                "matched_category": matched_cat,
+                "matched_category": matched_cats[0] if matched_cats else None,
+                "matched_categories": matched_cats,
                 "matched_by":       matched_by,
                 "instances":        [],
             }
 
         # ── 3. Count distinct instance ids; drop tiny ones as noise ─────
         instance_ids, counts = np.unique(sem[target_mask], return_counts=True)
-        instances: List[Dict[str, int]] = []
+        instances: List[Dict[str, Any]] = []
         kept_pixels = 0
         for iid, n in zip(instance_ids, counts):
             n = int(n)
             if n >= min_pixel_count:
-                instances.append({"id": int(iid), "n_pixels": n})
+                iid_int = int(iid)
+                idx = min(max(iid_int, 0), len(self._sem_name_map) - 1)
+                instances.append({
+                    "id": iid_int,
+                    "category": str(self._sem_name_map[idx] or ""),
+                    "n_pixels": n,
+                })
                 kept_pixels += n
 
         return {
@@ -603,7 +617,8 @@ class VisibilityChecker:
             "n_instances":      len(instances),
             "pixel_count":      kept_pixels,
             "pixel_fraction":   float(kept_pixels) / float(sem.size),
-            "matched_category": matched_cat,
+            "matched_category": matched_cats[0] if matched_cats else None,
+            "matched_categories": matched_cats,
             "matched_by":       matched_by,
             "instances":        instances,
         }

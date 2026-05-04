@@ -268,6 +268,7 @@ def main() -> None:
                         record.update({
                             "n_instances":      result.get("n_instances", 0),
                             "matched_category": result.get("matched_category"),
+                            "matched_categories": result.get("matched_categories", []),
                             "matched_by":       result.get("matched_by"),
                             "pixel_count":      result.get("pixel_count", 0),
                             "pixel_fraction":   result.get("pixel_fraction", 0.0),

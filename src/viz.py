@@ -88,7 +88,7 @@ def _collect_semantic_legend(
     sem_id: np.ndarray,
     sem_name: np.ndarray,
     *,
-    min_area_frac: float = 0.005,
+    min_area_frac: float = 0.001,
 ) -> list[tuple]:
     """Return [(name, (r, g, b), (cx_frac, cy_frac)), ...] sorted by area desc.
 

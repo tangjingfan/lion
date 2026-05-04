@@ -3,14 +3,17 @@ LION-Bench — Stage 3 filter: drop non-referrable / unmapped landmarks.
 
 Reads stage 2's sub-path-level survivor set (via current.yaml) and the
 rewriter JSON, then drops sub-paths whose landmark cannot be grounded as a
-concrete MP3D object.  Three rules:
+concrete MP3D object.  Four rules:
 
   1. ``landmark_category == "spatial"``         → drop  (rewriter's own
                                                           judgement that
                                                           there is no
                                                           referrable object)
-  2. ``components`` empty / all "unknown"        → drop  (no MP3D mapping)
-  3. ``landmark`` text matches blacklist word    → drop  (e.g. "hallway",
+  2. generic room phrases                       → drop  (e.g. "room with a
+                                                         light on"; not a
+                                                         named room type)
+  3. ``components`` empty / all "unknown"        → drop  (no MP3D mapping)
+  4. ``landmark`` text matches blacklist word    → drop  (e.g. "hallway",
                                                           "corridor",
                                                           "stairs")
 
@@ -68,6 +71,23 @@ DEFAULT_BLACKLIST = (
     "stairs", "staircase", "step", "steps",
 )
 
+SPECIFIC_ROOM_TERMS = (
+    "bathroom", "bedroom", "closet", "dining room", "family room",
+    "foyer", "garage", "hall", "kitchen", "laundry room", "library",
+    "living room", "lounge", "meeting room", "office", "rec room",
+    "tv room", "utility room",
+)
+
+
+def _is_generic_room_landmark(landmark: str) -> bool:
+    """Return true for vague room phrases, but keep named room types."""
+    if not re.search(r"\broom\b", landmark):
+        return False
+    return not any(
+        re.search(rf"\b{re.escape(room)}\b", landmark)
+        for room in SPECIFIC_ROOM_TERMS
+    )
+
 
 def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]:
     """Return ``(keep, reason)`` for one sub-path's rewrite entry."""
@@ -77,6 +97,9 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
 
     if category == "spatial":
         return False, "category:spatial"
+
+    if _is_generic_room_landmark(landmark):
+        return False, "generic_room"
 
     mapped = [
         (c.get("semantic_label") or "unknown").strip().lower()
