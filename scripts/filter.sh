@@ -14,6 +14,10 @@
 #   bash scripts/filter.sh 1 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 2 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 3 [--from_yaml configs/selection/exp.yaml]
+#
+# Visibility annotation (classification only, no dropping) lives outside
+# this filter pipeline:
+#   bash scripts/annotate_visibility.sh [--from_yaml ...]
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
