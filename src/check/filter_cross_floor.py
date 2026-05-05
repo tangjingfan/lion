@@ -93,8 +93,13 @@ def main() -> None:
 
     keep:    List[int]       = []
     dropped: Dict[int, Dict] = {}
+    n_subs_total = 0
+    n_subs_keep = 0
+    n_subs_drop = 0
 
     for ep in episodes:
+        n_ep_subs = len(ep.sub_paths)
+        n_subs_total += n_ep_subs
         scan_db = db.get(ep.scan, {})
         try:
             ys = [float(scan_db[n][1]) for n in ep.path]
@@ -119,11 +124,14 @@ def main() -> None:
         }
 
         if cross:
+            n_subs_drop += n_ep_subs
             dropped[ep.instruction_id] = {
                 "scan":      ep.scan,
                 "y_range_m": round(y_range, 3),
+                "n_sub_paths": n_ep_subs,
             }
         else:
+            n_subs_keep += n_ep_subs
             keep.append(ep.instruction_id)
 
     keep_path = write_keep_yaml(
@@ -145,6 +153,9 @@ def main() -> None:
     print(f"  total   : {n_total}")
     print(f"  keep    : {n_keep}")
     print(f"  dropped : {n_drop}  ({pct_drop:.1%})")
+    print(f"  sub-paths in  : {n_subs_total}")
+    print(f"  sub-paths keep: {n_subs_keep}")
+    print(f"  sub-paths drop: {n_subs_drop}")
     print()
     print("Outputs:")
     print(f"  {keep_path}")

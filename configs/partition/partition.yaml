@@ -3,19 +3,19 @@
 # ============================================================
 #
 # The partition splits each sub-trajectory into a spatial portion
-# (accomplishing the turn / short forward) and a landmark portion
-# (walking to the landmark).
+# (the first short stretch from the start) and a landmark portion
+# (the remainder, walking to the landmark).
 
 # ── Turn detection (degrees) ───────────────────────────────────
-# Absolute heading change (vs. the sub-path's start heading) that
-# qualifies an edge as the turn edge.
-turn_thresh_deg:   45.0    # used for "turn left" / "turn right"
-around_thresh_deg: 120.0   # used for "turn around"
+# With rollout frames, signed TURN_LEFT / TURN_RIGHT heading changes are
+# accumulated. A sub-path is treated as "with turn" only when |cumulative
+# turn| crosses this threshold before the forward-distance cutoff.
+turn_thresh_deg:   45.0    # |cumulative turn| >= 45° qualifies as a turn
+around_thresh_deg: 120.0   # |cumulative turn| >= 120° is "turn around"
 
 # ── Forward distance (metres) ──────────────────────────────────
-# Length of the "move forward" segment that defines the spatial portion:
-#   • turn-*   sub-paths: after the detected turn edge, walk forward
-#                         this far before placing the partition.
-#   • forward  sub-paths: partition at the first node whose cumulative
-#                         distance from the start reaches this value.
+# With rollout frames: if the signed cumulative turn crosses the threshold,
+# start from that crossing step and walk this far before cutting. If not,
+# cut after this much motion from the start of the rollout sub-path segment.
+# Without rollout frames, this is applied along the reference sub-path.
 forward_distance_m: 0.3

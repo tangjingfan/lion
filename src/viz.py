@@ -23,6 +23,7 @@ Config (under output.viz):
 
 from __future__ import annotations
 
+import json
 import math
 import textwrap
 from pathlib import Path
@@ -165,12 +166,19 @@ class EpisodeVisualizer:
         self._enabled = cfg.get("enabled", False)
         self._frame_skip = max(1, cfg.get("frame_skip", 1))
         self._info_w = cfg.get("info_width", 300)
+        self._mark_semantic_numbers = cfg.get("mark_semantic_numbers", False)
 
         self._episode: Optional[LandmarkRxREpisode] = None
+        self._scan_dir: Optional[Path] = None
+        self._frame_index_path: Optional[Path] = None
         self._ep_dir: Optional[Path] = None
         self._sub_dir: Optional[Path] = None
         self._sub_idx: int = 0
         self._step: int = 0
+        # Scans whose frames.jsonl we've already truncated this run.
+        self._initialized_scans: set = set()
+        if self._enabled:
+            self._viz_dir.mkdir(parents=True, exist_ok=True)
 
     def on_reset(self, episode: LandmarkRxREpisode, obs: Dict[str, Any]) -> None:
         if not self._enabled:
@@ -178,8 +186,14 @@ class EpisodeVisualizer:
         self._episode = episode
         self._sub_idx = 0
         self._step = 0
-        self._ep_dir = self._viz_dir / str(episode.instruction_id)
-        self._sub_dir = self._ep_dir / f"{self._sub_idx + 1:03d}"
+        self._scan_dir = self._viz_dir / episode.scan
+        self._frame_index_path = self._scan_dir / "frames.jsonl"
+        if episode.scan not in self._initialized_scans:
+            self._scan_dir.mkdir(parents=True, exist_ok=True)
+            self._frame_index_path.unlink(missing_ok=True)
+            self._initialized_scans.add(episode.scan)
+        self._ep_dir = self._scan_dir / str(episode.instruction_id)
+        self._sub_dir = self._ep_dir / f"{self._sub_idx:03d}"
         self._sub_dir.mkdir(parents=True, exist_ok=True)
         self._save(obs, action=None)
 
@@ -196,7 +210,7 @@ class EpisodeVisualizer:
         if sub_idx is not None and sub_idx != self._sub_idx:
             self._sub_idx = sub_idx
             self._step = 0
-            self._sub_dir = self._ep_dir / f"{self._sub_idx + 1:03d}"
+            self._sub_dir = self._ep_dir / f"{self._sub_idx:03d}"
             self._sub_dir.mkdir(parents=True, exist_ok=True)
         else:
             self._step += 1
@@ -217,8 +231,37 @@ class EpisodeVisualizer:
             info_w=self._info_w,
             sub_idx=self._sub_idx,
             sub_total=len(self._episode.sub_paths) if self._episode else 1,
+            mark_semantic_numbers=self._mark_semantic_numbers,
         )
-        Image.fromarray(canvas).save(self._sub_dir / f"{self._step:04d}.png")
+        out_path = self._sub_dir / f"{self._step:04d}.png"
+        Image.fromarray(canvas).save(out_path)
+        self._record_frame(obs, action, out_path)
+
+    def _record_frame(
+        self,
+        obs: Dict[str, Any],
+        action: Optional[int],
+        out_path: Path,
+    ) -> None:
+        if self._episode is None:
+            return
+        pos = obs.get("position")
+        heading = obs.get("heading")
+        record = {
+            "rel_path": str(out_path.relative_to(self._scan_dir)),
+            "scan": self._episode.scan,
+            "instruction_id": int(self._episode.instruction_id),
+            "path_id": int(self._episode.path_id),
+            "sub_idx": int(self._sub_idx),
+            "sub_total": len(self._episode.sub_paths),
+            "sub_dir": f"{self._sub_idx:03d}",
+            "step": int(self._step),
+            "action": int(action) if action is not None else None,
+            "position": [float(x) for x in pos] if pos is not None else None,
+            "heading": float(heading) if heading is not None else None,
+        }
+        with open(self._frame_index_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +276,7 @@ def _compose(
     info_w: int,
     sub_idx: int = 0,
     sub_total: int = 1,
+    mark_semantic_numbers: bool = False,
 ) -> np.ndarray:
     from PIL import Image, ImageDraw, ImageFont
 
@@ -256,7 +300,8 @@ def _compose(
             legend = _collect_semantic_legend(
                 obs["semantic_id"], obs["semantic_name"]
             )
-            _mark_semantic_numbers(semantic_img, legend)
+            if mark_semantic_numbers:
+                _mark_semantic_numbers(semantic_img, legend)
         _draw_label(semantic_img, "SEMANTIC")
         extra_panels.append(semantic_img)
 
@@ -291,7 +336,7 @@ def _compose(
         lines += [
             (f"scan     : {episode.scan}", _FG, False),
             (f"instr_id : {episode.instruction_id}", _ACCENT, True),
-            (f"sub-path : {sub_idx + 1:03d} / {sub_total:03d}", _ACCENT, True),
+            (f"sub-path : {sub_idx:03d} / {sub_total:03d}", _ACCENT, True),
             ("", _FG, False),
         ]
 
@@ -414,7 +459,7 @@ def _obs_info_panel(width: int, height: int,
 
     row(f"ep {episode_id}", _OBS_ACCENT, font_lg)
     row(f"scan: {scan}", colour=(160, 160, 180))
-    row(f"sub-path {sub_idx + 1} / {sub_total}")
+    row(f"sub-path {sub_idx} / {sub_total}")
     sep()
 
     if result is not None:
@@ -517,7 +562,7 @@ def _make_vis_info_panel(
 
     row(f"episode  : {episode_id}", _VIS_ACCENT, bold=True)
     row(f"scan     : {scan}")
-    row(f"sub-path : {sub_idx + 1} / {sub_total}")
+    row(f"sub-path : {sub_idx} / {sub_total}")
     blank()
     dist = result.get("distance", 0.0)
     row(f"distance : {dist:.2f} m")

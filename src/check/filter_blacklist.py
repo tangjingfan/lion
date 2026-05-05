@@ -15,7 +15,7 @@ concrete MP3D object.  Four rules:
   3. ``components`` empty / all "unknown"        → drop  (no MP3D mapping)
   4. ``landmark`` text matches blacklist word    → drop  (e.g. "hallway",
                                                           "corridor",
-                                                          "stairs")
+                                                          "passage")
 
 The output graduates the sub-path-level survivor set to those with a
 trustworthy, MP3D-grounded landmark — ready for the visibility / uniqueness
@@ -64,11 +64,11 @@ STAGE_NAME = "blacklist"
 # signal a non-referrable space rather than a concrete object.  Specific
 # room types ("bedroom", "kitchen", "bathroom") are NOT here — those are
 # legitimate landmarks.  Generic spatial terms ("area", "space") and
-# transition zones ("hallway", "stairs") are.
+# transition zones ("hallway", "corridor") are.  Note: "stairs" is a real
+# MP40 object category, so it stays out of the blacklist.
 DEFAULT_BLACKLIST = (
     "hallway", "corridor", "passage", "passageway",
     "area", "space",
-    "stairs", "staircase", "step", "steps",
 )
 
 SPECIFIC_ROOM_TERMS = (
@@ -149,19 +149,28 @@ def main() -> None:
             "expects sub-path-level survivors (run stage 2 first).",
         )
 
-    # Locate rewriter output.
-    rewrite_path = None
-    for fname in ("sub_instructions_rewritten.json",
-                  "sub_instructions_rewritten_filtered.json"):
-        p = out_dir / "rewrite" / fname
-        if p.exists():
-            rewrite_path = p
+    # Locate rewriter output (per-scan).  Pick the first existing variant
+    # consistently across scans — ``_filtered`` if any scan has it.
+    rewrite_dir = out_dir / "rewrite"
+    if not rewrite_dir.exists():
+        raise SystemExit(f"No rewrite dir under {rewrite_dir}")
+    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
+    rewrite_episodes: Dict[str, Dict] = {}
+    used_paths: List[Path] = []
+    for suffix in ("_filtered", ""):
+        for scan_dir in scan_dirs:
+            p = scan_dir / f"sub_instructions_rewritten{suffix}.json"
+            if not p.exists():
+                continue
+            with open(p) as f:
+                rewrite_episodes.update(json.load(f).get("episodes", {}))
+            used_paths.append(p)
+        if rewrite_episodes:
             break
-    if rewrite_path is None:
-        raise SystemExit(f"No rewrite JSON under {out_dir}/rewrite/")
-    with open(rewrite_path) as f:
-        rewrite_episodes = json.load(f).get("episodes", {})
-    print(f"Loaded rewrite: {rewrite_path}")
+    if not rewrite_episodes:
+        raise SystemExit(f"No rewrite JSON under {rewrite_dir}/*/")
+    print(f"Loaded rewrite from {len(used_paths)} per-scan file(s); "
+          f"first: {used_paths[0]}")
 
     blacklist = tuple(args.blacklist) if args.blacklist else DEFAULT_BLACKLIST
     print(f"Blacklist words: {blacklist}")
@@ -251,6 +260,7 @@ def main() -> None:
     print(f"  episodes keep : {n_eps_keep}")
     print(f"  sub-paths in  : {n_subs_total}")
     print(f"  sub-paths keep: {n_subs_keep}  ({pct_subs:.1%})")
+    print(f"  sub-paths drop: {n_subs_total - n_subs_keep}")
     if reason_counts:
         print(f"  drop reasons:")
         for reason, n in sorted(reason_counts.items(), key=lambda kv: -kv[1]):

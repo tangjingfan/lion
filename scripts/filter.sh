@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run a single filter pipeline stage.
 #
-# Stage 1 is standalone; stage 2 wraps the prerequisite rewrite + partition
+# Stage 0 records the original selected set; stage 1 is standalone; stage 2 wraps the prerequisite rewrite + partition
 # tools so the survivor set, audit log, and current.yaml symlink advance in
 # lock-step.  Add new stages here as they come online.
 #
@@ -11,6 +11,7 @@
 # (expname) keeps its own filters/, rewrite/, partition/ outputs.
 #
 # Usage:
+#   bash scripts/filter.sh 0 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 1 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 2 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 3 [--from_yaml configs/selection/exp.yaml]
@@ -25,6 +26,7 @@ STAGE="${1:?Usage: bash scripts/filter.sh <stage_num> [args...]}"
 shift || true
 
 CONFIG="${CONFIG:-configs/rollout/rollout_landmark_rxr.yaml}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 
 # ── Pull the user's selection YAML out of "$@" so we can use it for path
 # resolution.  Any other args remain in "$@" and are forwarded to the
@@ -62,7 +64,8 @@ PY
 )"
 CURRENT="${FILTER_DIR}/current.yaml"
 
-# Stage 1's INPUT is the user's selection (custom episode list).
+# Stage 0's INPUT is the user's selection (custom episode list).
+# Stage 1's INPUT is also the user's selection; it does not require stage 0.
 # Stage 2+'s INPUT is the prior stage's current.yaml (filter survivors).
 # Each "current.yaml" is itself self-describing — write_keep_yaml embeds
 # expname / run_name into it — so downstream tools can reload the right
@@ -71,6 +74,12 @@ USER_SEL_ARGS=()
 [[ -n "${USER_SEL}" ]] && USER_SEL_ARGS=(--from_yaml "${USER_SEL}")
 
 case "${STAGE}" in
+  0)
+    python src/check/filter_original.py \
+        --config "${CONFIG}" \
+        "${USER_SEL_ARGS[@]+"${USER_SEL_ARGS[@]}"}" \
+        "$@"
+    ;;
   1)
     python src/check/filter_cross_floor.py \
         --config "${CONFIG}" \
@@ -82,15 +91,20 @@ case "${STAGE}" in
       echo "ERROR: ${CURRENT} not found — run stage 1 first." >&2
       exit 1
     fi
+    STAGE2_INPUT="${FILTER_DIR}/01_cross_floor.yaml"
+    if [[ ! -e "${STAGE2_INPUT}" ]]; then
+      STAGE2_INPUT="${CURRENT}"
+    fi
+    echo "stage 2 input: ${STAGE2_INPUT}"
     echo "── 2a. rewrite ────────────────────────────────────────"
     python src/check/rewrite_subinstructions.py \
-        --config "${CONFIG}" --from_yaml "${CURRENT}" "$@"
-    echo "── 2b. partition viz ─────────────────────────────────"
+        --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}" "$@"
+    echo "── 2b. partition viz (full regenerate) ───────────────"
     python src/check/visualize_partition.py \
-        --config "${CONFIG}" --from_yaml "${CURRENT}"
+        --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}"
     echo "── 2c. consolidate ───────────────────────────────────"
     python src/check/filter_partition.py \
-        --config "${CONFIG}" --from_yaml "${CURRENT}"
+        --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}"
     ;;
   3)
     if [[ ! -e "${CURRENT}" ]]; then
@@ -102,7 +116,7 @@ case "${STAGE}" in
     ;;
   *)
     echo "Unknown stage: ${STAGE}" >&2
-    echo "Available: 1 (cross_floor), 2 (rewrite + partition), 3 (blacklist)" >&2
+    echo "Available: 0 (original), 1 (cross_floor), 2 (rewrite + partition), 3 (blacklist)" >&2
     exit 1
     ;;
 esac

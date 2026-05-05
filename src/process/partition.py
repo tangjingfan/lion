@@ -1,7 +1,7 @@
 """
 Sub-path partition: split each sub-trajectory into a spatial portion
-(accomplishing the turn / short forward) and a landmark portion
-(walking to the landmark).
+(the first short stretch from the start) and a landmark portion (the
+remainder, walking to the landmark).
 
 The partition point is a *continuous* position along the sub-path, reported
 via a ceiling node index ``p`` and an interpolation factor ``alpha``:
@@ -13,19 +13,14 @@ via a ceiling node index ``p`` and an interpolation factor ``alpha``:
     ``(p-1) → p``; its node id is encoded from the 3-D position as
     ``virt:{x:+.4f}_{y:+.4f}_{z:+.4f}`` (see :func:`_virt_id`).
 
-The rule is driven by the *geometry* of the sub-path (not the instruction
-text — rewritten instructions can be wrong about left/right/forward):
-  • Find the first edge whose heading differs from the start heading by
-    more than TURN_THRESH_DEG — classify as ``around`` if the magnitude
-    also exceeds AROUND_THRESH_DEG, else ``left``/``right`` by sign.
-  • If such a turn edge exists, advance forward from its destination
-    until the accumulated distance reaches FORWARD_DISTANCE_M.
-  • Otherwise treat the sub-path as pure forward and partition at the
-    point whose cumulative distance from node 0 equals FORWARD_DISTANCE_M.
-
-The ``spatial_instruction`` text is still parsed (``instruction_kind``)
-and compared against the geometric ``kind`` (``direction_mismatch`` flag)
-so dataset-level instruction errors surface in the output.
+Placement rule
+--------------
+When rollout frame metadata is available, use the already segmented rollout
+steps.  For a turn instruction, consume the initial turn actions, record how
+many degrees the agent turned, then cut after ``FORWARD_DISTANCE_M`` metres of
+forward motion.  For a forward instruction, cut after the same distance from
+the start of the rollout segment.  If rollout metadata is unavailable, fall
+back to walking ``FORWARD_DISTANCE_M`` metres along the reference sub-path.
 """
 
 from __future__ import annotations
@@ -39,7 +34,10 @@ import numpy as np
 # ── Hyper-parameters (tunable; see configs/partition/partition.yaml) ──────
 TURN_THRESH_DEG    = 45.0
 AROUND_THRESH_DEG  = 120.0
-FORWARD_DISTANCE_M = 1.0      # metres of forward motion defining spatial part
+FORWARD_DISTANCE_M = 0.3      # metres of forward motion defining spatial part
+MOVE_FORWARD = 1
+TURN_LEFT = 2
+TURN_RIGHT = 3
 
 
 def heading_of_edge(p_from: np.ndarray, p_to: np.ndarray) -> float:
@@ -98,12 +96,218 @@ def _classify_by_geometry(
     return "forward", None
 
 
+def _classify_turn_delta(
+    delta_deg: float,
+    turn_thresh_deg: float,
+    around_thresh_deg: float,
+) -> str:
+    if abs(delta_deg) >= around_thresh_deg:
+        return "around"
+    if abs(delta_deg) >= turn_thresh_deg:
+        return "right" if delta_deg > 0 else "left"
+    return "forward"
+
+
+def _classify_rollout_turn_delta(delta_deg: float, around_thresh_deg: float) -> str:
+    """Rollout actions are explicit turns; classify by sign, not min angle."""
+    if abs(delta_deg) >= around_thresh_deg:
+        return "around"
+    return "right" if delta_deg > 0 else "left"
+
+
+def _classify_reference_partition_kind(
+    turn_deltas: Sequence[float],
+    partition_idx: int,
+    partition_alpha: float,
+    turn_thresh_deg: float,
+    around_thresh_deg: float,
+) -> Tuple[str, Optional[int]]:
+    """Classify only the geometry up to the partition point.
+
+    The full sub-path often bends later while walking to the landmark.  That
+    later bend should not label the spatial partition itself.
+    """
+    if not turn_deltas:
+        return "forward", None
+    max_edge = max(0, min(partition_idx - 1, len(turn_deltas) - 1))
+    best_k = max(range(max_edge + 1), key=lambda k: abs(turn_deltas[k]))
+    best_deg = math.degrees(turn_deltas[best_k])
+    return (
+        _classify_turn_delta(best_deg, turn_thresh_deg, around_thresh_deg),
+        best_k,
+    )
+
+
 def _edge_lengths(positions: Sequence[np.ndarray]) -> List[float]:
     """Euclidean length of each consecutive edge (length K = len(positions)-1)."""
     return [
         float(np.linalg.norm(positions[k + 1] - positions[k]))
         for k in range(len(positions) - 1)
     ]
+
+
+def _as_pos(record: Dict) -> Optional[np.ndarray]:
+    pos = record.get("position")
+    if pos is None:
+        return None
+    return np.asarray(pos, dtype=float)
+
+
+def _project_to_polyline(
+    pos: np.ndarray,
+    positions: Sequence[np.ndarray],
+) -> Tuple[int, float]:
+    """Return ``(ceil_node_idx, alpha)`` for the nearest reference edge."""
+    K = len(positions) - 1
+    if K <= 0:
+        return 0, 1.0
+
+    best_k = 0
+    best_alpha = 0.0
+    best_dist = float("inf")
+    for k in range(K):
+        a = np.asarray(positions[k], dtype=float)
+        b = np.asarray(positions[k + 1], dtype=float)
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        alpha = 0.0 if denom <= 0.0 else float(np.dot(pos - a, ab) / denom)
+        alpha = max(0.0, min(1.0, alpha))
+        proj = a + alpha * ab
+        dist = float(np.linalg.norm(pos - proj))
+        if dist < best_dist:
+            best_dist = dist
+            best_k = k
+            best_alpha = alpha
+    return best_k + 1, best_alpha
+
+
+def _cut_after_distance(
+    records: Sequence[Dict],
+    start_i: int,
+    distance_m: float,
+) -> Tuple[np.ndarray, float, Optional[int], str]:
+    """Interpolate the rollout position after ``distance_m`` travelled."""
+    if not records:
+        return np.zeros(3), 0.0, None, "no rollout frames"
+
+    start_i = max(0, min(start_i, len(records) - 1))
+    prev = _as_pos(records[start_i])
+    if prev is None:
+        prev = np.zeros(3)
+    if distance_m <= 0.0:
+        return prev.copy(), 0.0, records[start_i].get("step"), "zero threshold"
+
+    walked = 0.0
+    for i in range(start_i + 1, len(records)):
+        cur = _as_pos(records[i])
+        if cur is None:
+            continue
+        seg = float(np.linalg.norm(cur - prev))
+        if walked + seg >= distance_m and seg > 0.0:
+            remain = distance_m - walked
+            alpha = remain / seg
+            cut = prev + alpha * (cur - prev)
+            return (
+                np.asarray(cut, dtype=float),
+                float(distance_m),
+                records[i].get("step"),
+                f"rollout forward {distance_m:.2f} m",
+            )
+        walked += seg
+        prev = cur
+
+    return (
+        np.asarray(prev, dtype=float),
+        float(walked),
+        records[-1].get("step"),
+        f"rollout segment shorter than {distance_m:.2f} m; clamped",
+    )
+
+
+def _partition_point_from_rollout(
+    records: Sequence[Dict],
+    instruction_kind: str,
+    distance_m: float,
+    turn_thresh_deg: float,
+    around_thresh_deg: float,
+) -> Optional[Dict]:
+    """Choose a partition point using action-level rollout frames."""
+    records = [r for r in records if _as_pos(r) is not None]
+    if not records:
+        return None
+
+    start_pos = _as_pos(records[0])
+    start_heading = records[0].get("heading")
+    turn_deg = 0.0
+    turn_steps = 0
+    turn_threshold_i: Optional[int] = None
+    prev_heading = start_heading
+
+    for i in range(1, len(records)):
+        action = records[i].get("action")
+        heading = records[i].get("heading")
+        if action in (TURN_LEFT, TURN_RIGHT):
+            turn_steps += 1
+            if prev_heading is not None and heading is not None:
+                turn_deg += math.degrees(signed_angle_diff(float(heading), float(prev_heading)))
+            prev_heading = heading
+            if abs(turn_deg) >= turn_thresh_deg:
+                turn_threshold_i = i
+                break
+            continue
+        prev_heading = heading if heading is not None else prev_heading
+
+    if turn_threshold_i is not None:
+        walk_start_i = turn_threshold_i
+        cut_pos, walked, cut_step, cut_reason = _cut_after_distance(
+            records, walk_start_i, distance_m,
+        )
+        reason = (
+            f"rollout cumulative turn {turn_deg:+.1f} deg crossed "
+            f"{turn_thresh_deg:.1f} deg at step {records[walk_start_i].get('step')} "
+            f"over {turn_steps} turn step(s), "
+            f"then {cut_reason}"
+        )
+        rollout_kind = _classify_rollout_turn_delta(turn_deg, around_thresh_deg)
+    else:
+        cut_pos, walked, cut_step, cut_reason = _cut_after_distance(
+            records, 0, distance_m,
+        )
+        reason = (
+            f"rollout cumulative turn {turn_deg:+.1f} deg did not cross "
+            f"{turn_thresh_deg:.1f} deg; {cut_reason}"
+        )
+        walk_start_i = 0
+        rollout_kind = "forward"
+
+    total_walk = 0.0
+    prev = start_pos
+    for rec in records[1:]:
+        cur = _as_pos(rec)
+        if cur is None:
+            continue
+        total_walk += float(np.linalg.norm(cur - prev))
+        prev = cur
+
+    return {
+        "partition_pos": [float(cut_pos[0]), float(cut_pos[1]), float(cut_pos[2])],
+        "partition_source": "rollout_frames",
+        "partition_virtual": True,
+        "rollout_turn_deg": float(turn_deg),
+        "rollout_turn_steps": int(turn_steps),
+        "rollout_turn_threshold_deg": float(turn_thresh_deg),
+        "rollout_turn_threshold_step": (
+            int(records[turn_threshold_i].get("step"))
+            if turn_threshold_i is not None and records[turn_threshold_i].get("step") is not None
+            else None
+        ),
+        "rollout_kind": rollout_kind,
+        "rollout_walk_m": float(walked),
+        "rollout_segment_walk_m": float(total_walk),
+        "rollout_cut_step": int(cut_step) if cut_step is not None else None,
+        "rollout_walk_start_step": records[walk_start_i].get("step"),
+        "reason": reason,
+    }
 
 
 def _virt_id(pos: np.ndarray) -> str:
@@ -159,6 +363,7 @@ def partition_subpath(
     turn_thresh_deg:    float = TURN_THRESH_DEG,
     around_thresh_deg:  float = AROUND_THRESH_DEG,
     forward_distance_m: float = FORWARD_DISTANCE_M,
+    rollout_frames: Optional[Sequence[Dict]] = None,
 ) -> Dict[str, any]:
     """Return partition metadata for one sub-path.
 
@@ -209,44 +414,65 @@ def partition_subpath(
         signed_angle_diff(h, start_heading) for h in edge_headings
     ]
 
-    # Authoritative classification comes from geometry, not the instruction.
-    kind, turn_k = _classify_by_geometry(
-        turn_deltas, turn_thresh_deg, around_thresh_deg,
+    rollout_partition = _partition_point_from_rollout(
+        rollout_frames or [],
+        instruction_kind,
+        forward_distance_m,
+        turn_thresh_deg,
+        around_thresh_deg,
     )
+    if rollout_partition is not None:
+        pos = np.asarray(rollout_partition["partition_pos"], dtype=float)
+        p, alpha = _project_to_polyline(pos, positions)
+        base_reason = rollout_partition["reason"]
+        partition_source = "rollout_frames"
+        partition_virtual = True
+        reference_kind, turn_k = _classify_reference_partition_kind(
+            turn_deltas, p, alpha, turn_thresh_deg, around_thresh_deg,
+        )
+        kind = rollout_partition.get("rollout_kind") or reference_kind
+    else:
+        p, alpha, pos = _forward_partition_point_from(
+            0, positions, edge_lengths, forward_distance_m,
+        )
+        reference_kind, turn_k = _classify_reference_partition_kind(
+            turn_deltas, p, alpha, turn_thresh_deg, around_thresh_deg,
+        )
+        total_len = sum(edge_lengths)
+        if forward_distance_m >= total_len:
+            base_reason = (
+                f"reference forward {forward_distance_m:.2f} m exceeds path length "
+                f"{total_len:.2f} m; clamped to end"
+            )
+        else:
+            base_reason = f"reference forward {forward_distance_m:.2f} m from start"
+        partition_source = "reference_path"
+        partition_virtual = False
+        kind = reference_kind
+
     direction_mismatch = (kind != instruction_kind)
 
-    if turn_k is None:
-        # No turn in geometry → plain forward rule from node 0.
-        start_idx = 0
-        base_reason = f"no edge exceeded {turn_thresh_deg:.0f}°; " \
-                      f"forward {forward_distance_m:.2f} m"
-    else:
-        # Walk forward from the turn edge's destination node.
-        start_idx = turn_k + 1
-        base_reason = (
-            f"turn at edge {turn_k} "
-            f"(Δ={math.degrees(turn_deltas[turn_k]):+.0f}° ⇒ {kind}); "
-            f"+{forward_distance_m:.2f} m forward"
-        )
-
-    p, alpha, pos = _forward_partition_point_from(
-        start_idx, positions, edge_lengths, forward_distance_m,
-    )
     reason = f"{base_reason} → p={p}, α={alpha:.2f}"
     if direction_mismatch:
-        reason += f"  ⚠ instruction_kind={instruction_kind}"
+        reason += (
+            f"  instruction_kind={instruction_kind}, partition_kind={kind}"
+        )
 
     turn_delta_deg = (
         float(math.degrees(turn_deltas[turn_k])) if turn_k is not None else None
     )
 
-    return {
+    out = {
         "partition_idx":      p,
         "partition_alpha":    alpha,
         "partition_pos":      [float(pos[0]), float(pos[1]), float(pos[2])],
+        "partition_source":   partition_source,
+        "partition_virtual":  partition_virtual,
+        "forward_distance_m": float(forward_distance_m),
         "turn_node_idx":      turn_k,
         "turn_delta_deg":     turn_delta_deg,
         "kind":               kind,
+        "reference_kind":     reference_kind,
         "instruction_kind":   instruction_kind,
         "direction_mismatch": direction_mismatch,
         "geometric_spatial_instruction": _KIND_TO_INSTRUCTION[kind],
@@ -255,6 +481,16 @@ def partition_subpath(
         "turn_deltas":        turn_deltas,
         "reason":             reason,
     }
+    if rollout_partition is not None:
+        for key in (
+            "rollout_turn_deg", "rollout_turn_steps",
+            "rollout_turn_threshold_deg", "rollout_turn_threshold_step",
+            "rollout_kind",
+            "rollout_walk_m", "rollout_segment_walk_m", "rollout_cut_step",
+            "rollout_walk_start_step",
+        ):
+            out[key] = rollout_partition.get(key)
+    return out
 
 
 def partition_episode(
@@ -264,6 +500,7 @@ def partition_episode(
     turn_thresh_deg:    float = TURN_THRESH_DEG,
     around_thresh_deg:  float = AROUND_THRESH_DEG,
     forward_distance_m: float = FORWARD_DISTANCE_M,
+    rollout_frames_by_sub: Optional[Dict[int, Sequence[Dict]]] = None,
 ) -> List[Dict]:
     """Run ``partition_subpath`` for every sub-path in one episode.
 
@@ -319,21 +556,28 @@ def partition_episode(
             turn_thresh_deg=turn_thresh_deg,
             around_thresh_deg=around_thresh_deg,
             forward_distance_m=forward_distance_m,
+            rollout_frames=(rollout_frames_by_sub or {}).get(i),
         )
 
         # Build the two path segments; they share the partition point
         # (a real MP3D node when alpha==1.0, else a virtual "virt:..." node).
         p     = out["partition_idx"]
         alpha = out["partition_alpha"]
-        if alpha >= 1.0 - 1e-9 or p == 0:
+        use_virtual = bool(out.get("partition_virtual")) or (
+            alpha < 1.0 - 1e-9 and p > 0
+        )
+        if not use_virtual:
             out["partition_on_edge"] = None
             spatial_seg  = list(sub_nodes[: p + 1])
             landmark_seg = list(sub_nodes[p:])
         else:
             vid = _virt_id(np.asarray(out["partition_pos"]))
-            out["partition_on_edge"] = [sub_nodes[p - 1], sub_nodes[p]]
-            spatial_seg  = list(sub_nodes[:p]) + [vid]
-            landmark_seg = [vid] + list(sub_nodes[p:])
+            out["partition_on_edge"] = (
+                [sub_nodes[p - 1], sub_nodes[p]] if 0 < p < len(sub_nodes) else None
+            )
+            keep_to = max(1, min(p, len(sub_nodes)))
+            spatial_seg  = list(sub_nodes[:keep_to]) + [vid]
+            landmark_seg = [vid] + list(sub_nodes[keep_to:])
 
         out.update({
             "sub_idx":             i,

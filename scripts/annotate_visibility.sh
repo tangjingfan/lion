@@ -6,7 +6,7 @@
 # Reads the latest sub-path-level survivor set from
 #   results/{run_name}/filters/current.yaml
 # and writes a per-sub-path classification JSON to
-#   results/{run_name}/landmark_visibility/visibility.json
+#   results/{run_name}/landmark_visibility/{scan}/visibility.json
 #
 # Usage:
 #   bash scripts/annotate_visibility.sh [--from_yaml configs/selection/exp.yaml]

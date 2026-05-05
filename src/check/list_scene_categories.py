@@ -162,14 +162,15 @@ def main() -> None:
     if not args.objects_only:
         checker = VisibilityChecker(cfg["env"], scenes_dir)
     try:
-        object_lists: Dict[str, List[str]] = {}
         for scan in scans:
             scene_file = f"mp3d/{scan}/{scan}.glb"
             object_list = parse_house_objects(scenes_dir, scan)
-            object_lists[scan] = object_list
 
             print(f"\n=== {scan} ===")
             print(f"  object list entries: {len(object_list)}")
+
+            scan_dir = out_dir / scan
+            scan_dir.mkdir(parents=True, exist_ok=True)
 
             object_payload = {
                 "scan": scan,
@@ -178,7 +179,7 @@ def main() -> None:
             }
 
             if args.objects_only:
-                json_path = out_dir / f"{scan}_objects.json"
+                json_path = scan_dir / "objects.json"
                 with open(json_path, "w") as f:
                     json.dump(object_payload, f, indent=2)
                 print(f"  objects json → {json_path}")
@@ -186,6 +187,10 @@ def main() -> None:
 
             assert checker is not None
             counts, cat_id_to_name = _list_categories(checker, scene_file)
+
+            objects_path = scan_dir / "objects.json"
+            with open(objects_path, "w") as f:
+                json.dump(object_payload, f, indent=2)
 
             if not counts:
                 print("  (no categories — scene has no semantic annotations)")
@@ -195,10 +200,10 @@ def main() -> None:
                     "unique_categories": 0,
                     "categories": [],
                 }
-                json_path = out_dir / f"{scan}.json"
+                json_path = scan_dir / "categories.json"
                 with open(json_path, "w") as f:
                     json.dump(payload, f, indent=2)
-                print(f"  json → {json_path}")
+                print(f"  categories json → {json_path}")
                 continue
 
             n_obj = sum(counts.values())
@@ -222,7 +227,7 @@ def main() -> None:
                 "unique_categories": len(counts),
                 "categories":        full_entries,
             }
-            json_path = out_dir / f"{scan}.json"
+            json_path = scan_dir / "categories.json"
             with open(json_path, "w") as f:
                 json.dump(payload, f, indent=2)
 
@@ -240,13 +245,7 @@ def main() -> None:
                 for e in preview:
                     print(f"  {e['count']:>5d}  {e['cat_id']:>6d}  {e['name']}")
 
-            print(f"  json → {json_path}")
-
-        if args.selection or args.from_yaml or len(scans) > 1:
-            aggregate_path = out_dir / "object_lists.json"
-            with open(aggregate_path, "w") as f:
-                json.dump(object_lists, f, indent=2)
-            print(f"\nObject lists → {aggregate_path}")
+            print(f"  categories json → {json_path}")
     finally:
         if checker is not None:
             checker.close()

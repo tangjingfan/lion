@@ -98,13 +98,13 @@ def classify(
 
 # ── Loader ─────────────────────────────────────────────────────────────────
 def _iter_subpaths(partition_dir: Path):
-    """Yield (instruction_id, sub_idx, sub_path_dict) for every sub-path."""
-    for ep_dir in sorted(partition_dir.iterdir()):
-        if not ep_dir.is_dir():
-            continue
-        pj = ep_dir / "partition.json"
-        if not pj.exists():
-            continue
+    """Yield (instruction_id, sub_idx, sub_path_dict) for every sub-path.
+
+    Supports both the per-scan layout
+    ``{partition_dir}/{scan}/{ep}/partition.json`` (default) and a direct
+    pointer to one scan's folder ``{partition_dir}/{ep}/partition.json``.
+    """
+    for pj in sorted(partition_dir.glob("**/partition.json")):
         with open(pj) as f:
             ep = json.load(f)
         for sp in ep["partitions"]:

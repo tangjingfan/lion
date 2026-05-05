@@ -999,6 +999,7 @@ def run_landmark_uniqueness_check(
                 pos_end = scan_db[end_node]
 
                 # Build ordered semantic label list from components
+                from src.process.landmark_remap import lookup_mention_labels
                 semantic_labels: List[str] = []
                 for comp in sub_entry.get("components", []):
                     label = comp.get("semantic_label", "").strip()
@@ -1007,8 +1008,10 @@ def run_landmark_uniqueness_check(
                         if label not in semantic_labels:
                             semantic_labels.append(label)
                     elif mention and landmark_mapping:
-                        # fallback: look up mention in cross-episode mapping
-                        for mapped in landmark_mapping.get(mention, []):
+                        # fallback: look up mention in the cross-episode
+                        # mapping (per-scan or legacy flat format).
+                        for mapped in lookup_mention_labels(
+                                landmark_mapping, scan, mention):
                             if mapped.lower() not in ("unknown", "") \
                                     and mapped not in semantic_labels:
                                 semantic_labels.append(mapped)

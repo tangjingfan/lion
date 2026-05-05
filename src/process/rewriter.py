@@ -471,10 +471,19 @@ def process_episode(
 #  Landmark mapping builder
 # ---------------------------------------------------------------------------
 
-def build_landmark_mapping(all_results: Dict[str, Dict]) -> Dict[str, List[str]]:
-    """Aggregate original_mention → semantic_label across all episodes."""
-    mapping: Dict[str, set] = defaultdict(set)
+def build_landmark_mapping(
+    all_results: Dict[str, Dict],
+) -> Dict[str, Dict[str, List[str]]]:
+    """Aggregate ``original_mention → semantic_label`` per scan.
+
+    Returns ``{scan: {mention: [labels]}}`` so each scene can be written
+    to its own ``rewrite/{scan}/landmark_mapping[_filtered].json`` file.
+    """
+    by_scan: Dict[str, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
     for ep_result in all_results.values():
+        scan = ep_result.get("scan")
+        if not scan:
+            continue
         for sub in ep_result.get("sub_paths", []):
             if sub.get("landmark_category") == "spatial":
                 continue
@@ -482,8 +491,11 @@ def build_landmark_mapping(all_results: Dict[str, Dict]) -> Dict[str, List[str]]
                 mention = comp.get("original_mention", "").strip().lower()
                 label   = comp.get("semantic_label",   "unknown").strip()
                 if mention and mention != "unknown":
-                    mapping[mention].add(label)
-    return {k: sorted(v) for k, v in sorted(mapping.items())}
+                    by_scan[scan][mention].add(label)
+    return {
+        scan: {k: sorted(v) for k, v in sorted(mentions.items())}
+        for scan, mentions in sorted(by_scan.items())
+    }
 
 
 # ---------------------------------------------------------------------------

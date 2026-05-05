@@ -215,38 +215,55 @@ def run_rollout(
         else:
             print(f"  {k}: {v:.4f}")
 
-    # --- save outputs ---
-    if out_cfg.get("save_json", True):
-        results_path = viz_dir / "results.json"
-        results_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(results_path, "w") as f:
-            json.dump(
-                {
-                    "aggregate": agg,
-                    "episodes": per_episode_results,
-                },
-                f,
-                indent=2,
-            )
-        print(f"\nResults saved to: {results_path}")
+    # --- save outputs (per-scan) ---
+    eps_by_scan: Dict[str, List[LandmarkRxREpisode]] = {}
+    for ep in episodes:
+        eps_by_scan.setdefault(ep.scan, []).append(ep)
 
-    if out_cfg.get("save_replay_yaml", True):
-        replay = {
-            "split": Path(cfg["dataset"]["data_path"]).stem,
-            "scans": sorted({ep.scan for ep in episodes}),
-            "languages": sorted({ep.language for ep in episodes}),
-            "instruction_ids": [ep.instruction_id for ep in episodes],
-        }
-        replay_path = viz_dir / "replay.yaml"
-        replay_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(replay_path, "w") as f:
-            yaml.dump(replay, f, default_flow_style=False, sort_keys=False)
-        print(f"Replay YAML saved to: {replay_path}")
+    save_json   = out_cfg.get("save_json", True)
+    save_replay = out_cfg.get("save_replay_yaml", True)
 
-    # Save the effective config used for this run
-    viz_dir.mkdir(parents=True, exist_ok=True)
-    with open(viz_dir / "config_used.yaml", "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+    for scan, scan_eps in eps_by_scan.items():
+        scan_dir = viz_dir / scan
+        scan_dir.mkdir(parents=True, exist_ok=True)
+
+        scan_results: Dict[str, Dict] = {}
+        scan_metrics: Dict[str, Dict] = {}
+        for ep in scan_eps:
+            key = ep.path_key
+            if key in per_episode_results:
+                scan_results[key] = per_episode_results[key]
+            if key in per_episode_metrics:
+                scan_metrics[key] = per_episode_metrics[key]
+
+        if save_json:
+            results_path = scan_dir / "results.json"
+            with open(results_path, "w") as f:
+                json.dump(
+                    {
+                        "aggregate": aggregate_metrics(scan_metrics),
+                        "episodes":  scan_results,
+                    },
+                    f,
+                    indent=2,
+                )
+            print(f"  [{scan}] results → {results_path}")
+
+        if save_replay:
+            replay = {
+                "split": Path(cfg["dataset"]["data_path"]).stem,
+                "scans": [scan],
+                "languages": sorted({ep.language for ep in scan_eps}),
+                "instruction_ids": [ep.instruction_id for ep in scan_eps],
+            }
+            replay_path = scan_dir / "replay.yaml"
+            with open(replay_path, "w") as f:
+                yaml.dump(replay, f, default_flow_style=False, sort_keys=False)
+            print(f"  [{scan}] replay  → {replay_path}")
+
+        # Save the effective config used for this run (one copy per scan).
+        with open(scan_dir / "config_used.yaml", "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 
     return {"aggregate": agg, "episodes": per_episode_results}
 

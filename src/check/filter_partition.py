@@ -67,19 +67,35 @@ STAGE_NAME = "partition"
 
 
 def _load_rewrite(out_dir: Path) -> Tuple[Dict[str, Dict], Optional[Path]]:
-    """Locate and load the rewrite JSON.  Falls back to filtered variant."""
+    """Aggregate per-scan rewrite JSONs into one ``{ep_id: rewrite}`` dict.
+
+    Walks ``rewrite/{scan}/sub_instructions_rewritten[_filtered].json``
+    and unions the ``episodes`` blocks.  Picks ``_filtered`` if any scan
+    has it, else the unfiltered variant.  Returns the merged dict and one
+    representative path for logging.
+    """
     rewrite_dir = out_dir / "rewrite"
-    for fname in ("sub_instructions_rewritten.json",
-                  "sub_instructions_rewritten_filtered.json"):
-        p = rewrite_dir / fname
-        if p.exists():
+    if not rewrite_dir.exists():
+        return {}, None
+    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
+    for suffix in ("_filtered", ""):
+        merged: Dict[str, Dict] = {}
+        any_path: Optional[Path] = None
+        for scan_dir in scan_dirs:
+            p = scan_dir / f"sub_instructions_rewritten{suffix}.json"
+            if not p.exists():
+                continue
             with open(p) as f:
-                return json.load(f).get("episodes", {}), p
+                eps = json.load(f).get("episodes", {})
+            merged.update(eps)
+            any_path = any_path or p
+        if merged:
+            return merged, any_path
     return {}, None
 
 
-def _load_partition(out_dir: Path, ep_id: int) -> Optional[Dict]:
-    p = out_dir / "partition" / str(ep_id) / "partition.json"
+def _load_partition(out_dir: Path, scan: str, ep_id: int) -> Optional[Dict]:
+    p = out_dir / "partition" / scan / str(ep_id) / "partition.json"
     if not p.exists():
         return None
     with open(p) as f:
@@ -180,7 +196,7 @@ def main() -> None:
         ep_audit  = ensure_episode(audit, ep)
 
         rewrite_ep   = rewrite_episodes.get(ep_id_str)
-        partition_ep = _load_partition(out_dir, ep.instruction_id)
+        partition_ep = _load_partition(out_dir, ep.scan, ep.instruction_id)
 
         if rewrite_ep is None or partition_ep is None:
             n_eps_no_data += 1
@@ -256,6 +272,7 @@ def main() -> None:
         print(f"    of which {n_eps_no_data} for missing rewrite/partition data")
     print(f"  sub-paths in  : {n_subs_total}")
     print(f"  sub-paths keep: {n_subs_keep}  ({pct_subs:.1%})")
+    print(f"  sub-paths drop: {n_subs_total - n_subs_keep}")
     print()
     print("Outputs:")
     print(f"  {keep_path}")

@@ -55,6 +55,7 @@ output:
     frame_skip: 1
     info_width: 300
     sub_advance_radius: 0.5
+    mark_semantic_numbers: false  # true = draw legend numbers on semantic panel
 
 # ── Visibility check tuning (scripts/visibility.sh) ─────────────
 visibility:

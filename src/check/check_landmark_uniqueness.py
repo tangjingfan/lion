@@ -64,27 +64,42 @@ def main() -> None:
     img_w          = uniq_cfg.get("img_width",  320)
     img_h          = uniq_cfg.get("img_height", 240)
     rewrite_dir    = out_dir / "rewrite"
-    rewritten_path = Path(uniq_cfg["rewritten_path"]) if uniq_cfg.get("rewritten_path") \
-                     else rewrite_dir / "sub_instructions_rewritten.json"
-    # derive mapping path from rewritten path: same dir, same suffix (_filtered or not)
-    suffix       = "_filtered" if rewritten_path.stem.endswith("_filtered") else ""
-    mapping_path = rewritten_path.parent / f"landmark_mapping{suffix}.json"
 
-    if not rewritten_path.exists():
-        print(f"ERROR: rewritten JSON not found: {rewritten_path}")
+    # Aggregate per-scan rewrite + mapping files into the cross-scan
+    # ``rewritten`` / ``landmark_mapping`` shapes consumed downstream.
+    if not rewrite_dir.exists():
+        print(f"ERROR: rewrite dir not found: {rewrite_dir}")
         print("Run src/check/rewrite_subinstructions.py first.")
         sys.exit(1)
+    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
 
-    with open(rewritten_path) as f:
-        rewritten = json.load(f)
+    chosen_suffix = None
+    for cand in ("_filtered", ""):
+        if any((d / f"sub_instructions_rewritten{cand}.json").exists()
+               for d in scan_dirs):
+            chosen_suffix = cand
+            break
+    if chosen_suffix is None:
+        print(f"ERROR: no sub_instructions_rewritten[_filtered].json under {rewrite_dir}/*/")
+        sys.exit(1)
 
-    landmark_mapping = {}
-    if mapping_path.exists():
-        with open(mapping_path) as f:
-            landmark_mapping = json.load(f)
-        print(f"Loaded landmark mapping: {len(landmark_mapping)} entries from {mapping_path}")
-    else:
-        print(f"No landmark_mapping.json found at {mapping_path}, skipping fallback.")
+    rewritten = {"episodes": {}}
+    landmark_mapping: dict = {}
+    n_map_loaded = 0
+    for scan_dir in scan_dirs:
+        rw = scan_dir / f"sub_instructions_rewritten{chosen_suffix}.json"
+        lm = scan_dir / f"landmark_mapping{chosen_suffix}.json"
+        if rw.exists():
+            with open(rw) as f:
+                rewritten["episodes"].update(json.load(f).get("episodes", {}))
+        if lm.exists():
+            with open(lm) as f:
+                landmark_mapping[scan_dir.name] = json.load(f) or {}
+            n_map_loaded += 1
+    print(f"Loaded rewrite from {len(scan_dirs)} per-scan dir(s) "
+          f"(suffix={chosen_suffix!r})")
+    print(f"Loaded landmark_mapping{chosen_suffix}.json for "
+          f"{n_map_loaded}/{len(scan_dirs)} scans")
 
     episodes = episodes_from_config(cfg)
     if not episodes:

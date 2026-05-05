@@ -9,10 +9,10 @@ Usage
   python src/check/rewrite_subinstructions.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml
 
-Output
-------
-  results/val_unseen/sub_instructions_rewritten.json   — full per-episode rewrite
-  results/val_unseen/landmark_mapping.json             — original_mention → semantic_labels
+Output (per-scan)
+-----------------
+  results/{run}/rewrite/{scan}/sub_instructions_rewritten[_filtered].json
+  results/{run}/rewrite/{scan}/landmark_mapping[_filtered].json
 """
 
 from __future__ import annotations
@@ -22,7 +22,9 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List
 
 import yaml
 
@@ -84,8 +86,6 @@ def main() -> None:
 
     out_dir      = get_run_dir(cfg) / "rewrite"
     suffix       = "_filtered" if filter_ambiguous else ""
-    json_path    = out_dir / f"sub_instructions_rewritten{suffix}.json"
-    mapping_path = out_dir / f"landmark_mapping{suffix}.json"
     scenes_dir   = cfg.get("scenes", {}).get("scenes_dir", "")
 
     client = make_client(api_key)
@@ -99,24 +99,47 @@ def main() -> None:
         filter_ambiguous=filter_ambiguous,
     )
 
+    # Bucket episodes by scan and write one rewrite + one mapping per scan.
+    eps_by_scan: Dict[str, Dict[str, dict]] = defaultdict(dict)
+    for ep_id, ep_result in all_results.items():
+        scan = ep_result.get("scan")
+        if not scan:
+            continue
+        eps_by_scan[scan][ep_id] = ep_result
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(json_path, "w") as f:
-        json.dump({"model": model, "episodes": all_results}, f, indent=2, ensure_ascii=False)
-    with open(mapping_path, "w") as f:
-        json.dump(landmark_mapping, f, indent=2, ensure_ascii=False)
+    written: List[Path] = []
+    for scan, scan_eps in sorted(eps_by_scan.items()):
+        scan_dir = out_dir / scan
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        json_path    = scan_dir / f"sub_instructions_rewritten{suffix}.json"
+        mapping_path = scan_dir / f"landmark_mapping{suffix}.json"
+        with open(json_path, "w") as f:
+            json.dump({"model": model, "episodes": scan_eps},
+                      f, indent=2, ensure_ascii=False)
+        with open(mapping_path, "w") as f:
+            # ``landmark_mapping`` is keyed by scan now (per-scan dict);
+            # each scan file holds the flat ``{mention: [labels]}`` for
+            # itself.
+            json.dump(landmark_mapping.get(scan, {}),
+                      f, indent=2, ensure_ascii=False)
+        written.extend([json_path, mapping_path])
 
     n_total = sum(len(v["sub_paths"]) for v in all_results.values())
     n_err   = sum(1 for v in all_results.values()
                   for s in v["sub_paths"] if "error" in s)
     n_comp  = sum(len(s.get("components", [])) for v in all_results.values()
                   for s in v["sub_paths"])
+    n_mentions = sum(len(m) for m in landmark_mapping.values())
     print(f"\n=== Summary ===")
     print(f"  episodes   : {len(all_results)}")
+    print(f"  scans      : {len(eps_by_scan)}")
     print(f"  sub-paths  : {n_total}  (errors: {n_err})")
-    print(f"  components : {n_comp}  ({len(landmark_mapping)} unique mentions)")
+    print(f"  components : {n_comp}  ({n_mentions} unique mentions across scans)")
     print(f"  time       : {time.time() - t0:.1f}s")
-    print(f"  output     → {json_path}")
-    print(f"  mapping    → {mapping_path}")
+    print(f"  output dir → {out_dir}")
+    for p in written:
+        print(f"    {p}")
 
 
 if __name__ == "__main__":

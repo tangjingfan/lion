@@ -15,8 +15,8 @@ Usage
 
 Output
 ------
-  results/val_unseen/partition/{instruction_id}/{instruction_id}.png
-  results/val_unseen/partition/{instruction_id}/partition.json
+  results/val_unseen/partition/{scan}/{instruction_id}/{instruction_id}.png
+  results/val_unseen/partition/{scan}/{instruction_id}/partition.json
 """
 
 from __future__ import annotations
@@ -69,6 +69,27 @@ def load_adjacency(
     return sorted(edges)
 
 
+def _load_rollout_frames(rollout_dir: Path) -> Dict[Tuple[str, int, int], List[Dict]]:
+    """Load rollout frame metadata keyed by ``(scan, instruction_id, sub_idx)``."""
+    by_sub: Dict[Tuple[str, int, int], List[Dict]] = {}
+    for index_path in sorted(rollout_dir.glob("*/frames.jsonl")):
+        with open(index_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                scan = rec.get("scan")
+                ep_id = rec.get("instruction_id")
+                sub_idx = rec.get("sub_idx")
+                if scan is None or ep_id is None or sub_idx is None:
+                    continue
+                key = (str(scan), int(ep_id), int(sub_idx))
+                by_sub.setdefault(key, []).append(rec)
+    for records in by_sub.values():
+        records.sort(key=lambda r: int(r.get("step") or 0))
+    return by_sub
+
+
 # ── Drawing ───────────────────────────────────────────────────────────────
 #
 # Layout per episode: a small overview strip at the top + one zoomed panel
@@ -102,53 +123,90 @@ def _heading_arrow(ax, x: float, y: float, heading: float,
     )
 
 
-def _draw_tape(ax_tape, K: int, p_idx: int, alpha: float = 1.0) -> None:
-    """Action tape: numbered boxes for each node, partition split visible.
+def _display_path(part: Dict, scan_db: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str], int]:
+    """Return display coords/labels with a virtual partition node inserted."""
+    nodes = part["sub_path_nodes"]
+    coords: List[Tuple[float, float]] = []
+    labels: List[str] = []
 
-    With ``alpha ∈ (0, 1)`` the partition sits *between* nodes ``p-1`` and
-    ``p``; a diamond marker is drawn on the connector at that fractional
-    x-coordinate.  With ``alpha == 1.0`` (on-node), node ``p_idx`` is
-    outlined as the shared boundary.
-    """
-    ax_tape.set_xlim(-0.5, K + 0.5)
+    p_idx = int(part["partition_idx"])
+    alpha = float(part.get("partition_alpha", 1.0))
+    virtual = (
+        bool(part.get("partition_virtual"))
+        or (alpha < 1.0 - 1e-9 and 0 < p_idx <= len(nodes) - 1)
+    )
+    insert_at = max(1, min(p_idx, len(nodes))) if virtual else p_idx
+    part_display_idx = insert_at if virtual else p_idx
+
+    for i, node_id in enumerate(nodes):
+        if virtual and i == insert_at:
+            part_pos = part.get("partition_pos")
+            if part_pos is not None:
+                coords.append(_xy(np.asarray(part_pos, dtype=float)))
+            else:
+                prev_xy = np.asarray(_xy(scan_db[nodes[p_idx - 1]]), dtype=float)
+                next_xy = np.asarray(_xy(scan_db[nodes[p_idx]]), dtype=float)
+                xy = (1.0 - alpha) * prev_xy + alpha * next_xy
+                coords.append((float(xy[0]), float(xy[1])))
+            labels.append("P")
+        coords.append(_xy(scan_db[node_id]))
+        labels.append(str(i))
+
+    if virtual and insert_at >= len(nodes):
+        part_pos = part.get("partition_pos")
+        coords.append(_xy(np.asarray(part_pos, dtype=float)))
+        labels.append("P")
+
+    return np.asarray(coords, dtype=float), labels, part_display_idx
+
+
+def _draw_tape(ax_tape, part: Dict) -> None:
+    """Action tape with the partition displayed as its own node."""
+    K = len(part["sub_path_nodes"]) - 1
+    p_idx = int(part["partition_idx"])
+    alpha = float(part.get("partition_alpha", 1.0))
+    virtual = (
+        bool(part.get("partition_virtual"))
+        or (alpha < 1.0 - 1e-9 and 0 < p_idx <= K)
+    )
+    insert_at = max(1, min(p_idx, K + 1)) if virtual else p_idx
+    n_display = K + 2 if virtual else K + 1
+    part_x = float(insert_at)
+
+    ax_tape.set_xlim(-0.5, n_display - 0.5)
     ax_tape.set_ylim(-0.8, 0.8)
     ax_tape.axis("off")
-
-    virtual = alpha < 1.0 - 1e-9 and 0 < p_idx <= K
-    part_x  = (p_idx - 1) + alpha if virtual else float(p_idx)
 
     # Region labels
     if part_x > 0:
         ax_tape.text(part_x / 2.0, 0.75, "SPATIAL",
                      fontsize=7, color=_COLOUR_SPATIAL, fontweight="bold",
                      ha="center", va="center")
-    if part_x < K:
-        ax_tape.text((part_x + K) / 2.0, 0.75, "LANDMARK",
+    if part_x < n_display - 1:
+        ax_tape.text((part_x + n_display - 1) / 2.0, 0.75, "LANDMARK",
                      fontsize=7, color=_COLOUR_LANDMARK, fontweight="bold",
                      ha="center", va="center")
 
     # Connector
-    ax_tape.plot([0, K], [0, 0], color="#bbb", lw=1.2, zorder=1)
+    ax_tape.plot([0, n_display - 1], [0, 0], color="#bbb", lw=1.2, zorder=1)
 
-    # Node boxes — spatial if strictly before partition; landmark if after.
-    for i in range(K + 1):
-        if virtual:
-            role_spatial = i < p_idx
-        else:
-            role_spatial = i <= p_idx
+    real_i = 0
+    for x in range(n_display):
+        is_partition = x == insert_at
+        if is_partition:
+            ax_tape.scatter([x], [0], s=170, marker="D",
+                            facecolor="black", edgecolor="white", lw=1.2, zorder=4)
+            ax_tape.text(x, 0, "P", ha="center", va="center",
+                         fontsize=8, fontweight="bold", color="white", zorder=5)
+            continue
+        role_spatial = x < insert_at
         fc = _COLOUR_SPATIAL if role_spatial else _COLOUR_LANDMARK
-        on_boundary = (not virtual) and (i == p_idx)
-        ec = "black" if on_boundary else "white"
-        lw = 2.2   if on_boundary else 1.0
-        ax_tape.scatter([i], [0], s=280, facecolor=fc,
-                        edgecolor=ec, lw=lw, zorder=2)
-        ax_tape.text(i, 0, str(i), ha="center", va="center",
+        ax_tape.scatter([x], [0], s=280, facecolor=fc,
+                        edgecolor="white", lw=1.0, zorder=2)
+        ax_tape.text(x, 0, str(real_i), ha="center", va="center",
                      fontsize=8, fontweight="bold", color="white", zorder=3)
+        real_i += 1
 
-    # Partition marker — diamond on edge for virtual, at node for on-node.
-    if virtual:
-        ax_tape.scatter([part_x], [0], s=140, marker="D",
-                        facecolor="black", edgecolor="white", lw=1.2, zorder=4)
     ax_tape.annotate("partition", xy=(part_x, -0.25),
                      xytext=(part_x, -0.7),
                      fontsize=7, color="black", ha="center", va="top",
@@ -157,26 +215,15 @@ def _draw_tape(ax_tape, K: int, p_idx: int, alpha: float = 1.0) -> None:
 
 def _draw_subpath_map(ax, part: Dict, scan_db: Dict[str, np.ndarray]) -> None:
     """Zoomed top-down 2-D map of a single sub-path."""
-    nodes   = part["sub_path_nodes"]
-    p_idx   = part["partition_idx"]
-    alpha   = float(part.get("partition_alpha", 1.0))
-    coords  = np.array([_xy(scan_db[n]) for n in nodes])
-    K       = len(nodes) - 1
-    virtual = alpha < 1.0 - 1e-9 and 0 < p_idx <= K
+    coords, labels, part_display_idx = _display_path(part, scan_db)
+    n_edges = len(coords) - 1
 
     # Edge arrows (dest colored by role of destination node); distance + Δ°
     deltas = part.get("turn_deltas") or []
-    for k in range(K):
+    for k in range(n_edges):
         x0, y0 = coords[k]
         x1, y1 = coords[k + 1]
-        # Edges strictly before partition edge → spatial;
-        # strictly after → landmark; the partition edge itself (only when
-        # virtual) is drawn landmark (the post-partition half dominates).
-        if virtual:
-            dest_is_spatial = (k + 1) < p_idx
-        else:
-            dest_is_spatial = (k + 1) <= p_idx
-        ec = _COLOUR_SPATIAL if dest_is_spatial else _COLOUR_LANDMARK
+        ec = _COLOUR_SPATIAL if (k + 1) <= part_display_idx else _COLOUR_LANDMARK
         ax.annotate(
             "", xy=(x1, y1), xytext=(x0, y0),
             arrowprops=dict(arrowstyle="-|>", color=ec, lw=2.6,
@@ -184,7 +231,8 @@ def _draw_subpath_map(ax, part: Dict, scan_db: Dict[str, np.ndarray]) -> None:
             zorder=3,
         )
         dist = float(np.hypot(x1 - x0, y1 - y0))
-        d_deg = math.degrees(deltas[k]) if k < len(deltas) else 0.0
+        d_idx = min(k, len(deltas) - 1)
+        d_deg = math.degrees(deltas[d_idx]) if deltas else 0.0
         mx = 0.5 * (x0 + x1); my = 0.5 * (y0 + y1)
         ax.text(mx, my, f"{dist:.1f} m\nΔ{d_deg:+.0f}°",
                 fontsize=7, color="#333", zorder=6,
@@ -192,35 +240,32 @@ def _draw_subpath_map(ax, part: Dict, scan_db: Dict[str, np.ndarray]) -> None:
                 bbox=dict(boxstyle="round,pad=0.2", fc="white",
                           ec="#ccc", lw=0.6, alpha=0.9))
 
-    # Node markers: numbered circles, filled by role
+    # Node markers: real nodes are circles; partition is its own diamond node.
     for i, (x, y) in enumerate(coords):
-        if virtual:
-            role_spatial = i < p_idx
-        else:
-            role_spatial = i <= p_idx
+        if i == part_display_idx:
+            ax.scatter([x], [y], s=320, marker="D",
+                       facecolor="black", edgecolor="white", lw=1.8, zorder=7)
+            ax.text(x, y, "P", ha="center", va="center",
+                    fontsize=10, fontweight="bold", color="white", zorder=8)
+            label = (
+                f"walk={float(part.get('rollout_walk_m') or 0.0):.2f}m\n"
+                f"turn={float(part.get('rollout_turn_deg') or 0.0):+.0f}°"
+                if part.get("partition_source") == "rollout_frames"
+                else "partition"
+            )
+            ax.annotate(label, xy=(x, y),
+                        xytext=(10, 10), textcoords="offset points",
+                        fontsize=7, color="black",
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                                  ec="#888", lw=0.5),
+                        zorder=8)
+            continue
+        role_spatial = i < part_display_idx
         fc = _COLOUR_SPATIAL if role_spatial else _COLOUR_LANDMARK
-        on_boundary = (not virtual) and (i == p_idx)
-        ec = "black" if on_boundary else "white"
-        lw = 2.8   if on_boundary else 1.4
         ax.scatter([x], [y], s=640, facecolor=fc,
-                   edgecolor=ec, lw=lw, zorder=4)
-        ax.text(x, y, str(i), ha="center", va="center",
+                   edgecolor="white", lw=1.4, zorder=4)
+        ax.text(x, y, labels[i], ha="center", va="center",
                 fontsize=11, fontweight="bold", color="white", zorder=5)
-
-    # Virtual partition marker: diamond on the edge at the interpolated point.
-    if virtual:
-        x_prev, y_prev = coords[p_idx - 1]
-        x_next, y_next = coords[p_idx]
-        px = (1.0 - alpha) * x_prev + alpha * x_next
-        py = (1.0 - alpha) * y_prev + alpha * y_next
-        ax.scatter([px], [py], s=260, marker="D",
-                   facecolor="black", edgecolor="white", lw=1.8, zorder=7)
-        ax.annotate(f"α={alpha:.2f}", xy=(px, py),
-                    xytext=(10, 10), textcoords="offset points",
-                    fontsize=7, color="black",
-                    bbox=dict(boxstyle="round,pad=0.15", fc="white",
-                              ec="#888", lw=0.5),
-                    zorder=7)
 
     # Start-heading arrow at node 0 (labeled with absolute heading in degrees)
     x0, y0 = coords[0]
@@ -265,22 +310,15 @@ def _draw_subpath_panel(fig, outer_gs_cell, part: Dict,
     ax_tape = fig.add_subplot(inner[0])
     ax_map  = fig.add_subplot(inner[1])
 
-    K     = len(part["sub_path_nodes"]) - 1
-    p_idx = part["partition_idx"]
-    alpha = float(part.get("partition_alpha", 1.0))
-    _draw_tape(ax_tape, K, p_idx, alpha)
+    _draw_tape(ax_tape, part)
     _draw_subpath_map(ax_map, part, scan_db)
 
     kind    = part["kind"]
-    spatial = (part.get("spatial_instruction") or "").strip()
+    spatial = (part.get("geometric_spatial_instruction") or "").strip()
     lm      = part.get("landmark") or ""
     title   = f"[{part['sub_idx']}] {spatial}"
     if lm:
         title += f"  →  {lm}"
-    if alpha < 1.0 - 1e-9 and 0 < p_idx <= K:
-        title += f"      p={p_idx - 1}+{alpha:.2f}/{K}  ·  {kind}  ·  virtual"
-    else:
-        title += f"      p={p_idx}/{K}  ·  {kind}"
     ax_tape.set_title(title, fontsize=9, pad=4)
 
 
@@ -360,9 +398,9 @@ def draw_episode(
     legend_handles = [
         Patch(facecolor=_COLOUR_SPATIAL,  edgecolor="white", label="spatial node"),
         Patch(facecolor=_COLOUR_LANDMARK, edgecolor="white", label="landmark node"),
-        Line2D([0], [0], marker="o", color="white",
-               markerfacecolor="white", markeredgecolor="black",
-               markeredgewidth=2.4, markersize=10, label="partition node (black ring)"),
+        Line2D([0], [0], marker="D", color="white",
+               markerfacecolor="black", markeredgecolor="white",
+               markeredgewidth=1.4, markersize=9, label="partition node"),
         Line2D([0], [0], marker=r"$\rightarrow$", color="black",
                markersize=12, lw=0, label="heading at start"),
     ]
@@ -419,25 +457,43 @@ def main() -> None:
 
     out_dir  = get_run_dir(cfg)
     part_dir = out_dir / "partition"
+    rollout_frames = _load_rollout_frames(out_dir / "rollout_viz")
+    if rollout_frames:
+        n_frame_records = sum(len(v) for v in rollout_frames.values())
+        print(
+            f"Loaded rollout frame metadata: {len(rollout_frames)} sub-path(s), "
+            f"{n_frame_records} frame(s)"
+        )
+    else:
+        print("No rollout frame metadata found; partition will use reference-path fallback.")
 
-    # Load rewritten sub-instructions (spatial instructions come from here)
-    uniq_cfg       = cfg.get("uniqueness", {})
-    rewrite_dir    = out_dir / "rewrite"
-    rewritten_path = Path(uniq_cfg["rewritten_path"]) if uniq_cfg.get("rewritten_path") \
-                     else rewrite_dir / "sub_instructions_rewritten.json"
-    if not rewritten_path.exists():
-        filtered = rewrite_dir / "sub_instructions_rewritten_filtered.json"
-        if filtered.exists():
-            rewritten_path = filtered
-    rewritten: Optional[Dict] = None
-    if rewritten_path.exists():
-        print(f"Loading rewritten instructions: {rewritten_path}")
-        with open(rewritten_path) as f:
-            rewritten = json.load(f)
-        rewritten_ids = set(rewritten["episodes"].keys())
-        episodes = [ep for ep in episodes
-                    if str(ep.instruction_id) in rewritten_ids]
-        print(f"Filtered to {len(episodes)} episode(s) present in rewritten JSON.")
+    # Load rewritten sub-instructions per scan.  Pick the first existing
+    # variant (filtered first) consistently across all scans encountered.
+    rewrite_dir = out_dir / "rewrite"
+    needed_scans_all = sorted({ep.scan for ep in episodes})
+    chosen_suffix: Optional[str] = None
+    for cand in ("_filtered", ""):
+        if any((rewrite_dir / s / f"sub_instructions_rewritten{cand}.json").exists()
+               for s in needed_scans_all):
+            chosen_suffix = cand
+            break
+    rewritten_by_scan: Dict[str, Dict] = {}
+    rewritten_ids: set = set()
+    if chosen_suffix is not None:
+        for scan in needed_scans_all:
+            p = rewrite_dir / scan / f"sub_instructions_rewritten{chosen_suffix}.json"
+            if not p.exists():
+                continue
+            with open(p) as f:
+                rewritten_by_scan[scan] = json.load(f)
+            rewritten_ids.update(rewritten_by_scan[scan].get("episodes", {}).keys())
+            print(f"Loaded rewritten ({scan}): {p}")
+        if rewritten_by_scan:
+            episodes = [ep for ep in episodes
+                        if str(ep.instruction_id) in rewritten_ids]
+            print(f"Filtered to {len(episodes)} episode(s) present in rewritten JSON.")
+        else:
+            print("No rewritten JSON found; treating all sub-paths as forward.")
     else:
         print("No rewritten JSON found; treating all sub-paths as forward.")
 
@@ -466,16 +522,28 @@ def main() -> None:
                 load_adjacency(json_dir, ep.scan) if json_dir else []
             )
         ep_rewritten = None
-        if rewritten is not None:
-            ep_rewritten = rewritten.get("episodes", {}).get(str(ep.instruction_id))
+        scan_rewritten = rewritten_by_scan.get(ep.scan)
+        if scan_rewritten is not None:
+            ep_rewritten = scan_rewritten.get("episodes", {}).get(str(ep.instruction_id))
 
-        partitions = partition_episode(ep, scan_db, ep_rewritten, **part_kwargs)
+        frames_by_sub = {
+            sub_idx: rollout_frames[(ep.scan, int(ep.instruction_id), sub_idx)]
+            for sub_idx in range(len(ep.sub_paths))
+            if (ep.scan, int(ep.instruction_id), sub_idx) in rollout_frames
+        }
+        partitions = partition_episode(
+            ep,
+            scan_db,
+            ep_rewritten,
+            rollout_frames_by_sub=frames_by_sub,
+            **part_kwargs,
+        )
 
         # Collect virtual (off-connectivity) partition nodes for this episode.
         # When partition is virtual, spatial_path[-1] holds the "virt:..." id.
         ep_virtual: Dict[str, List[float]] = {}
         for p in partitions:
-            if p.get("partition_on_edge") is not None:
+            if p.get("partition_virtual") or p.get("partition_on_edge") is not None:
                 sp = p.get("spatial_path") or []
                 pos = p.get("partition_pos")
                 if sp and pos is not None:
@@ -500,8 +568,8 @@ def main() -> None:
             "virtual_nodes": ep_virtual,
         }
 
-        # One folder per instruction_id, containing its PNG and partition.json.
-        ep_dir = part_dir / str(ep.instruction_id)
+        # One folder per (scan, instruction_id), containing its PNG and partition.json.
+        ep_dir = part_dir / ep.scan / str(ep.instruction_id)
         ep_dir.mkdir(parents=True, exist_ok=True)
         out_png  = ep_dir / f"{ep.instruction_id}.png"
         out_json = ep_dir / "partition.json"
@@ -515,7 +583,7 @@ def main() -> None:
         except Exception as exc:
             print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  FAIL: {exc}")
 
-    print(f"\nPer-episode outputs  → {part_dir}/<instruction_id>/"
+    print(f"\nPer-episode outputs  → {part_dir}/<scan>/<instruction_id>/"
           f"{{<instruction_id>.png, partition.json}}")
 
 
