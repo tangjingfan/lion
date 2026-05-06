@@ -12,6 +12,16 @@ scans: []
 # Language filter ([] = no restriction)
 languages: []
 
+# Rollout output controls
+output:
+  save_json: true
+  save_replay_yaml: true
+  viz:
+    enabled: true
+    frame_skip: 1
+    info_width: 300
+    sub_advance_radius: 0.5
+
 instruction_ids:
   - 274
   - 275
