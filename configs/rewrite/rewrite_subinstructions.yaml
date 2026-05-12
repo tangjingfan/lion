@@ -18,6 +18,6 @@ max_tokens: 4096
 max_retries: 3
 retry_delay: 2.0   # seconds between retries
 
-# Filter out landmarks the LLM deems too ambiguous or unlocatable
-# (e.g. "doorway", "wall", "area").  Set to true to enable filtering.
+# Keep the LLM's own ambiguity flag in the rewrite JSON for downstream audit.
+# Stage 2 decides what to drop using explicit landmark/referrability rules.
 filter: true

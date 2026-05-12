@@ -26,6 +26,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from src.check._filter_utils import load_rewrite_episodes
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import load_connectivity
 from src.process.visibility import VisibilityChecker, run_landmark_uniqueness_check
@@ -65,39 +66,30 @@ def main() -> None:
     img_h          = uniq_cfg.get("img_height", 240)
     rewrite_dir    = out_dir / "rewrite"
 
-    # Aggregate per-scan rewrite + mapping files into the cross-scan
-    # ``rewritten`` / ``landmark_mapping`` shapes consumed downstream.
+    # Aggregate per-episode rewrites + per-scan mapping files into the
+    # cross-scan ``rewritten`` / ``landmark_mapping`` shapes consumed downstream.
     if not rewrite_dir.exists():
         print(f"ERROR: rewrite dir not found: {rewrite_dir}")
         print("Run src/check/rewrite_subinstructions.py first.")
         sys.exit(1)
-    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
 
-    chosen_suffix = None
-    for cand in ("_filtered", ""):
-        if any((d / f"sub_instructions_rewritten{cand}.json").exists()
-               for d in scan_dirs):
-            chosen_suffix = cand
-            break
+    eps, chosen_suffix, _paths = load_rewrite_episodes(rewrite_dir)
     if chosen_suffix is None:
-        print(f"ERROR: no sub_instructions_rewritten[_filtered].json under {rewrite_dir}/*/")
+        print(f"ERROR: no sub_instructions_rewritten[_filtered].json under {rewrite_dir}/*/*/")
         sys.exit(1)
+    rewritten = {"episodes": eps}
 
-    rewritten = {"episodes": {}}
+    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
     landmark_mapping: dict = {}
     n_map_loaded = 0
     for scan_dir in scan_dirs:
-        rw = scan_dir / f"sub_instructions_rewritten{chosen_suffix}.json"
         lm = scan_dir / f"landmark_mapping{chosen_suffix}.json"
-        if rw.exists():
-            with open(rw) as f:
-                rewritten["episodes"].update(json.load(f).get("episodes", {}))
         if lm.exists():
             with open(lm) as f:
                 landmark_mapping[scan_dir.name] = json.load(f) or {}
             n_map_loaded += 1
-    print(f"Loaded rewrite from {len(scan_dirs)} per-scan dir(s) "
-          f"(suffix={chosen_suffix!r})")
+    print(f"Loaded rewrite: {len(eps)} episode(s) across "
+          f"{len(scan_dirs)} scan(s) (suffix={chosen_suffix!r})")
     print(f"Loaded landmark_mapping{chosen_suffix}.json for "
           f"{n_map_loaded}/{len(scan_dirs)} scans")
 

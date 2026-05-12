@@ -9,9 +9,9 @@ Usage
   python src/check/rewrite_subinstructions.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml
 
-Output (per-scan)
------------------
-  results/{run}/rewrite/{scan}/sub_instructions_rewritten[_filtered].json
+Output
+------
+  results/{run}/rewrite/{scan}/{instruction_id}/sub_instructions_rewritten[_filtered].json
   results/{run}/rewrite/{scan}/landmark_mapping[_filtered].json
 """
 
@@ -112,18 +112,24 @@ def main() -> None:
     for scan, scan_eps in sorted(eps_by_scan.items()):
         scan_dir = out_dir / scan
         scan_dir.mkdir(parents=True, exist_ok=True)
-        json_path    = scan_dir / f"sub_instructions_rewritten{suffix}.json"
         mapping_path = scan_dir / f"landmark_mapping{suffix}.json"
-        with open(json_path, "w") as f:
-            json.dump({"model": model, "episodes": scan_eps},
-                      f, indent=2, ensure_ascii=False)
         with open(mapping_path, "w") as f:
-            # ``landmark_mapping`` is keyed by scan now (per-scan dict);
-            # each scan file holds the flat ``{mention: [labels]}`` for
-            # itself.
+            # ``landmark_mapping`` stays per-scan: ``{mention: [labels]}``
+            # aggregated across all episodes in this scene.
             json.dump(landmark_mapping.get(scan, {}),
                       f, indent=2, ensure_ascii=False)
-        written.extend([json_path, mapping_path])
+        written.append(mapping_path)
+        for ep_id, ep_result in scan_eps.items():
+            ep_dir = scan_dir / str(ep_id)
+            ep_dir.mkdir(parents=True, exist_ok=True)
+            json_path = ep_dir / f"sub_instructions_rewritten{suffix}.json"
+            with open(json_path, "w") as f:
+                json.dump(
+                    {"model": model, "instruction_id": ep_id,
+                     "episode": ep_result},
+                    f, indent=2, ensure_ascii=False,
+                )
+            written.append(json_path)
 
     n_total = sum(len(v["sub_paths"]) for v in all_results.values())
     n_err   = sum(1 for v in all_results.values()

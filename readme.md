@@ -91,21 +91,25 @@ bash scripts/filter.sh 0 --from_yaml "$SEL"
 bash scripts/filter.sh 1 --from_yaml "$SEL"
 
 # 2) LLM-rewrite each sub-instruction → landmark + spatial atom +
-#    components. Partition uses rollout frames when available, then drops ambiguous /
-#    rewriter-errored / partition-errored sub-paths.
+#    components, then drop landmarks that are hard to refer to or ground
+#    (including blacklisted words such as door/window).
 GEMINI_API_KEY=... bash scripts/filter.sh 2 --from_yaml "$SEL"
 
-# 3) Drop sub-paths whose landmark can't ground to a concrete MP40
-#    object: spatial-only ("hallway"), generic room phrases, all-unknown
-#    components, or blacklisted transition words.
+# 3) Partition the remaining sub-paths. Partition uses rollout frames when
+#    available, then drops partition-errored sub-paths.
 bash scripts/filter.sh 3 --from_yaml "$SEL"
 ```
 
 After stage 2 you also get:
 
 ```
-rewrite/X7HyMhZNoso/sub_instructions_rewritten_filtered.json
+rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json
 rewrite/X7HyMhZNoso/landmark_mapping_filtered.json
+```
+
+After stage 3 you also get:
+
+```
 partition/X7HyMhZNoso/{instruction_id}/partition.json
 partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png
 ```
@@ -119,7 +123,7 @@ treated as move-forward and cut after 0.3 m from the start of the rollout
 sub-path segment. If rollout frames are missing, it falls back to the reference
 path using the same distance threshold.
 
-After stage 3, `current.yaml` points to `03_blacklist.yaml` — the final
+After stage 3, `current.yaml` points to `03_partition.yaml` — the final
 sub-path-level survivor set.
 
 ## 3. Scene object lists
@@ -149,7 +153,7 @@ map every mention to candidates drawn **only from this scan's**
 `objects.json`.
 
 Inputs (per scan):
-- `rewrite/X7HyMhZNoso/sub_instructions_rewritten_filtered.json` — source of mentions
+- `rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json` — source of mentions (one file per episode)
 - `scene_categories/X7HyMhZNoso/objects.json` — allowed label vocabulary
 
 Output (overwrites in place):
@@ -184,7 +188,7 @@ bash scripts/annotate_visibility.sh --from_yaml "$SEL"
 
 Reads:
 - `filters/current.yaml`
-- `rewrite/X7HyMhZNoso/sub_instructions_rewritten_filtered.json`
+- `rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json`
 - `rewrite/X7HyMhZNoso/landmark_mapping_filtered.json`
 - `partition/X7HyMhZNoso/{ep}/partition.json`
 

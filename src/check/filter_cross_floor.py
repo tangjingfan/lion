@@ -62,9 +62,9 @@ def main() -> None:
     ap.add_argument("--from_yaml", default=None,
                     help="Selection YAML to restrict the input set "
                          "(overrides config's selection.from_yaml)")
-    ap.add_argument("--threshold_m", type=float, default=1.5,
+    ap.add_argument("--threshold_m", type=float, default=0.5,
                     help="Y-range threshold (m) above which an episode is "
-                         "considered cross-floor (default 1.5)")
+                         "considered cross-floor (default 0.5)")
     args = ap.parse_args()
 
     with open(args.config) as f:

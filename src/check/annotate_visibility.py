@@ -45,9 +45,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    discover_rewrite_suffix,
     get_filter_dir,
     get_run_dir,
     get_split,
+    iter_rewrite_files,
     load_keep,
     resolve_selection,
 )
@@ -150,31 +152,27 @@ def main() -> None:
             "expects sub-path-level survivors (run filter stages 1-3 first).",
         )
 
-    # Locate per-scan rewrite JSONs.  Pick a single suffix variant
+    # Locate per-episode rewrite JSONs.  Pick a single suffix variant
     # consistently across all scans (``_filtered`` first).
     rewrite_dir = out_dir / "rewrite"
     if not rewrite_dir.exists():
         raise SystemExit(f"No rewrite dir under {rewrite_dir}")
-    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
-    rewrite_by_scan: Dict[str, Dict[str, Dict]] = {}
-    mapping_by_scan: Dict[str, Dict] = {}
-    chosen_suffix: Optional[str] = None
-    for suffix in ("_filtered", ""):
-        if any((d / f"sub_instructions_rewritten{suffix}.json").exists()
-               for d in scan_dirs):
-            chosen_suffix = suffix
-            break
+    chosen_suffix: Optional[str] = discover_rewrite_suffix(rewrite_dir)
     if chosen_suffix is None:
-        raise SystemExit(f"No rewrite JSON under {rewrite_dir}/*/")
+        raise SystemExit(f"No rewrite JSON under {rewrite_dir}/*/*/")
+
+    rewrite_by_scan: Dict[str, Dict[str, Dict]] = defaultdict(dict)
+    for scan, ep_id, p in iter_rewrite_files(rewrite_dir, chosen_suffix):
+        with open(p) as f:
+            rewrite_by_scan[scan][ep_id] = json.load(f)["episode"]
+        print(f"Loaded rewrite ({scan}/{ep_id}): {p}")
+    rewrite_by_scan = dict(rewrite_by_scan)
+
+    mapping_by_scan: Dict[str, Dict] = {}
+    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
     for scan_dir in scan_dirs:
         scan = scan_dir.name
-        rw = scan_dir / f"sub_instructions_rewritten{chosen_suffix}.json"
         lm = scan_dir / f"landmark_mapping{chosen_suffix}.json"
-        if not rw.exists():
-            continue
-        with open(rw) as f:
-            rewrite_by_scan[scan] = json.load(f).get("episodes", {})
-        print(f"Loaded rewrite ({scan}): {rw}")
         if lm.exists():
             with open(lm) as f:
                 mapping_by_scan[scan] = json.load(f) or {}

@@ -56,6 +56,18 @@ _FG     = (220, 220, 220)    # default text colour
 _ACCENT = (100, 200, 255)    # highlight colour
 
 
+def _sub_instruction_for(
+    episode: Optional[LandmarkRxREpisode],
+    sub_idx: int,
+) -> str:
+    if episode is None:
+        return ""
+    subs = episode.sub_instructions or []
+    if 0 <= int(sub_idx) < len(subs):
+        return str(subs[int(sub_idx)] or "")
+    return ""
+
+
 def _depth_to_rgb(depth: np.ndarray) -> np.ndarray:
     depth = np.asarray(depth, dtype=np.float32)
     finite = np.isfinite(depth)
@@ -254,6 +266,7 @@ class EpisodeVisualizer:
             "path_id": int(self._episode.path_id),
             "sub_idx": int(self._sub_idx),
             "sub_total": len(self._episode.sub_paths),
+            "sub_instruction": _sub_instruction_for(self._episode, self._sub_idx),
             "sub_dir": f"{self._sub_idx:03d}",
             "step": int(self._step),
             "action": int(action) if action is not None else None,
@@ -349,6 +362,14 @@ def _compose(
 
     if episode is not None:
         instr_chars = (info_w - 8) // 7   # ~7px per char at font size 12
+        sub_instruction = _sub_instruction_for(episode, sub_idx)
+        if sub_instruction:
+            lines += [("SUB-INSTRUCTION:", _ACCENT, True)]
+            wrapped_sub = textwrap.wrap(sub_instruction, width=instr_chars)
+            lines += [(ln, (250, 225, 120), False) for ln in wrapped_sub]
+            lines += [("", _FG, False)]
+
+        lines += [("FULL INSTRUCTION:", (160, 160, 180), True)]
         wrapped = textwrap.wrap(episode.instruction, width=instr_chars)
         lines += [(ln, (220, 210, 130), False) for ln in wrapped]
 

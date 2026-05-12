@@ -1,7 +1,7 @@
 """LION-Bench — Refine landmark_mapping[_filtered].json with per-scene LLM remap.
 
 Reads (per scan):
-  • ``{run_dir}/rewrite/{scan}/sub_instructions_rewritten[_filtered].json``
+  • ``{run_dir}/rewrite/{scan}/{instruction_id}/sub_instructions_rewritten[_filtered].json``
     — source of every non-spatial mention used by that scene's episodes.
   • ``{run_dir}/scene_categories/{scan}/objects.json`` — full MP3D
     ``.house`` object vocabulary for that scan (produced by
@@ -38,7 +38,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_selection
+from src.check._filter_utils import (
+    get_run_dir,
+    load_rewrite_by_scan,
+    resolve_selection,
+)
 from src.process.landmark_remap import remap_scan_mentions
 from src.process.rewriter import make_client, parse_house_objects
 
@@ -58,26 +62,20 @@ def _load_object_list(
 
 def _discover_per_scan_rewrites(
     rewrite_dir: Path,
-) -> Tuple[List[Tuple[str, Path]], str]:
-    """Return ``[(scan, rewrite_json_path), ...]`` and the suffix in use.
+) -> Tuple[Dict[str, Dict[str, Dict]], str]:
+    """Return ``{scan: {ep_id: episode}}`` and the suffix in use.
 
     Tries ``_filtered`` first across all scans, then unfiltered.
     """
     if not rewrite_dir.exists():
         raise SystemExit(f"No rewrite dir: {rewrite_dir}")
-    for suffix in ("_filtered", ""):
-        hits: List[Tuple[str, Path]] = []
-        for scan_dir in sorted(rewrite_dir.iterdir()):
-            if not scan_dir.is_dir():
-                continue
-            p = scan_dir / f"sub_instructions_rewritten{suffix}.json"
-            if p.exists():
-                hits.append((scan_dir.name, p))
-        if hits:
-            return hits, suffix
-    raise SystemExit(
-        f"No sub_instructions_rewritten[_filtered].json under {rewrite_dir}/*/"
-    )
+    by_scan, suffix, _paths = load_rewrite_by_scan(rewrite_dir)
+    if not by_scan:
+        raise SystemExit(
+            f"No sub_instructions_rewritten[_filtered].json under "
+            f"{rewrite_dir}/*/*/"
+        )
+    return by_scan, suffix
 
 
 def main() -> None:
@@ -119,7 +117,7 @@ def main() -> None:
     scene_cat_dir = run_dir / "scene_categories"
 
     rewrites, suffix = _discover_per_scan_rewrites(rewrite_dir)
-    print(f"Discovered {len(rewrites)} per-scan rewrite file(s) "
+    print(f"Discovered rewrites for {len(rewrites)} scan(s) "
           f"(suffix={suffix!r})")
 
     client     = make_client(api_key)
@@ -127,10 +125,7 @@ def main() -> None:
     summary: Dict[str, Tuple[int, int]] = {}
     t0 = time.time()
 
-    for scan, rewrite_path in rewrites:
-        with open(rewrite_path) as f:
-            rewrite_episodes = json.load(f).get("episodes", {})
-
+    for scan, rewrite_episodes in sorted(rewrites.items()):
         # Collect mentions this scan actually uses.
         mentions_set: set = set()
         for ep in rewrite_episodes.values():

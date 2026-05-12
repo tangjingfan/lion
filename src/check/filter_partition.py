@@ -1,18 +1,17 @@
 """
-LION-Bench — Stage 2 filter: consolidate rewrite + partition outputs.
+LION-Bench — Stage 3 filter: consolidate rewrite + partition outputs.
 
 Reads the prior stage's survivor set from ``current.yaml`` (typically
-``01_cross_floor.yaml``), then for every (instruction_id, sub_idx) checks:
+``02_blacklist.yaml``), then for every surviving (instruction_id, sub_idx)
+checks:
 
-  • rewriter  — was the LLM rewrite valid?  (drops "error" sub-paths and
-                ones the rewriter flagged as ambiguous via ``keep=false``)
+  • rewriter  — was the LLM rewrite valid?  (drops "error" sub-paths)
   • partition — did geometric partition succeed?  (drops sub-paths with
                 <2 nodes / other geometry errors)
 
-This stage graduates the filter framework from episode-level to sub-path
-level: ``02_partition.yaml`` carries an ``instruction_ids`` list (episodes
-with ≥1 surviving sub-path) AND a ``sub_paths`` dict listing exactly which
-sub_idx survive within each.
+This stage preserves the sub-path-level survivor set: ``03_partition.yaml``
+carries an ``instruction_ids`` list (episodes with ≥1 surviving sub-path) AND
+a ``sub_paths`` dict listing exactly which sub_idx survive within each.
 
 Prerequisites
 -------------
@@ -52,6 +51,7 @@ from src.check._filter_utils import (
     get_split,
     load_audit,
     load_keep,
+    load_rewrite_episodes,
     register_stage,
     resolve_selection,
     save_audit,
@@ -62,36 +62,21 @@ from src.check._filter_utils import (
 from src.dataset.landmark_rxr import episodes_from_config
 
 
-STAGE_NUM  = 2
+STAGE_NUM  = 3
 STAGE_NAME = "partition"
 
 
 def _load_rewrite(out_dir: Path) -> Tuple[Dict[str, Dict], Optional[Path]]:
-    """Aggregate per-scan rewrite JSONs into one ``{ep_id: rewrite}`` dict.
+    """Aggregate per-episode rewrite JSONs into one ``{ep_id: rewrite}`` dict.
 
-    Walks ``rewrite/{scan}/sub_instructions_rewritten[_filtered].json``
-    and unions the ``episodes`` blocks.  Picks ``_filtered`` if any scan
-    has it, else the unfiltered variant.  Returns the merged dict and one
-    representative path for logging.
+    Walks ``rewrite/{scan}/{instruction_id}/sub_instructions_rewritten[_filtered].json``
+    and unions them.  Picks ``_filtered`` if any episode has it, else the
+    unfiltered variant.  Returns the merged dict and one representative
+    path for logging.
     """
     rewrite_dir = out_dir / "rewrite"
-    if not rewrite_dir.exists():
-        return {}, None
-    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
-    for suffix in ("_filtered", ""):
-        merged: Dict[str, Dict] = {}
-        any_path: Optional[Path] = None
-        for scan_dir in scan_dirs:
-            p = scan_dir / f"sub_instructions_rewritten{suffix}.json"
-            if not p.exists():
-                continue
-            with open(p) as f:
-                eps = json.load(f).get("episodes", {})
-            merged.update(eps)
-            any_path = any_path or p
-        if merged:
-            return merged, any_path
-    return {}, None
+    eps, _suffix, paths = load_rewrite_episodes(rewrite_dir)
+    return eps, (paths[0] if paths else None)
 
 
 def _load_partition(out_dir: Path, scan: str, ep_id: int) -> Optional[Dict]:
@@ -116,9 +101,6 @@ def _classify_sub_path(
     if "error" in rewrite_sub:
         audit["rewrite"] = f"error:{str(rewrite_sub['error'])[:60]}"
         return False, audit
-    if not rewrite_sub.get("keep", True):
-        audit["rewrite"] = "ambiguous"
-        return False, audit
     audit["rewrite"]            = "ok"
     audit["landmark_category"]  = rewrite_sub.get("landmark_category", "unknown")
     audit["landmark"]           = rewrite_sub.get("landmark", "")
@@ -139,7 +121,7 @@ def _classify_sub_path(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Stage 2: fold rewriter + partition results into the filter pipeline",
+        description="Stage 3: fold rewriter + partition results into the filter pipeline",
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--from_yaml", default=None,
@@ -155,21 +137,32 @@ def main() -> None:
 
     filt_dir = get_filter_dir(cfg)
     if not filt_dir.exists():
-        raise SystemExit(f"No filters/ at {filt_dir} — run stage 1 first.")
+        raise SystemExit(f"No filters/ at {filt_dir} — run prior stages first.")
     out_dir = filt_dir.parent
     split   = get_split(cfg)
 
     # Read survivors from the prior stage via current.yaml.
     current = filt_dir / "current.yaml"
-    if not current.exists():
-        raise SystemExit(f"No current.yaml at {current} — run stage 1 first.")
-    prior_ids = set(int(x) for x in load_keep(current.resolve())
-                                            .get("instruction_ids", []))
+    prior_path = Path(args.from_yaml).expanduser() if args.from_yaml else current
+    if not prior_path.exists():
+        raise SystemExit(f"No prior survivor YAML at {prior_path} — run stage 2 first.")
+    prior_keep = load_keep(prior_path.resolve())
+    prior_ids = set(int(x) for x in prior_keep.get("instruction_ids", []))
     if not prior_ids:
         raise SystemExit("Prior stage produced no surviving episodes.")
+    prior_subs = prior_keep.get("sub_paths")
+    if not prior_subs:
+        raise SystemExit(
+            "Prior stage's current.yaml has no `sub_paths` field — stage 3 "
+            "expects sub-path-level survivors (run stage 2 first).",
+        )
+    allowed_subs = {
+        int(ep_id): [int(s) for s in subs]
+        for ep_id, subs in prior_subs.items()
+    }
 
     # Reload the dataset, restricted to prior survivors.
-    resolve_selection(cfg, str(current.resolve()))
+    resolve_selection(cfg, str(prior_path.resolve()))
     episodes = episodes_from_config(cfg)
     if not episodes:
         raise SystemExit("No episodes loaded from current.yaml.")
@@ -215,7 +208,7 @@ def main() -> None:
         ep_keep_subs: List[int]      = []
         ep_drops:     Dict[int, Dict] = {}
 
-        for sub_idx in range(len(ep.sub_paths)):
+        for sub_idx in allowed_subs.get(ep.instruction_id, []):
             n_subs_total += 1
             keep_it, payload = _classify_sub_path(
                 rewrite_subs.get(sub_idx),

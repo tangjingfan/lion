@@ -33,7 +33,11 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_selection
+from src.check._filter_utils import (
+    get_run_dir,
+    load_rewrite_by_scan,
+    resolve_selection,
+)
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import _mp3d_to_habitat, load_connectivity
 from src.process.partition import partition_episode
@@ -467,33 +471,20 @@ def main() -> None:
     else:
         print("No rollout frame metadata found; partition will use reference-path fallback.")
 
-    # Load rewritten sub-instructions per scan.  Pick the first existing
-    # variant (filtered first) consistently across all scans encountered.
+    # Load rewritten sub-instructions (per-episode files, grouped by scan).
+    # Picks ``_filtered`` over unfiltered if any episode file has it.
     rewrite_dir = out_dir / "rewrite"
-    needed_scans_all = sorted({ep.scan for ep in episodes})
-    chosen_suffix: Optional[str] = None
-    for cand in ("_filtered", ""):
-        if any((rewrite_dir / s / f"sub_instructions_rewritten{cand}.json").exists()
-               for s in needed_scans_all):
-            chosen_suffix = cand
-            break
-    rewritten_by_scan: Dict[str, Dict] = {}
-    rewritten_ids: set = set()
-    if chosen_suffix is not None:
-        for scan in needed_scans_all:
-            p = rewrite_dir / scan / f"sub_instructions_rewritten{chosen_suffix}.json"
-            if not p.exists():
-                continue
-            with open(p) as f:
-                rewritten_by_scan[scan] = json.load(f)
-            rewritten_ids.update(rewritten_by_scan[scan].get("episodes", {}).keys())
-            print(f"Loaded rewritten ({scan}): {p}")
-        if rewritten_by_scan:
-            episodes = [ep for ep in episodes
-                        if str(ep.instruction_id) in rewritten_ids]
-            print(f"Filtered to {len(episodes)} episode(s) present in rewritten JSON.")
-        else:
-            print("No rewritten JSON found; treating all sub-paths as forward.")
+    rewritten_by_scan, chosen_suffix, paths = load_rewrite_by_scan(rewrite_dir)
+    if rewritten_by_scan:
+        for p in paths:
+            print(f"Loaded rewritten: {p}")
+        rewritten_ids = {ep_id
+                         for eps in rewritten_by_scan.values()
+                         for ep_id in eps}
+        episodes = [ep for ep in episodes
+                    if str(ep.instruction_id) in rewritten_ids]
+        print(f"Filtered to {len(episodes)} episode(s) present in rewritten JSON "
+              f"(suffix={chosen_suffix!r}).")
     else:
         print("No rewritten JSON found; treating all sub-paths as forward.")
 
@@ -521,10 +512,8 @@ def main() -> None:
             adjacency_cache[ep.scan] = (
                 load_adjacency(json_dir, ep.scan) if json_dir else []
             )
-        ep_rewritten = None
-        scan_rewritten = rewritten_by_scan.get(ep.scan)
-        if scan_rewritten is not None:
-            ep_rewritten = scan_rewritten.get("episodes", {}).get(str(ep.instruction_id))
+        scan_rewritten = rewritten_by_scan.get(ep.scan, {})
+        ep_rewritten = scan_rewritten.get(str(ep.instruction_id))
 
         frames_by_sub = {
             sub_idx: rollout_frames[(ep.scan, int(ep.instruction_id), sub_idx)]

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Run a single filter pipeline stage.
 #
-# Stage 0 records the original selected set; stage 1 is standalone; stage 2 wraps the prerequisite rewrite + partition
-# tools so the survivor set, audit log, and current.yaml symlink advance in
-# lock-step.  Add new stages here as they come online.
+# Stage 0 records the original selected set; stage 1 is standalone; stage 2
+# rewrites + drops non-referrable landmarks; stage 3 partitions the remaining
+# sub-paths.  Add new stages here as they come online.
 #
 # The filter directory is derived from the rollout YAML's
 # output.{run_name,expname,base_dir} fields PLUS any selection YAML the
@@ -99,11 +99,8 @@ case "${STAGE}" in
     echo "── 2a. rewrite ────────────────────────────────────────"
     python src/check/rewrite_subinstructions.py \
         --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}" "$@"
-    echo "── 2b. partition viz (full regenerate) ───────────────"
-    python src/check/visualize_partition.py \
-        --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}"
-    echo "── 2c. consolidate ───────────────────────────────────"
-    python src/check/filter_partition.py \
+    echo "── 2b. blacklist / referrability ─────────────────────"
+    python src/check/filter_blacklist.py \
         --config "${CONFIG}" --from_yaml "${STAGE2_INPUT}"
     ;;
   3)
@@ -111,12 +108,17 @@ case "${STAGE}" in
       echo "ERROR: ${CURRENT} not found — run stage 2 first." >&2
       exit 1
     fi
-    python src/check/filter_blacklist.py \
+    echo "stage 3 input: ${CURRENT}"
+    echo "── 3a. partition viz (full regenerate) ───────────────"
+    python src/check/visualize_partition.py \
+        --config "${CONFIG}" --from_yaml "${CURRENT}"
+    echo "── 3b. consolidate ───────────────────────────────────"
+    python src/check/filter_partition.py \
         --config "${CONFIG}" --from_yaml "${CURRENT}" "$@"
     ;;
   *)
     echo "Unknown stage: ${STAGE}" >&2
-    echo "Available: 0 (original), 1 (cross_floor), 2 (rewrite + partition), 3 (blacklist)" >&2
+    echo "Available: 0 (original), 1 (cross_floor), 2 (rewrite + blacklist), 3 (partition)" >&2
     exit 1
     ;;
 esac

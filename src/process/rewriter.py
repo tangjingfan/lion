@@ -429,8 +429,6 @@ def process_episode(
         ex = extractions[i] if i < len(extractions) else {}
 
         keep = bool(ex.get("keep", True))
-        if filter_ambiguous and not keep:
-            continue
 
         category = str(ex.get("landmark_category", "object")).strip().lower()
         if category not in _VALID_CATEGORIES:

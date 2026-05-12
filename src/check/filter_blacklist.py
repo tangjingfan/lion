@@ -1,21 +1,18 @@
 """
-LION-Bench — Stage 3 filter: drop non-referrable / unmapped landmarks.
+LION-Bench — Stage 2 filter: drop non-referrable / unmapped landmarks.
 
-Reads stage 2's sub-path-level survivor set (via current.yaml) and the
-rewriter JSON, then drops sub-paths whose landmark cannot be grounded as a
+Reads the prior survivor set (via current.yaml) and the rewriter JSON, then
+drops sub-paths whose landmark cannot be grounded as a
 concrete MP3D object.  Four rules:
 
-  1. ``landmark_category == "spatial"``         → drop  (rewriter's own
-                                                          judgement that
-                                                          there is no
-                                                          referrable object)
-  2. generic room phrases                       → drop  (e.g. "room with a
+  1. generic room phrases                       → drop  (e.g. "room with a
                                                          light on"; not a
                                                          named room type)
-  3. ``components`` empty / all "unknown"        → drop  (no MP3D mapping)
-  4. ``landmark`` text matches blacklist word    → drop  (e.g. "hallway",
+  2. ``components`` empty / all "unknown"        → drop  (no MP3D mapping)
+  3. ``landmark`` text matches blacklist word    → drop  (e.g. "hallway",
                                                           "corridor",
-                                                          "passage")
+                                                          "door", "window")
+  4. mapped semantic label matches blacklist     → drop
 
 The output graduates the sub-path-level survivor set to those with a
 trustworthy, MP3D-grounded landmark — ready for the visibility / uniqueness
@@ -48,6 +45,7 @@ from src.check._filter_utils import (
     get_split,
     load_audit,
     load_keep,
+    load_rewrite_episodes,
     register_stage,
     resolve_selection,
     save_audit,
@@ -55,9 +53,10 @@ from src.check._filter_utils import (
     write_drop_yaml,
     write_keep_yaml,
 )
+from src.dataset.landmark_rxr import episodes_from_config
 
 
-STAGE_NUM  = 3
+STAGE_NUM  = 2
 STAGE_NAME = "blacklist"
 
 # Words that, when they appear as a whole word in the landmark phrase,
@@ -69,6 +68,7 @@ STAGE_NAME = "blacklist"
 DEFAULT_BLACKLIST = (
     "hallway", "corridor", "passage", "passageway",
     "area", "space",
+    "door", "window",
 )
 
 SPECIFIC_ROOM_TERMS = (
@@ -95,11 +95,17 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
     landmark   = (rewrite_sub.get("landmark") or "").strip().lower()
     components = rewrite_sub.get("components") or []
 
-    if category == "spatial":
-        return False, "category:spatial"
-
     if _is_generic_room_landmark(landmark):
         return False, "generic_room"
+
+    for word in blacklist:
+        if re.search(rf"\b{re.escape(word)}\b", landmark):
+            return False, f"blacklist:{word}"
+
+    # Spatial landmarks may not have MP3D components.  Keep them unless the
+    # landmark phrase itself is one of the explicitly hard-to-refer terms.
+    if category == "spatial":
+        return True, "ok"
 
     mapped = [
         (c.get("semantic_label") or "unknown").strip().lower()
@@ -109,7 +115,7 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
         return False, "unmapped"
 
     for word in blacklist:
-        if re.search(rf"\b{re.escape(word)}\b", landmark):
+        if any(re.search(rf"\b{re.escape(word)}\b", label) for label in mapped):
             return False, f"blacklist:{word}"
 
     return True, "ok"
@@ -117,7 +123,7 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Stage 3: drop non-referrable / unmapped landmarks",
+        description="Stage 2: drop non-referrable / unmapped landmarks",
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--from_yaml", default=None,
@@ -138,38 +144,42 @@ def main() -> None:
     split   = get_split(cfg)
 
     current = filt_dir / "current.yaml"
-    if not current.exists():
-        raise SystemExit(f"No current.yaml at {current} — run stage 2 first.")
+    prior_path = Path(args.from_yaml).expanduser() if args.from_yaml else current
+    if not prior_path.exists():
+        raise SystemExit(f"No prior survivor YAML at {prior_path} — run stage 1 first.")
 
-    prior_keep = load_keep(current.resolve())
+    prior_keep = load_keep(prior_path.resolve())
     prior_subs = prior_keep.get("sub_paths")
-    if not prior_subs:
-        raise SystemExit(
-            "Prior stage's current.yaml has no `sub_paths` field — stage 3 "
-            "expects sub-path-level survivors (run stage 2 first).",
-        )
 
-    # Locate rewriter output (per-scan).  Pick the first existing variant
-    # consistently across scans — ``_filtered`` if any scan has it.
+    # Reload the selected episodes through current.yaml.  If the prior stage
+    # is episode-level (stage 1), classify every sub-path.  If it is already
+    # sub-path-level, preserve that narrower set.
+    resolve_selection(cfg, str(prior_path.resolve()))
+    episodes = episodes_from_config(cfg)
+    if not episodes:
+        raise SystemExit("No episodes loaded from current.yaml.")
+    allowed_subs: Dict[int, List[int]] = {}
+    if prior_subs:
+        allowed_subs = {
+            int(ep_id): [int(s) for s in subs]
+            for ep_id, subs in prior_subs.items()
+        }
+    else:
+        allowed_subs = {
+            int(ep.instruction_id): list(range(len(ep.sub_paths)))
+            for ep in episodes
+        }
+    episode_by_id = {int(ep.instruction_id): ep for ep in episodes}
+
+    # Locate rewriter output (per-episode).  Pick the ``_filtered`` variant
+    # if any per-episode file under rewrite_dir has it; otherwise unfiltered.
     rewrite_dir = out_dir / "rewrite"
     if not rewrite_dir.exists():
         raise SystemExit(f"No rewrite dir under {rewrite_dir}")
-    scan_dirs = [d for d in sorted(rewrite_dir.iterdir()) if d.is_dir()]
-    rewrite_episodes: Dict[str, Dict] = {}
-    used_paths: List[Path] = []
-    for suffix in ("_filtered", ""):
-        for scan_dir in scan_dirs:
-            p = scan_dir / f"sub_instructions_rewritten{suffix}.json"
-            if not p.exists():
-                continue
-            with open(p) as f:
-                rewrite_episodes.update(json.load(f).get("episodes", {}))
-            used_paths.append(p)
-        if rewrite_episodes:
-            break
+    rewrite_episodes, _suffix, used_paths = load_rewrite_episodes(rewrite_dir)
     if not rewrite_episodes:
-        raise SystemExit(f"No rewrite JSON under {rewrite_dir}/*/")
-    print(f"Loaded rewrite from {len(used_paths)} per-scan file(s); "
+        raise SystemExit(f"No rewrite JSON under {rewrite_dir}/*/*/")
+    print(f"Loaded rewrite from {len(used_paths)} per-episode file(s); "
           f"first: {used_paths[0]}")
 
     blacklist = tuple(args.blacklist) if args.blacklist else DEFAULT_BLACKLIST
@@ -184,12 +194,17 @@ def main() -> None:
     n_subs_keep  = 0
     reason_counts: Dict[str, int] = {}
 
-    for ep_id_raw, sub_idxs in prior_subs.items():
+    for ep_id_raw, sub_idxs in allowed_subs.items():
         # YAML loads bare int keys as int; rewrite JSON keys are strings.
         ep_id      = int(ep_id_raw)
         ep_id_str  = str(ep_id)
         rewrite_ep = rewrite_episodes.get(ep_id_str)
-        ep_audit   = audit["episodes"].setdefault(ep_id_str, {"stages": {}})
+        ep = episode_by_id.get(ep_id)
+        ep_audit = (
+            ensure_episode(audit, ep)
+            if ep is not None
+            else audit["episodes"].setdefault(ep_id_str, {"stages": {}})
+        )
         rewrite_subs = (
             {int(s["sub_idx"]): s for s in rewrite_ep.get("sub_paths", [])}
             if rewrite_ep else {}
@@ -251,7 +266,7 @@ def main() -> None:
     save_audit(audit, filt_dir)
     current_path = update_current(filt_dir, keep_path)
 
-    n_eps_in   = len(prior_subs)
+    n_eps_in   = len(allowed_subs)
     n_eps_keep = len(keep_sub_paths)
     pct_subs   = (n_subs_keep / n_subs_total) if n_subs_total else 0.0
 
