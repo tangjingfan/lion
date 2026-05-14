@@ -3,13 +3,22 @@
 Reads (per scan):
   • ``{run_dir}/rewrite/{scan}/{instruction_id}/sub_instructions_rewritten[_filtered].json``
     — source of every non-spatial mention used by that scene's episodes.
-  • ``{run_dir}/scene_categories/{scan}/objects.json`` — full MP3D
-    ``.house`` object vocabulary for that scan (produced by
+  • ``{run_dir}/scene_categories/{scan}/objects.json`` — instantiated MPCAT40
+    object vocabulary for that scan (produced by
     ``scripts/list_scene_categories.sh --objects_only``).
 
 For each scan, asks an LLM to map every mention to candidate labels
 drawn ONLY from that scan's object list — refining the rewriter's own
 mapping with a focused per-scene prompt.
+
+Pipeline placement
+------------------
+This tool only needs filter stage 2 (rewrite) to have written the
+per-episode rewrite JSONs and ``list_scene_categories`` to have written
+``scene_categories/{scan}/objects.json``. It does **not** depend on
+partition (filter stage 3); the ``--from_yaml`` argument is used only to
+resolve the experiment's run directory, so either the original selection
+YAML or any later ``filters/*.yaml`` works.
 
 Output (overwrites the rewriter's per-scan mapping in place):
   ``{run_dir}/rewrite/{scan}/landmark_mapping[_filtered].json``  with
@@ -20,7 +29,7 @@ Usage
   GEMINI_API_KEY=your_key \\
   python src/check/refine_landmark_mapping.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml results/{run}/filters/current.yaml
+      --from_yaml configs/selection/exp.yaml
 """
 
 from __future__ import annotations
@@ -55,7 +64,14 @@ def _load_object_list(
     if json_path.exists():
         with open(json_path) as f:
             payload = json.load(f) or {}
-        return list(payload.get("object_list") or [])
+        source = payload.get("object_list_source")
+        if source in {"house_mpcat40_instances", "habitat_mpcat40_instances"}:
+            return list(payload.get("object_list") or [])
+        print(
+            f"  WARN: {json_path} has legacy object_list source "
+            "— reparsing MPCAT40 labels"
+        )
+        return parse_house_objects(scenes_dir, scan)
     print(f"  WARN: {json_path} missing — falling back to parse_house_objects")
     return parse_house_objects(scenes_dir, scan)
 

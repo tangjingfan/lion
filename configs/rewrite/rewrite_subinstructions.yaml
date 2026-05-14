@@ -2,7 +2,11 @@
 #  LION-Bench — Sub-instruction rewrite config
 # ============================================================
 
-# Gemini model to use
+# Gemini model to use.
+# `gemini-2.5-flash` is a thinking model — its internal reasoning is billed
+# against `max_tokens`, so `max_tokens` is set generously below to leave room
+# for both the thinking trace and the actual JSON output. Older non-thinking
+# models like `gemini-2.0-flash` are no longer available to new API accounts.
 model: gemini-2.5-flash
 
 # Parallel API workers
@@ -11,8 +15,11 @@ max_workers: 4
 # Sampling temperature (lower = more deterministic)
 temperature: 0.2
 
-# Max output tokens per request
-max_tokens: 4096
+# Max output tokens per request.
+# Sized for `refine_landmark_mapping`, whose response is one big JSON over
+# every mention in a scan (~hundreds of entries). Thinking tokens eat into
+# this budget, so we keep it well above what the raw JSON would need.
+max_tokens: 32768
 
 # Retry settings for failed API calls
 max_retries: 3

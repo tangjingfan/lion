@@ -22,6 +22,10 @@ output:
     info_width: 300
     sub_advance_radius: 0.5
 
+# Agent
+agent:
+  type: oracle
+
 instruction_ids:
   - 274
   - 275

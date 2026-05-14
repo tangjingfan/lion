@@ -1,12 +1,18 @@
 # Language-instructed Object Navigation
 
+> 中文版见 [readme_zh.md](readme_zh.md).
+
 Landmark-RxR rollout + dataset-curation pipeline adapted from LION-Bench.
 Habitat-Lab's `rgbds_agent` provides `rgb`, `depth`, and `semantic`
 observations.
 
-This README walks through one concrete experiment end-to-end. Every
-output path shown is what you actually get on disk for the example
-selection.
+This README walks through the three core stages end-to-end:
+
+1. **Rollout** — drive the agent through every selected episode.
+2. **Filter pipeline** — narrow `(instruction_id, sub_idx)` pairs down to
+   the ones worth grounding.
+3. **Target instance selection** — fix one MP40 instance id per
+   surviving sub-path as the navigation target.
 
 ## Setup
 
@@ -36,12 +42,10 @@ their artifacts isolated:
 ```
 results/val_unseen_partial_one_scene/
   rollout_viz/X7HyMhZNoso/...
-  scene_categories/X7HyMhZNoso/...
   rewrite/X7HyMhZNoso/...
+  scene_categories/X7HyMhZNoso/...
   partition/X7HyMhZNoso/...
-  landmark_visibility/X7HyMhZNoso/...
   target_instances/X7HyMhZNoso/...
-  perturb_visibility/X7HyMhZNoso/...
   filters/                 # cross-scan; not split
 ```
 
@@ -69,6 +73,10 @@ config_used.yaml                                  # effective merged config
 Note: `sub_idx` is **0-indexed** everywhere — folder names are `000/`,
 `001/`, ..., not `001/`, `002/`.
 
+`frames.jsonl` is consumed by the partition stage of the filter
+pipeline (step 2) so that partition cut-points reflect actual rollout
+geometry rather than the reference path.
+
 ## 2. Filter pipeline
 
 Four stages narrow `(instruction_id, sub_idx)` pairs down to the ones
@@ -82,54 +90,110 @@ current.yaml            # symlink to the latest stage's keep file
 ```
 
 `current.yaml` is what every downstream tool reads via `--from_yaml`.
+The four stages are **pure filter** — each one accepts a survivor set
+and emits a smaller one. Vocabulary prep + visibility live in step 3.
 
 ```bash
-# 0) Snapshot the original selection (drops nothing).
-bash scripts/filter.sh 0 --from_yaml "$SEL"
-
-# 1) Drop episodes whose path crosses a floor (vertical span > 1.5 m).
-bash scripts/filter.sh 1 --from_yaml "$SEL"
-
-# 2) LLM-rewrite each sub-instruction → landmark + spatial atom +
-#    components, then drop landmarks that are hard to refer to or ground
-#    (including blacklisted words such as door/window).
-GEMINI_API_KEY=... bash scripts/filter.sh 2 --from_yaml "$SEL"
-
-# 3) Partition the remaining sub-paths. Partition uses rollout frames when
-#    available, then drops partition-errored sub-paths.
-bash scripts/filter.sh 3 --from_yaml "$SEL"
+CURRENT=results/val_unseen_partial_one_scene/filters/current.yaml
 ```
 
-After stage 2 you also get:
+#### 2.0 Snapshot (drops nothing)
+
+```bash
+bash scripts/filter.sh 0 --from_yaml "$SEL"
+```
+
+Writes `filters/00_snapshot.yaml` and re-points `current.yaml` at it.
+
+#### 2.1 Cross-floor filter
+
+Drops episodes whose reference path crosses a floor (vertical span >
+0.5 m).
+
+```bash
+bash scripts/filter.sh 1 --from_yaml "$SEL"
+```
+
+#### 2.2 LLM rewrite
+
+For every surviving sub-instruction, asks the LLM to produce
+`landmark + landmark_category + landmark_instruction + spatial_instruction`
+plus a per-component breakdown. Then drops landmarks that are hard to
+refer to / ground (blacklist contains words like door, window, …).
+
+```bash
+GEMINI_API_KEY=... bash scripts/filter.sh 2 --from_yaml "$SEL"
+```
+
+Produces:
 
 ```
 rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json
-rewrite/X7HyMhZNoso/landmark_mapping_filtered.json
+rewrite/X7HyMhZNoso/landmark_mapping_filtered.json    # mention → [labels]
 ```
 
-After stage 3 you also get:
+The `landmark_mapping_filtered.json` here is the rewriter's own
+per-component guess — sometimes pulling in labels from other scenes'
+vocabularies. Step 3b cleans it up before visibility annotation.
+
+#### 2.3 Partition (uses rollout frames)
+
+Splits each surviving sub-path into a spatial segment + a landmark
+segment, picking the cut point from `rollout_viz/{scan}/frames.jsonl`
+(see geometry note below). Drops sub-paths where partition errored.
+
+```bash
+bash scripts/filter.sh 3 --from_yaml "$SEL"
+```
+
+Produces:
 
 ```
 partition/X7HyMhZNoso/{instruction_id}/partition.json
 partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png
 ```
 
-Partition reads `rollout_viz/{scan}/frames.jsonl` when present. It accumulates
-signed rollout turn angles (`TURN_RIGHT` positive, `TURN_LEFT` negative). If
-`|cumulative turn| >= turn_thresh_deg` before the forward-distance cutoff, the
-sub-path is treated as "with turn" and the partition is placed after another
-0.3 m of forward motion from that threshold-crossing step. Otherwise it is
-treated as move-forward and cut after 0.3 m from the start of the rollout
-sub-path segment. If rollout frames are missing, it falls back to the reference
-path using the same distance threshold.
-
 After stage 3, `current.yaml` points to `03_partition.yaml` — the final
-sub-path-level survivor set.
+sub-path-level survivor set used by step 3 below.
 
-## 3. Scene object lists
+##### Partition geometry
 
-Cache each scan's MP3D `.house` object vocabulary so the LLM remap step
-has a fixed candidate list (and you can reuse it for debugging).
+Partition reads `rollout_viz/{scan}/frames.jsonl` when present. It
+accumulates signed rollout turn angles (`TURN_RIGHT` positive,
+`TURN_LEFT` negative). If `|cumulative turn| >= turn_thresh_deg` before
+the forward-distance cutoff, the sub-path is treated as "with turn" and
+the partition is placed after another 0.3 m of forward motion from that
+threshold-crossing step. Otherwise it is treated as move-forward and
+cut after 0.3 m from the start of the rollout sub-path segment. If
+rollout frames are missing, it falls back to the reference path using
+the same distance threshold.
+
+## 3. Target instance selection
+
+Pick one MP40 instance id per surviving sub-path as the navigation
+target. Four steps — the first two prep a clean per-scan vocabulary
+for the rewriter's mention → label map, then visibility is annotated
+and the final target is chosen.
+
+```text
+list_scene_categories      ← scene vocab cache
+        │
+        ▼
+refine_landmark_mapping    ← LLM, rewrites landmark_mapping_filtered.json
+        │
+        ▼
+list_target_instances      ← enumerate candidate instances + uniqueness tag
+        │
+        ▼
+select_target_instances    ← pick the nearest one to the sub-path end
+                             (skipped when uniqueness == unique)
+```
+
+### 3a. Cache the scan's object vocabulary
+
+Parses each scan's MP3D `.house` to get the instantiated MPCAT40 category
+list, matching the labels used by rollout viz. This is the **only** allowed
+vocabulary for the refine step below.
 
 ```bash
 bash scripts/list_scene_categories.sh --from_yaml "$SEL" --objects_only
@@ -141,49 +205,45 @@ Writes:
 scene_categories/X7HyMhZNoso/objects.json
 ```
 
-Drop `--objects_only` if you also want a Habitat semantic-annotation
-dump (instance counts per category) at `categories.json`.
+### 3b. Refine landmark mapping (LLM, per-scan)
 
-## 4. Refine landmark mapping
-
-The rewriter's `landmark_mapping_filtered.json` is built
-component-by-component during stage 2 and can include labels the LLM
-pulled from other scenes' vocabularies. This step re-asks the LLM to
-map every mention to candidates drawn **only from this scan's**
-`objects.json`.
-
-Inputs (per scan):
-- `rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json` — source of mentions (one file per episode)
-- `scene_categories/X7HyMhZNoso/objects.json` — allowed label vocabulary
-
-Output (overwrites in place):
-- `rewrite/X7HyMhZNoso/landmark_mapping_filtered.json` — `{mention: [labels]}`,
-  every label guaranteed to be a verbatim entry of `objects.json`
+Re-asks the LLM to map every mention to candidates drawn **only** from
+that scan's `objects.json`. Overwrites the previous
+`landmark_mapping_filtered.json` in place.
 
 ```bash
-GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh \
-    --from_yaml results/val_unseen_partial_one_scene/filters/current.yaml
+GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh --from_yaml "$SEL"
 ```
 
-If `objects.json` is missing for a scan, the tool falls back to live
-`.house` parsing (with a WARNING). Pass `--rewrite_config` to override
-model / temperature / `max_tokens`; defaults live in
-`configs/rewrite/rewrite_subinstructions.yaml`.
+> **Why `max_tokens` is large**: the model in
+> `configs/rewrite/rewrite_subinstructions.yaml` is `gemini-2.5-flash`,
+> a thinking model whose internal reasoning is billed against
+> `max_tokens`. The remap response is one big JSON over every mention
+> in a scan, so we set `max_tokens: 32768` to leave room for both the
+> thinking trace and the actual output. With a small budget (e.g.
+> 4096) the JSON gets truncated mid-string and the script fails with
+> `Unterminated string ... could not parse JSON`. Non-thinking
+> alternatives like `gemini-2.0-flash` are no longer available to new
+> Gemini API accounts.
 
-## 5. Visibility checks
+### 3c. Enumerate candidate target instances at the partition point
 
-Four sub-steps, all **non-filtering** — none of them touches
-`current.yaml`. They classify, choose, and stress-test the landmark
-visibility on the survivor set from step 2.
-
-### 5a. Render visibility from each partition point
-
-For every surviving `(ep, sub)`, render a 360° semantic panorama at the
-**partition point** and count distinct MP40 instances of the matched
-landmark category.
+For every surviving `(ep, sub)`, render a 360° semantic panorama at
+the **partition point** (the turn node between this sub-path and the
+next; usually a virtual `virt:...` node from `partition.json`) and
+list every visible MP40 instance whose category matches the landmark.
+`uniqueness` is decided from the **count of visible instances at that
+vantage point**, not the whole-scene total — that count is what
+determines whether downstream selection has a unique target without
+extra disambiguation. A per-candidate mask PNG is rendered at the
+same pose by default.
 
 ```bash
-bash scripts/annotate_visibility.sh --from_yaml "$SEL"
+bash scripts/list_target_instances.sh --from_yaml "$SEL"
+# skip the per-candidate viz PNGs (faster):
+bash scripts/list_target_instances.sh --from_yaml "$SEL" --no_save_viz
+# tighten the pixel threshold per instance:
+bash scripts/list_target_instances.sh --from_yaml "$SEL" --min_pixel_count 100
 ```
 
 Reads:
@@ -193,91 +253,50 @@ Reads:
 - `partition/X7HyMhZNoso/{ep}/partition.json`
 
 Writes:
-- `landmark_visibility/X7HyMhZNoso/visibility.json`
+- `target_instances/X7HyMhZNoso/target_instances.json` — per (ep, sub):
+  `landmark`, `semantic_labels`, `matched_category`,
+  `matched_categories`, `matched_by`, `pixel_count`, `pixel_fraction`,
+  `candidates[]` (each `{id, category, n_pixels}` plus `viz_path` and
+  `viz_visible_pixels` when viz is on), and `uniqueness` ∈ {`unique`,
+  `ambiguous`, `not_visible`, `no_match`, `partition_pos_unresolvable`}.
+- `target_instances/viz/X7HyMhZNoso/{ep}/sub_{NNN}_cand_{IID}.png` —
+  one RGB + semantic panorama per visible candidate, rendered at the
+  partition point with a target-mask strip below.
 
-Per sub-path: `status` ∈ {`visible`, `not_visible`, `no_match`,
-`partition_pos_unresolvable`, `partition_json_missing`}, plus
-`n_instances`, `matched_categories`, `pixel_count`, and a per-instance
-`instances[]` list.
+### 3d. Choose the target instance
 
-### 5b. Summarise unique vs ambiguous visible cases
+The selection runs **on the sub-path's final node** (`sub_path_nodes[-1]`,
+the last step), not the partition point. This matters when ranking
+multiple candidates: the agent is supposed to end up near the target,
+so distance is measured from where it stops.
 
-```bash
-bash scripts/count_visible_unique.sh --from_yaml "$SEL"
-# inspect non-unique cases:
-bash scripts/count_visible_unique.sh --from_yaml "$SEL" --print_non_unique
-```
+Rule:
 
-Reads `landmark_visibility/*/visibility.json` (all scans), prints a
-status breakdown and a per-scan / per-category summary. No file output.
-
-### 5c. Pick a concrete target instance per sub-path
-
-For visible-unique or visible-dominant cases, fix one MP40 instance id
-as the navigation target. The "dominant" rule keeps the largest visible
-instance when it is at least `--dominance_ratio` (default 3×) the
-second-largest.
+- **1 visible instance** → that instance (`view_unique`).
+- **>1 visible instances** → the instance whose AABB center is
+  closest to the sub-path end point (`view_nearest`). The Habitat
+  scene is loaded once per scan and its semantic annotations supply
+  every instance's center in habitat coordinates.
+- **>1 visible but no instance centers available** → fall back to the
+  largest-pixel instance (`view_nearest_fallback`).
 
 ```bash
 bash scripts/select_target_instances.sh --from_yaml "$SEL"
-# tune the ratio:
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --dominance_ratio 2.5
+# list every multi-candidate sub-path with its chosen id + distances:
+bash scripts/select_target_instances.sh --from_yaml "$SEL" --print_multi
+# lighter .house-only debug image instead of the Habitat render:
+bash scripts/select_target_instances.sh --from_yaml "$SEL" --viz_mode topdown
+# skip viz altogether:
+bash scripts/select_target_instances.sh --from_yaml "$SEL" --no_save_viz
 ```
 
 Writes:
-- `target_instances/target_instances.json` — per (ep, sub) chosen
-  `target_instance_ids` + verdict (`view_unique` / `view_dominant` /
-  `ambiguous` / `visibility:no_match` / `visibility:not_visible`)
+- `target_instances/target_instances.json` — per (ep, sub):
+  `target_instance_ids`, `status` (one of the verdicts above),
+  `selection_distance` (chosen instance's distance to the sub-path
+  end, metres), `candidate_distances` (per-id distance map), plus the
+  full `candidates[]` carried over from visibility.
 - `target_instances/viz/X7HyMhZNoso/{ep}/sub_{NNN}_id_{IID}.png` —
-  rollout-style RGB+semantic panel with a target-mask strip below.
-  Pass `--viz_mode topdown` for a lightweight `.house`-only debug
-  image, or `--no_save_viz` to skip.
-
-### 5d. Robustness check: visibility under start-position perturbation
-
-Stand at the **start of each sub-trajectory** and render 8 panoramas
-on a 0.5 m circle around that node. Count how many of those positions
-still see one of the chosen `target_instance_ids`, and whether any
-**other** visible instance shares that target instance's MP40 category.
-This diagnoses both target visibility and category-level uniqueness.
-
-```bash
-bash scripts/perturb_visibility.sh --from_yaml "$SEL"
-# tune the perturbation:
-bash scripts/perturb_visibility.sh --from_yaml "$SEL" --radius 0.3 --n 16
-# render at the raw position without snapping to navmesh:
-bash scripts/perturb_visibility.sh --from_yaml "$SEL" --no_snap
-```
-
-Defaults: `--radius 0.5`, `--n 8`, `--min_pixel_count 50`,
-`--min_original_pixel_fraction 0.5`, snapping on, `--save_viz` on.
-Target visibility in a perturbed view requires both the absolute pixel
-floor and at least 50% of the target's original selected-view pixel
-count. Heading is fixed at 0 (panorama is equirectangular — only
-position matters).
-
-Each perturbation record includes `target_categories`,
-`same_category_hits`, `n_other_same_category`, and `category_unique`.
-`category_unique: true` means the target was visible enough and no
-non-target instance of the same category was visible above the pixel
-threshold from that sampled position.
-
-Reads:
-- `filters/current.yaml`
-- `target_instances/X7HyMhZNoso/target_instances.json` (auto-falls back
-  to the global single file if the per-scan layout isn't in place yet)
-- Connectivity DB for the start-node 3-D position
-
-Writes:
-- `perturb_visibility/X7HyMhZNoso/summary.json` — scan-level summary
-  and an index of per-sub-trajectory JSON files.
-- `perturb_visibility/X7HyMhZNoso/{ep}/sub_{NNN}/visibility.json` —
-  one file per sub-trajectory with `n_perturbations`, `n_visible`,
-  `all_visible`, `n_category_unique`, `all_category_unique`, and the
-  per-sample records.
-- `perturb_visibility/X7HyMhZNoso/{ep}/sub_{NNN}/k_{KK}.png` — one PNG
-  per perturbation, saved next to that sub-trajectory's JSON. It shows
-  the 360° RGB panorama with red overlay on target-instance pixels and
-  a caption (`k / angle / VIS / px current-required / UNIQ-or-SAME /
-  snap`). Skip with `--no_save_viz`; tune width with
-  `--panorama_width 1024`.
+  RGB + semantic panorama rendered at the sub-path end node, with a
+  target-mask strip below highlighting the chosen instance. Each PNG
+  is what the agent should see at its last step.

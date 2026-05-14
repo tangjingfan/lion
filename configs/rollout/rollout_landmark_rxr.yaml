@@ -60,6 +60,10 @@ env:
   forward_step_size: 0.25  # metres
   turn_angle: 15.0         # degrees
 
+  # ShortestPathFollower (OracleAgent) parameters
+  goal_radius: 0.5         # geodesic "reached" threshold per waypoint, metres
+  max_steps_per_wp: 100    # safety cap per waypoint to break follower oscillation
+
 # ============================================================
 #  Output — only the base directory lives here.
 #  Per-experiment overrides (run_name / expname / viz toggles /

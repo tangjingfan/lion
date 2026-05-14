@@ -35,7 +35,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from src.dataset.landmark_rxr import LandmarkRxREpisode
 
@@ -58,30 +58,49 @@ def make_client(api_key: str):
 # ---------------------------------------------------------------------------
 
 def parse_house_objects(scenes_dir: str, scan: str) -> List[str]:
-    """Return sorted list of unique object category names defined in the scene.
+    """Return sorted MPCAT40 category names instantiated in the scene.
 
-    Parses C lines from the MP3D .house file (all defined categories, not just
-    instantiated ones) so the LLM has the full vocabulary to match against.
+    Habitat-Sim's semantic scene, and therefore rollout viz, exposes
+    MP40/MPCAT40 names via ``obj.category.name()``.  MP3D ``.house`` files also
+    contain raw category names, but those do not always match the labels used
+    by semantic rendering.  Read the C-line MPCAT40 name and collect only
+    categories referenced by O-line object instances so the LLM vocabulary uses
+    the same naming surface as downstream viz and visibility checks.
     """
     house_path = Path(scenes_dir) / "mp3d" / scan / f"{scan}.house"
     if not house_path.exists():
         return []
 
-    names: set = set()
+    cat_index_to_mpcat40: Dict[int, str] = {}
+    used_cat_indices: Set[int] = set()
     with open(house_path) as f:
         for line in f:
             parts = line.split()
             if not parts:
                 continue
-            if parts[0] == "C" and len(parts) >= 4:
+            if parts[0] == "C" and len(parts) >= 6:
                 try:
-                    name = parts[3].replace("#", " ")
-                    names.add(name)
+                    cat_index = int(parts[1])
+                    name = parts[5].replace("#", " ").strip()
                 except ValueError:
-                    pass
+                    continue
+                if name:
+                    cat_index_to_mpcat40[cat_index] = name
+            elif parts[0] == "O" and len(parts) >= 4:
+                try:
+                    used_cat_indices.add(int(parts[3]))
+                except ValueError:
+                    continue
 
     skip = {"remove", "void", "object", "misc"}
-    return [n for n in sorted(names) if n not in skip]
+    names = {
+        cat_index_to_mpcat40[idx]
+        for idx in used_cat_indices
+        if idx in cat_index_to_mpcat40
+    }
+    if not names:
+        names = set(cat_index_to_mpcat40.values())
+    return [n for n in sorted(names) if n.lower() not in skip]
 
 
 # ---------------------------------------------------------------------------
@@ -138,20 +157,37 @@ For EACH segment produce FOUR fields:
      Each atom must be one of the four listed above — nothing else.
 
   5. KEEP
-     true  — the landmark is specific and locatable (a named object, piece of furniture,
-              named room, etc. that an agent can reliably navigate to).
-     false — the landmark is too ambiguous or too general to locate reliably, e.g.:
-               • generic architectural features: "wall", "floor", "ceiling", "area", "space"
-               • vague spatial references: "somewhere", "spot", "place", "location"
-               • overly broad categories: "somewhere in the room"
-             Note: "doorway", "corridor", "hallway" are spatial but still locatable → keep=true.
-             Only set keep=false for landmarks a robot genuinely cannot navigate to.
+     true  — the landmark is specific and locatable: a named concrete object,
+              a piece of furniture, a named room, or any other anchor that a
+              robot can reliably navigate to AND distinguish from its
+              surroundings (e.g. "teapot on the table", "bath", "kitchen",
+              "staircase", "fridge", "framed painting").
+
+     false — the landmark is a generic architectural feature, a non-referrable
+              transitional space, or a vague reference.  An MP3D semantic
+              instance of these may exist in the scene, but choosing one
+              specific instance to ground the instruction on is unreliable.
+              Set keep=false when the landmark phrase is essentially one of:
+
+               • generic architectural surfaces / fixtures:
+                   "wall", "floor", "ceiling", "door", "window"
+               • transitional spaces (the agent moves *through*, not *to*):
+                   "doorway", "archway", "threshold", "hallway", "corridor",
+                   "passage", "passageway", "landing"
+               • vague spatial references:
+                   "area", "space", "somewhere", "spot", "place", "location",
+                   "somewhere in the room"
+
+             This applies regardless of LANDMARK_CATEGORY — a "spatial" or
+             "object" classification does not override the keep=false rule.
+             Only emit keep=true when the segment names a SPECIFIC anchor a
+             robot can actually navigate to (not just walk past).
 
 Respond with ONLY a JSON array (no markdown, no explanation), one object per segment,
 with keys: "landmark", "landmark_category", "landmark_instruction",
 "spatial_instruction", "keep".
 
-Example:
+Examples:
 [
   {
     "landmark": "teapot on the table",
@@ -161,11 +197,25 @@ Example:
     "keep": true
   },
   {
+    "landmark": "kitchen",
+    "landmark_category": "room",
+    "landmark_instruction": "Go to the kitchen.",
+    "spatial_instruction": "Go forward.",
+    "keep": true
+  },
+  {
+    "landmark": "doorway",
+    "landmark_category": "spatial",
+    "landmark_instruction": "Go to the doorway.",
+    "spatial_instruction": "Turn left.",
+    "keep": false
+  },
+  {
     "landmark": "corridor",
     "landmark_category": "spatial",
     "landmark_instruction": "Go to the corridor.",
-    "spatial_instruction": "Turn left.",
-    "keep": true
+    "spatial_instruction": "Go forward.",
+    "keep": false
   },
   {
     "landmark": "wall",

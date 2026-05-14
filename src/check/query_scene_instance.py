@@ -396,6 +396,7 @@ def _render_mask_for_rollout_frame(
         instruction_id=frame_record.get("instruction_id", "unknown"),
         instruction=frame_record.get("instruction", ""),
         sub_paths=[None] * int(frame_record.get("sub_total") or 1),
+        sub_instructions=[],
     )
     canvas = _compose(
         obs=obs,

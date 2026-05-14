@@ -8,8 +8,8 @@ exposes (e.g. "refrigerator" rather than "fridge", "stairs" rather than
 "stair case").
 
 It can also read a selection / filter YAML, infer which scenes are used by the
-selected instructions, and dump the MP3D ``.house`` object vocabulary for those
-scenes.  By default, writes JSON dumps under the current experiment's
+selected instructions, and dump each scene's instantiated MPCAT40 vocabulary.
+By default, writes JSON dumps under the current experiment's
 ``{output.base_dir}/{run_name}/scene_categories/`` folder; the console listing
 is just a preview.
 
@@ -117,7 +117,7 @@ def main() -> None:
                     help="Selection/filter/replay YAML to merge before "
                          "inferring scans from selected instructions.")
     ap.add_argument("--objects_only", action="store_true",
-                    help="Only write MP3D .house object lists for inferred "
+                    help="Only write MPCAT40 object lists for inferred "
                          "or explicit scans; skip Habitat semantic categories.")
     ap.add_argument("--grep", default=None,
                     help="Case-insensitive regex; only print categories "
@@ -175,6 +175,7 @@ def main() -> None:
             object_payload = {
                 "scan": scan,
                 "scene_file": scene_file,
+                "object_list_source": "house_mpcat40_instances",
                 "object_list": object_list,
             }
 
@@ -187,6 +188,14 @@ def main() -> None:
 
             assert checker is not None
             counts, cat_id_to_name = _list_categories(checker, scene_file)
+            if counts:
+                object_list = sorted(counts.keys())
+                object_payload = {
+                    "scan": scan,
+                    "scene_file": scene_file,
+                    "object_list_source": "habitat_mpcat40_instances",
+                    "object_list": object_list,
+                }
 
             objects_path = scan_dir / "objects.json"
             with open(objects_path, "w") as f:

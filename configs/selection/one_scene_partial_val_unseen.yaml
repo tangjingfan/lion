@@ -3,7 +3,7 @@
 # Original split this selection was drawn from
 split: val_unseen
 
-expname: partial_one_scene
+expname: one_scene_partial
 
 # Scenes to include ([] = same as parent config / no restriction)
 scans: []

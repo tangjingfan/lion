@@ -16,9 +16,12 @@
 #   bash scripts/filter.sh 2 [--from_yaml configs/selection/exp.yaml]
 #   bash scripts/filter.sh 3 [--from_yaml configs/selection/exp.yaml]
 #
-# Visibility annotation (classification only, no dropping) lives outside
-# this filter pipeline:
-#   bash scripts/annotate_visibility.sh [--from_yaml ...]
+# After all four stages, the target-instance-selection phase lives in
+# its own scripts (each is classification / selection, no dropping):
+#   bash scripts/list_scene_categories.sh    --from_yaml ... --objects_only
+#   bash scripts/refine_landmark_mapping.sh  --from_yaml ...
+#   bash scripts/list_target_instances.sh    --from_yaml ...
+#   bash scripts/select_target_instances.sh  --from_yaml ...
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

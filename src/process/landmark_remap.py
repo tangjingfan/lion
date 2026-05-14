@@ -1,4 +1,4 @@
-"""LLM-driven per-scene landmark mention → MP3D object label remap.
+"""LLM-driven per-scene landmark mention → MPCAT40 object label remap.
 
 Refines the cross-episode landmark mapping produced by the rewriter by
 re-asking an LLM to map each mention to the actual MP3D ``.house`` object
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Sequence
 _REMAP_SYSTEM = """\
 You are a spatial navigation assistant for an indoor robot.
 
-You receive ONE scene's full MP3D object vocabulary and a list of short
+You receive ONE scene's instantiated MPCAT40 object vocabulary and a list of short
 noun-phrase mentions extracted from human navigation instructions about
 that scene.
 

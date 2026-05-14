@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# List MP40 / MP3D semantic categories present in a scene.
+# Cache each scan's instantiated MPCAT40 object vocabulary as JSON.
 #
-# Useful for debugging "no_match" cases in landmark visibility — tells you
-# what category *names* the scene's semantic mesh actually exposes (e.g.
-# "refrigerator" not "fridge").
+# Pipeline role: prerequisite for `refine_landmark_mapping.sh` — that tool
+# only accepts labels drawn from this scan's `objects.json`. Run with
+# `--objects_only` against the experiment's selection YAML to produce the
+# `objects.json` files refine_landmark_mapping expects.
+#
+# Also handy as a debugger for "no_match" landmark-visibility cases (e.g.
+# the scene exposes "refrigerator", not "fridge"); the --scan / --grep
+# flags below cover that use.
 #
 # Usage:
+#   bash scripts/list_scene_categories.sh --from_yaml configs/selection/exp.yaml --objects_only
 #   bash scripts/list_scene_categories.sh --scan X7HyMhZNoso
 #   bash scripts/list_scene_categories.sh --scan X7HyMhZNoso --grep fridge
 #   bash scripts/list_scene_categories.sh --scan X7HyMhZNoso --scan oLBMNvg9in8
-#   bash scripts/list_scene_categories.sh --from_yaml configs/selection/val_unseen_example.yaml --objects_only
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

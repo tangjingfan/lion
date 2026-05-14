@@ -4,8 +4,10 @@ Abstract base agent and built-in agents.
 Built-in agents
 ---------------
   DummyAgent   — random actions, for pipeline smoke-testing
-  OracleAgent  — follows the GT reference path using habitat-sim's
-                 GreedyGeodesicFollower (upper-bound / GT trajectory)
+  OracleAgent  — follows the GT reference path using habitat-lab's
+                 ShortestPathFollower in a per-waypoint inner loop
+                 (CL_CoTNav style; the rollout driver consumes
+                 OracleAgent.follower directly and does not call step()).
 
 To plug in a real agent:
   1. Subclass BaseAgent
@@ -17,9 +19,7 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
-
-import numpy as np
+from typing import Any, Dict, List
 
 from src.dataset.landmark_rxr import LandmarkRxREpisode
 from src.env.habitat_env import MOVE_FORWARD, STOP, TURN_LEFT, TURN_RIGHT
@@ -68,81 +68,50 @@ class DummyAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 class OracleAgent(BaseAgent):
-    """Follows the GT reference path using habitat-sim's GreedyGeodesicFollower.
+    """Owns a ShortestPathFollower for following the GT reference path.
 
-    Advances through the navmesh-snapped GT waypoints in order.  For each
-    step it asks the follower for the best action toward the current waypoint;
-    once the agent is within goal_radius it moves on to the next waypoint and
-    stops after the last one.
+    The rollout driver (``rollout._drive_oracle``) consumes
+    ``self.follower`` and ``self.waypoints`` directly in a per-waypoint
+    inner loop (CL_CoTNav pattern), so ``step()`` is never called and
+    raises if used.
 
-    set_env() must be called after every env.reset() (rollout.py does this
-    automatically) because reconfigure() rebuilds the pathfinder per scene.
-
-    Note: habitat-sim 0.3.1 has no ShortestPathFollower in Python bindings;
-    GreedyGeodesicFollower is the equivalent (geodesic / navmesh shortest path).
-    We use integer action keys so next_action_along() returns the same action
-    IDs consumed by Habitat-Lab's simulator wrapper.
+    set_env() must be called after every env.reset() because make_sim
+    can rebuild the underlying simulator per scene.
     """
 
-    # GreedyGeodesicFollower returns the exact action keys we register.
-    _KEY_TO_ACTION = {
-        MOVE_FORWARD: MOVE_FORWARD,
-        TURN_LEFT: TURN_LEFT,
-        TURN_RIGHT: TURN_RIGHT,
-    }
-
-    def __init__(self) -> None:
-        self._follower = None       # habitat_sim.nav.GreedyGeodesicFollower
+    def __init__(self, goal_radius: float = 0.5) -> None:
+        self._goal_radius = float(goal_radius)
+        self._follower = None
         self._waypoints: List[List[float]] = []
-        self._wp_idx: int = 0
-        self._goal_radius: float = 0.5   # metres — advance to next waypoint
 
     def set_env(self, env) -> None:
-        """Bind follower to the current scene's pathfinder. Call after each env.reset()."""
-        import habitat_sim
-        pathfinder = env.get_pathfinder()
-        agent      = env._sim.get_agent(0)
-        self._follower = habitat_sim.nav.GreedyGeodesicFollower(
-            pathfinder=pathfinder,
-            agent=agent,
+        """Bind the follower to the current scene's simulator."""
+        from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
+        self._follower = ShortestPathFollower(
+            sim=env._sim,
             goal_radius=self._goal_radius,
-            forward_key=MOVE_FORWARD,
-            left_key=TURN_LEFT,
-            right_key=TURN_RIGHT,
+            return_one_hot=False,
+            stop_on_error=True,
         )
 
     def reset(self, episode: LandmarkRxREpisode) -> None:
-        # reference_path is at navmesh height (set by env.reset)
-        self._waypoints = episode.reference_path[1:]  # skip start node
-        self._wp_idx = 0
-        if self._follower is not None:
-            self._follower.reset()
+        # reference_path is at navmesh height (set by env.reset); skip the
+        # start node since the agent is already placed there.
+        self._waypoints = list(episode.reference_path[1:])
 
     def step(self, obs: Dict[str, Any]) -> int:
-        if self._follower is None or self._wp_idx >= len(self._waypoints):
-            return STOP
+        raise NotImplementedError(
+            "OracleAgent is driven by rollout._drive_oracle via the "
+            "ShortestPathFollower; step() should not be called."
+        )
 
-        goal = np.array(self._waypoints[self._wp_idx], dtype=np.float32)
-        cur  = obs["position"]
+    @property
+    def follower(self):
+        return self._follower
 
-        # Advance waypoint when close enough
-        if np.linalg.norm(cur - goal) < self._goal_radius:
-            self._wp_idx += 1
-            if self._wp_idx >= len(self._waypoints):
-                return STOP
-            goal = np.array(self._waypoints[self._wp_idx], dtype=np.float32)
-
-        try:
-            action_key = self._follower.next_action_along(goal)
-        except Exception:
-            return STOP
-
-        if action_key is None:
-            # Follower says we're at this waypoint — move to next
-            self._wp_idx += 1
-            return STOP if self._wp_idx >= len(self._waypoints) else MOVE_FORWARD
-
-        return self._KEY_TO_ACTION.get(action_key, STOP)
+    @property
+    def waypoints(self) -> List[List[float]]:
+        return self._waypoints
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +119,19 @@ class OracleAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 def build_agent(cfg: dict) -> BaseAgent:
-    """Instantiate an agent from the "agent" config section."""
-    agent_type = cfg.get("type", "dummy").lower()
+    """Instantiate an agent from the top-level rollout config.
+
+    Reads agent type from cfg["agent"] and OracleAgent's follower
+    ``goal_radius`` from cfg["env"] so the parameter lives next to the
+    rest of the simulator config.
+    """
+    agent_cfg = cfg.get("agent", {})
+    env_cfg = cfg.get("env", {})
+    agent_type = agent_cfg.get("type", "dummy").lower()
     if agent_type == "dummy":
         return DummyAgent()
     if agent_type == "oracle":
-        return OracleAgent()
+        return OracleAgent(goal_radius=env_cfg.get("goal_radius", 0.5))
     raise ValueError(
         f"Unknown agent type: {agent_type!r}. "
         "Implement a BaseAgent subclass and register it here."

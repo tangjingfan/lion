@@ -67,8 +67,10 @@ STAGE_NAME = "blacklist"
 # MP40 object category, so it stays out of the blacklist.
 DEFAULT_BLACKLIST = (
     "hallway", "corridor", "passage", "passageway",
+    "doorway", "door way", "archway", "threshold",
+    "entrance", "entryway", "opening",
     "area", "space",
-    "door", "window",
+    "door", "window", "wall", "floor", "ceiling",
 )
 
 SPECIFIC_ROOM_TERMS = (
@@ -76,6 +78,12 @@ SPECIFIC_ROOM_TERMS = (
     "foyer", "garage", "hall", "kitchen", "laundry room", "library",
     "living room", "lounge", "meeting room", "office", "rec room",
     "tv room", "utility room",
+)
+
+SAFE_COMPOUND_TERMS = (
+    "wall clock", "wall art", "wall painting", "wall picture",
+    "floor lamp", "ceiling light", "ceiling fan",
+    "window blinds", "window shade", "window curtain",
 )
 
 
@@ -89,18 +97,72 @@ def _is_generic_room_landmark(landmark: str) -> bool:
     )
 
 
+def _term_pattern(term: str) -> re.Pattern:
+    """Whole-phrase term matcher with simple plural tolerance.
+
+    The previous exact whole-word regex caught ``door`` but missed ``doors``.
+    These labels are noisy LLM strings rather than a controlled ontology, so a
+    small amount of morphology buys a lot of robustness without making the
+    rules fuzzy.
+    """
+    words = [re.escape(w) for w in term.split()]
+    sep = r"[\s_-]+"
+    body = sep.join(words)
+    suffix = r"(?:s|es)?" if not term.endswith(("s", "y")) else r""
+    return re.compile(rf"(?<![a-z0-9]){body}{suffix}(?![a-z0-9])")
+
+
+def _matches_blacklist(text: str, blacklist: Tuple[str, ...]) -> str:
+    text = (text or "").strip().lower().replace("-", " ").replace("_", " ")
+    if not text:
+        return ""
+    if any(re.search(rf"\b{re.escape(term)}\b", text) for term in SAFE_COMPOUND_TERMS):
+        return ""
+    for term in blacklist:
+        if _term_pattern(term.lower()).search(text):
+            return term
+    return ""
+
+
+def _component_labels(components: List[Dict]) -> List[str]:
+    return [
+        (comp.get("semantic_label") or "").strip().lower()
+        for comp in components
+        if (comp.get("semantic_label") or "").strip()
+    ]
+
+
 def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]:
-    """Return ``(keep, reason)`` for one sub-path's rewrite entry."""
+    """Return ``(keep, reason)`` for one sub-path's rewrite entry.
+
+    Decision order (primary → fallback):
+      1. ``keep`` field from the rewriter (LLM verdict).  This is the
+         authoritative signal — a properly tuned rewriter already marks
+         non-referrable landmarks (walls, doorways, corridors, ...) as
+         ``keep=false``.
+      2. ``generic_room`` pattern — vague "room" phrases without a named
+         room type.
+      3. Regex ``DEFAULT_BLACKLIST`` — defence-in-depth safety net that
+         catches generic terms slipping through the LLM.
+      4. Mapped semantic label sanity — drop unmapped non-spatial
+         landmarks; drop any whose mapped label hits the blacklist.
+    """
     category   = (rewrite_sub.get("landmark_category") or "object").lower()
     landmark   = (rewrite_sub.get("landmark") or "").strip().lower()
     components = rewrite_sub.get("components") or []
 
+    # 1. Primary: trust the LLM's keep verdict.
+    if not bool(rewrite_sub.get("keep", True)):
+        return False, "llm_keep_false"
+
+    # 2. Cheap text pattern that the LLM occasionally misses.
     if _is_generic_room_landmark(landmark):
         return False, "generic_room"
 
-    for word in blacklist:
-        if re.search(rf"\b{re.escape(word)}\b", landmark):
-            return False, f"blacklist:{word}"
+    # 3. Regex safety net on the landmark phrase itself.
+    hit = _matches_blacklist(landmark, blacklist)
+    if hit:
+        return False, f"blacklist:{hit}"
 
     # Spatial landmarks may not have MP3D components.  Keep them unless the
     # landmark phrase itself is one of the explicitly hard-to-refer terms.
@@ -114,9 +176,13 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
     if not mapped or all(s in ("", "unknown") for s in mapped):
         return False, "unmapped"
 
-    for word in blacklist:
-        if any(re.search(rf"\b{re.escape(word)}\b", label) for label in mapped):
-            return False, f"blacklist:{word}"
+    # 4. Same regex net on mapped labels.  Avoid using descriptions here:
+    # they often include contextual text ("teapoy ... facing the glass door")
+    # where the blacklisted object is not the target landmark.
+    for label in _component_labels(components):
+        hit = _matches_blacklist(label, blacklist)
+        if hit:
+            return False, f"blacklist:{hit}"
 
     return True, "ok"
 
