@@ -6,13 +6,16 @@ Landmark-RxR rollout + dataset-curation pipeline adapted from LION-Bench.
 Habitat-Lab's `rgbds_agent` provides `rgb`, `depth`, and `semantic`
 observations.
 
-This README walks through the three core stages end-to-end:
+This README walks through the four core stages end-to-end:
 
 1. **Rollout** — drive the agent through every selected episode.
-2. **Filter pipeline** — narrow `(instruction_id, sub_idx)` pairs down to
-   the ones worth grounding.
+2. **Filter pipeline 0-3** — narrow `(instruction_id, sub_idx)` pairs
+   down to the ones worth grounding.
 3. **Target instance selection** — fix one MP40 instance id per
    surviving sub-path as the navigation target.
+4. **Filter pipeline 4 + rescue** — filter final targets by semantic
+   granularity and optionally rescue some coarse instances with
+   YOLO-World (open-vocab detector; VLM as fallback).
 
 ## Setup
 
@@ -77,10 +80,11 @@ Note: `sub_idx` is **0-indexed** everywhere — folder names are `000/`,
 pipeline (step 2) so that partition cut-points reflect actual rollout
 geometry rather than the reference path.
 
-## 2. Filter pipeline
+## 2. Filter pipeline (stages 0-3)
 
-Four stages narrow `(instruction_id, sub_idx)` pairs down to the ones
-worth grounding. Each stage writes to `results/{run}/filters/`:
+The filter pipeline narrows `(instruction_id, sub_idx)` pairs down to
+the ones worth grounding. Run stages 0-3 first; stage 4 runs after
+target instance selection. Each stage writes to `results/{run}/filters/`:
 
 ```
 NN_{name}.yaml          # selection-compatible survivor list
@@ -90,11 +94,31 @@ current.yaml            # symlink to the latest stage's keep file
 ```
 
 `current.yaml` is what every downstream tool reads via `--from_yaml`.
-The four stages are **pure filter** — each one accepts a survivor set
-and emits a smaller one. Vocabulary prep + visibility live in step 3.
+The stages are **pure filter** — each one accepts a survivor set and
+emits a smaller one. Vocabulary prep + visibility live in step 3.
 
 ```bash
 CURRENT=results/val_unseen_partial_one_scene/filters/current.yaml
+```
+
+Note: survivor files such as `filters/current.yaml` or
+`03_partition.yaml` go to `--from_yaml`, not `--config`. The `--config`
+flag is only for rollout configs such as
+`configs/rollout/rollout_landmark_rxr.yaml`.
+
+Execution order:
+
+```text
+filter stages 0-3
+        │
+        ▼
+target instance selection (step 3)
+        │
+        ▼
+optional VLM semantic rescue (step 4)
+        │
+        ▼
+filter stage 4 semantic_granularity (step 4)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -153,8 +177,8 @@ partition/X7HyMhZNoso/{instruction_id}/partition.json
 partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png
 ```
 
-After stage 3, `current.yaml` points to `03_partition.yaml` — the final
-sub-path-level survivor set used by step 3 below.
+After stage 3, `current.yaml` points to `03_partition.yaml` — the
+sub-path-level survivor set used as input by target instance selection.
 
 ##### Partition geometry
 
@@ -171,9 +195,10 @@ the same distance threshold.
 ## 3. Target instance selection
 
 Pick one MP40 instance id per surviving sub-path as the navigation
-target. Four steps — the first two prep a clean per-scan vocabulary
-for the rewriter's mention → label map, then visibility is annotated
-and the final target is chosen.
+target. The first two steps prep a clean per-scan vocabulary for the
+rewriter's mention → label map, then visibility is annotated, the final
+target is chosen. After 3d, continue to step 4 for semantic-granularity
+filtering.
 
 ```text
 list_scene_categories      ← scene vocab cache
@@ -291,12 +316,141 @@ bash scripts/select_target_instances.sh --from_yaml "$SEL" --no_save_viz
 ```
 
 Writes:
-- `target_instances/target_instances.json` — per (ep, sub):
+- `target_instances/X7HyMhZNoso/target_instances.json` — per (ep, sub):
   `target_instance_ids`, `status` (one of the verdicts above),
   `selection_distance` (chosen instance's distance to the sub-path
   end, metres), `candidate_distances` (per-id distance map), plus the
   full `candidates[]` carried over from visibility.
-- `target_instances/viz/X7HyMhZNoso/{ep}/sub_{NNN}_id_{IID}.png` —
-  RGB + semantic panorama rendered at the sub-path end node, with a
-  target-mask strip below highlighting the chosen instance. Each PNG
-  is what the agent should see at its last step.
+- `target_instances/viz_last_frame/X7HyMhZNoso/{ep}/sub_{NNN}_last.png`
+  — the rollout's original last-frame visualization.
+- `target_instances/viz_partition/X7HyMhZNoso/{ep}/sub_{NNN}_id_{IID}.png`
+  — the partition-point target-mask visualization.
+- `target_instances/viz_last_frame_instance/X7HyMhZNoso/{ep}/sub_{NNN}_id_{IID}.png`
+  — when Habitat rendering is available, an RGB + semantic panorama at
+  the sub-path end node with the chosen instance highlighted.
+
+## 4. Filter pipeline (rescue + stage 4)
+
+### 4a. Pixel-grounded semantic rescue (optional, recommended first)
+
+Recover MPCAT40-coarse targets (`appliances` / `lighting` / `objects` /
+…) into fine categories (`stove` / `refrigerator` / `lamp` / …) via
+open-vocabulary detection. Primary path is YOLO-World; the VLM is only
+used as a fallback when the detector returns nothing (off by default).
+
+Inputs: 3c's `target_instances/{scan}/target_instances.json` + rollout
+`frames.jsonl`. Pipeline: pick sub-paths grounded only to coarse semantic
+labels → re-render an RGB and raw semantic panorama at the same pose →
+prompt YOLO-World with the landmark phrase plus synonym expansions
+(`fridge → {fridge, refrigerator}`, `stove → {stove, oven, cooktop,
+range, ...}`) → for each detection (highest score first), query the
+semantic buffer with category-aware instance recovery, preferring
+instances inside the bbox whose MPCat40 name is the coarse bucket
+containing the detector's fine class (e.g. an `appliances` instance when
+the detector says `stove`); the first detection that yields a
+category-matched instance wins. This can rescue examples with
+`target_instance_ids: []` because the instance id comes from the
+detection box.
+
+```bash
+# Dry run — see which coarse sub-paths will be sent to the detector:
+bash scripts/build_vlm_pixel_grounded_rescue.sh \
+    --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --dry_run
+
+# Run for real (first call auto-downloads ~340MB YOLO-World weights + CLIP):
+bash scripts/build_vlm_pixel_grounded_rescue.sh \
+    --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
+
+# Optional VLM fallback (only invoked when YOLO finds nothing above threshold):
+GEMINI_API_KEY=... bash scripts/build_vlm_pixel_grounded_rescue.sh \
+    --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --enable_vlm_fallback
+```
+
+Dependency: `pip install ultralytics` (pulls ultralytics + CLIP; runs on
+CUDA in the `lion` env).
+
+Main CLI options:
+
+- `--yolo_model`: default `yolov8l-worldv2.pt`. Use `yolov8x-worldv2.pt`
+  for more accuracy / slower, or the `s` / `m` variants for speed.
+- `--yolo_conf`: default `0.10`.
+- `--yolo_imgsz`: default `1024`, matches panorama width.
+- `--yolo_device`: override torch device; omit to let ultralytics pick.
+- `--enable_vlm_fallback`: opt-in. Requires `--api_key` / `GEMINI_API_KEY`.
+- `--sample_radius` / `--search_radius`: tight vs wide search shells
+  used during instance recovery.
+
+Writes:
+
+- `target_instances/{scan}/semantic_rescue_categories.json` — per-scan
+  rescue dictionary. Main lookup is `instances["{instance_id}"] ->
+  {category, confidence, is_rescuable, semantic_category,
+  grounding_method, landmarks, examples, image_paths}`.
+  `grounding_method` is `yolo_world` or `vlm_fallback`.
+- `target_instances/{scan}/vlm_pixel_grounding/{episode_id}/sub_{NNN}_{rgb,bbox,point,mask}.png`
+  — clean RGB, detector bbox, bbox center, and the recovered MP3D
+  instance mask overlay.
+- `target_instances/{scan}/vlm_pixel_grounding/vlm_pixel_grounding_summary.{json,png}`
+  — grounding-result JSON plus a contact sheet (4 thumbnails per row,
+  last column is the mask overlay; rows where the detector category
+  doesn't match the recovered semantic label are flagged `[MISMATCH]`).
+
+Loop back to the filter: stage 4b auto-loads the rescue dict on startup
+and flips matching `(episode_id, sub_idx)` or `target_instance_id` hits
+to `ok_rescued` in the survivor YAML — no extra wiring needed.
+
+The older mask-based rescue is still available:
+
+```bash
+bash scripts/build_semantic_rescue_categories.sh --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml --dry_run
+```
+
+It only handles examples that already have `target_instance_ids`,
+asking the VLM to name the existing target mask. Useful for auditing an
+existing selection, but it cannot rescue examples without an instance
+id.
+
+### 4b. Semantic granularity filter (final drop, no LLM)
+
+This step filters semantic-taxonomy failures, not low-visibility cases.
+For example, an instruction may say `stove`, but MP3D/MPCAT40 may only
+label the selected target instance as the coarse class `appliances`
+instead of a standalone `stove` semantic label.
+
+This stage first checks `target_instances/{scan}/semantic_rescue_categories.json`.
+If the VLM rescued this `(episode_id, sub_idx)` or the selected instance id
+with a finer category, the sub-path is kept and audit records `ok_rescued`;
+otherwise the coarse target is dropped.
+
+Rule:
+
+- Read the final selected `target_instance_ids` and inspect the selected
+  instance's semantic label.
+- Drop it if the selected label is only a configured coarse label
+  (default: `appliances`, `objects`, `furniture`, `lighting`) and it was
+  not rescued to a finer category.
+- Keep it when the selected instance has a more specific semantic label,
+  or when VLM rescue succeeded.
+
+```bash
+# After rescue, use the stage-3 survivor set as input for the final filter:
+bash scripts/filter.sh 4 --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
+
+# Report counts only, without writing 04_semantic_granularity.yaml or
+# moving current.yaml:
+python src/check/filter_semantic_granularity.py \
+    --config configs/rollout/rollout_landmark_rxr.yaml \
+    --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --report_only
+```
+
+Writes:
+
+- `filters/04_semantic_granularity.yaml` — survivor set after semantic
+  granularity and rescue checks.
+- `filters/04_semantic_granularity_dropped.yaml` — remaining dropped
+  examples with reason `coarse_semantic_label`, plus `landmark`,
+  `semantic_labels`, `coarse_label`, and `target_instance_ids`.
+- `filters/current.yaml` — repointed to `04_semantic_granularity.yaml`.
