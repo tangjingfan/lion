@@ -150,13 +150,6 @@ def _build_record(
         rec["start_heading"]     = part.get("start_heading")
         rec["forward_distance_m"] = part.get("forward_distance_m")
         rec["turn_delta_deg"]    = part.get("turn_delta_deg")
-        # Rollout-derived geometry stats (carried from partition.json).
-        for k in (
-            "rollout_walk_m", "rollout_walk_start_step", "rollout_cut_step",
-            "rollout_turn_deg", "rollout_turn_steps", "rollout_kind",
-        ):
-            if k in part:
-                rec[k] = part[k]
 
     # Target block.
     if target:
@@ -179,13 +172,9 @@ def _build_record(
         ):
             if k in target:
                 rec[k] = target[k]
-        # Pointers to viz artifacts.
-        for k in (
-            "rollout_last_frame", "rollout_last_step", "rollout_last_viz_path",
-            "partition_viz_path",
-        ):
-            if k in target:
-                rec[k] = target[k]
+        # Pointer to the partition-point viz PNG (when rendered by 08).
+        if "partition_viz_path" in target:
+            rec["partition_viz_path"] = target["partition_viz_path"]
 
     return rec
 
