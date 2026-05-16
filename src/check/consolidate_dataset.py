@@ -147,9 +147,6 @@ def _build_record(
         rec["partition_kind"]    = part.get("kind")
         rec["instruction_kind"]  = part.get("instruction_kind")
         rec["direction_mismatch"] = part.get("direction_mismatch")
-        rec["start_heading"]     = part.get("start_heading")
-        rec["forward_distance_m"] = part.get("forward_distance_m")
-        rec["turn_delta_deg"]    = part.get("turn_delta_deg")
 
     # Target block.
     if target:
