@@ -158,17 +158,6 @@ def _build_record(
             target.get("visibility_status") in ("unique", "ambiguous")
         )
         rec["visibility_status"]          = target.get("visibility_status")
-        rec["pixel_count_at_partition"]   = target.get("pixel_count")
-        rec["selection_distance"]         = target.get("selection_distance")
-        rec["n_candidates"]               = len(target.get("candidates") or [])
-        # Rescue annotations (only present when 10_apply_rescue has run).
-        for k in (
-            "rescue_landmark", "rescue_category",
-            "rescue_grounding_method", "rescue_semantic_category",
-            "rescue_instance_id",
-        ):
-            if k in target:
-                rec[k] = target[k]
         # Pointer to the partition-point viz PNG (when rendered by 08).
         if "partition_viz_path" in target:
             rec["partition_viz_path"] = target["partition_viz_path"]
