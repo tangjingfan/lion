@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import yaml
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -76,6 +77,7 @@ from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import load_connectivity
 from src.process.landmark_remap import lookup_mention_labels
 from src.process.visibility import VisibilityChecker
+from src.viz import _semantic_to_rgb
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +261,9 @@ def main() -> None:
     run_dir  = get_run_dir(cfg)
     out_root = run_dir / "target_instances"
     out_root.mkdir(parents=True, exist_ok=True)
-    viz_root = out_root / "viz"
+    viz_root          = out_root / "viz"
+    partition_obs_root = out_root / "partition_obs"
+    partition_obs_count = 0
     written_paths: List[Path] = []
     uniqueness_counts: Dict[str, int] = defaultdict(int)
     viz_count = 0
@@ -334,6 +338,34 @@ def main() -> None:
                     uniqueness = _uniqueness_verdict(pos, visibility_result)
                     uniqueness_counts[uniqueness] += 1
                     n_total_candidates += len(candidates)
+
+                    # Save the clean partition-pose RGB + semantic panoramas
+                    # once per (ep, sub) — independent of candidates, so
+                    # not_visible sub-paths get a record too.
+                    if args.save_viz and pos is not None:
+                        try:
+                            obs_dir = partition_obs_root / scan / ep_id_str
+                            obs_dir.mkdir(parents=True, exist_ok=True)
+                            checker.load_scene(f"mp3d/{scan}/{scan}.glb")
+                            obs = checker.render_observation(
+                                np.asarray(pos, dtype=np.float32), 0.0,
+                            )
+                            rgb = obs.get("rgb")
+                            sem = obs.get("semantic")
+                            if rgb is not None:
+                                Image.fromarray(rgb).save(
+                                    obs_dir / f"sub_{sub_idx_int:03d}_rgb.png"
+                                )
+                            if sem is not None:
+                                Image.fromarray(_semantic_to_rgb(sem)).save(
+                                    obs_dir / f"sub_{sub_idx_int:03d}_semantic.png"
+                                )
+                            partition_obs_count += 1
+                        except Exception as exc:
+                            print(
+                                f"  WARN [{scan} ep={ep_id_str} sub={sub_idx_int}] "
+                                f"partition obs render failed: {exc}"
+                            )
 
                     record: Dict[str, Any] = {
                         "landmark":           landmark,
@@ -422,6 +454,7 @@ def main() -> None:
         print(f"    {verdict:<28s} {n:>4d}  ({pct:.1%})")
     if args.save_viz:
         print(f"  viz saved           : {viz_count}")
+        print(f"  partition obs saved : {partition_obs_count}  (rgb + semantic per sub-path)")
         if viz_errors:
             print(f"  viz errors          : {viz_errors}")
     print(f"\nOutputs ({len(written_paths)} scan file(s)):")
