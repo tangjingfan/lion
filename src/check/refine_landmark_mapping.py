@@ -5,7 +5,7 @@ Reads (per scan):
     — source of every non-spatial mention used by that scene's episodes.
   • ``{run_dir}/scene_categories/{scan}/objects.json`` — instantiated MPCAT40
     object vocabulary for that scan (produced by
-    ``scripts/list_scene_categories.sh --objects_only``).
+    ``scripts/05_get_object_list.sh --objects_only``).
 
 For each scan, asks an LLM to map every mention to candidate labels
 drawn ONLY from that scan's object list — refining the rewriter's own

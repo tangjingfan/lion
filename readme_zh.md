@@ -102,7 +102,7 @@ filter stage 4 semantic_granularity（第 4 章）
 #### 2.0 Snapshot（不丢任何东西）
 
 ```bash
-bash scripts/filter.sh 0 --from_yaml "$SEL"
+bash scripts/00_record_original.sh --from_yaml "$SEL"
 ```
 
 写入 `filters/00_snapshot.yaml` 并把 `current.yaml` 指过去。
@@ -112,7 +112,7 @@ bash scripts/filter.sh 0 --from_yaml "$SEL"
 丢掉参考路径竖直跨度 > 0.5 m 的 episode（视为跨楼层）。
 
 ```bash
-bash scripts/filter.sh 1 --from_yaml "$SEL"
+bash scripts/01_filter_multi_floor.sh --from_yaml "$SEL"
 ```
 
 #### 2.2 LLM 重写
@@ -120,7 +120,8 @@ bash scripts/filter.sh 1 --from_yaml "$SEL"
 对每条幸存 sub-instruction，让 LLM 产出 `landmark + landmark_category + landmark_instruction + spatial_instruction`，外加 per-component 分解。然后丢掉那些"很难指代/落到 MP3D 上"的 landmark（黑名单包括 door、window 等通用词）。
 
 ```bash
-GEMINI_API_KEY=... bash scripts/filter.sh 2 --from_yaml "$SEL"
+GEMINI_API_KEY=... bash scripts/02_rewrite_subinstruction.sh --from_yaml "$SEL"
+bash scripts/03_blacklist_landmark.sh --from_yaml "$SEL"
 ```
 
 产物：
@@ -137,7 +138,7 @@ rewrite/X7HyMhZNoso/landmark_mapping_filtered.json    # mention → [labels]
 把每条幸存 sub-path 切成 spatial 段 + landmark 段，分界点从 `rollout_viz/{scan}/frames.jsonl` 推出来（几何说明见下）。partition 出错的 sub-path 在这一步被丢掉。
 
 ```bash
-bash scripts/filter.sh 3 --from_yaml "$SEL"
+bash scripts/04_partition.sh --from_yaml "$SEL"
 ```
 
 产物：
@@ -180,7 +181,7 @@ select_target_instances    ← 选 sub-path 终点距离最近的那个
 解析每个 scan 的 MP3D `.house` 文件，拿到实际出现的 MPCAT40 类别列表，和 rollout viz 使用的标签一致。这份词表是 3b refine 之后 `landmark_mapping_filtered.json` **唯一允许的**词汇来源。
 
 ```bash
-bash scripts/list_scene_categories.sh --from_yaml "$SEL" --objects_only
+bash scripts/05_get_object_list.sh --from_yaml "$SEL" --objects_only
 ```
 
 产物：
@@ -194,7 +195,7 @@ scene_categories/X7HyMhZNoso/objects.json
 让 LLM 重新做一次映射，候选词汇**只能**从这个 scan 的 `objects.json` 里挑。结果**原地覆盖** `landmark_mapping_filtered.json`。
 
 ```bash
-GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh --from_yaml "$SEL"
+GEMINI_API_KEY=... bash scripts/06_refine_landmark_mapping.sh --from_yaml "$SEL"
 ```
 
 > **关于 `max_tokens` 为什么调得这么大**：`configs/rewrite/rewrite_subinstructions.yaml` 里现在用的是 `gemini-2.5-flash`，这是 thinking 模型，内部推理也会占用 `max_tokens` 预算。这一步的回复又是一个覆盖整个 scan 所有 mention 的大 JSON，所以 `max_tokens` 设到了 `32768`，给 thinking 和输出都留足空间。预算太小（比如 4096）会把 JSON 截断成不闭合的字符串，报 `Unterminated string ... could not parse JSON`。不带 thinking 的 `gemini-2.0-flash` 已经对 Gemini API 新账号下线了。
@@ -204,11 +205,11 @@ GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh --from_yaml "$SEL"
 对每条幸存 `(ep, sub)`，在 **partition 点**（这一段 sub-path 跟下一段之间的转折节点，通常是 `partition.json` 里的 `virt:...` 虚拟节点）渲染一张 360° 语义全景，列出当中匹配 landmark 类别的所有可见 MP40 instance。`uniqueness` 根据**该视角下可见 instance 的数量**决定，不是看全场景总数——只有"agent 站在转折点能不能一眼看清楚"这个量决定了下游是否还需要做消歧。默认还会为每个候选在同一个 pose 渲染一张 mask PNG。
 
 ```bash
-bash scripts/list_target_instances.sh --from_yaml "$SEL"
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL"
 # 不存可视化图（更快）：
-bash scripts/list_target_instances.sh --from_yaml "$SEL" --no_save_viz
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL" --no_save_viz
 # 调高每个 instance 的最小像素阈值：
-bash scripts/list_target_instances.sh --from_yaml "$SEL" --min_pixel_count 100
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL" --min_pixel_count 100
 ```
 
 读取：
@@ -235,13 +236,13 @@ bash scripts/list_target_instances.sh --from_yaml "$SEL" --min_pixel_count 100
 - **多个可见但拿不到位置** → 回退到像素最多的那个（`view_nearest_fallback`）。
 
 ```bash
-bash scripts/select_target_instances.sh --from_yaml "$SEL"
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL"
 # 打印所有多候选 sub-path：选了谁、各候选距离多少
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --print_multi
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --print_multi
 # 用更轻的 .house 顶视图代替 Habitat 渲染（debug 用）
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --viz_mode topdown
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --viz_mode topdown
 # 不存可视化图
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --no_save_viz
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --no_save_viz
 ```
 
 写入：
@@ -265,16 +266,16 @@ bash scripts/select_target_instances.sh --from_yaml "$SEL" --no_save_viz
 
 ```bash
 # Dry run：先看会送哪些 coarse sub-path 进 detector
-bash scripts/build_vlm_pixel_grounded_rescue.sh \
+bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
     --dry_run
 
 # 实际跑（首次会自动下载 ~340MB YOLO-World 权重 + CLIP）：
-bash scripts/build_vlm_pixel_grounded_rescue.sh \
+bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
 
 # 可选 VLM 兜底（YOLO 没检出时才调 Gemini）：
-GEMINI_API_KEY=... bash scripts/build_vlm_pixel_grounded_rescue.sh \
+GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
     --enable_vlm_fallback
 ```
@@ -320,7 +321,7 @@ bash scripts/build_semantic_rescue_categories.sh --from_yaml results/val_unseen_
 
 ```bash
 # rescue 之后，用 stage 3 survivor set 作为输入做最终 semantic filter：
-bash scripts/filter.sh 4 --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
+bash scripts/10_filter_semantic_granularity.sh --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
 
 # 只看统计，不写 04_semantic_granularity.yaml / 不改 current.yaml：
 python src/check/filter_semantic_granularity.py \

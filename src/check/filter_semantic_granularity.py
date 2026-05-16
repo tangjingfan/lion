@@ -232,11 +232,11 @@ def main() -> None:
             "Stage 4 is a filter stage, but it must run after target-instance "
             "selection because it reads the selected target ids. Run these "
             "steps first, then rerun stage 4:\n"
-            f"  bash scripts/list_scene_categories.sh --from_yaml {prior_path}\n"
-            f"  GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/list_target_instances.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/select_target_instances.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/filter.sh 4 --from_yaml {prior_path}"
+            f"  bash scripts/05_get_object_list.sh --from_yaml {prior_path}\n"
+            f"  GEMINI_API_KEY=... bash scripts/06_refine_landmark_mapping.sh --from_yaml {prior_path}\n"
+            f"  bash scripts/07_list_potential_instances.sh --from_yaml {prior_path}\n"
+            f"  bash scripts/08_get_potential_instance.sh --from_yaml {prior_path}\n"
+            f"  bash scripts/10_filter_semantic_granularity.sh --from_yaml {prior_path}"
         )
     rescue_db = {} if args.no_rescue else _load_rescue_db(run_dir)
 

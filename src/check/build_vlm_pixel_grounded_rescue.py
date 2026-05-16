@@ -433,7 +433,7 @@ def _collect_from_survivors(
             "No target instance annotations found. Pixel-grounded rescue "
             "runs after list_target_instances and before the final stage-4 "
             "filter. Run:\n"
-            f"  bash scripts/list_target_instances.sh --from_yaml {survivor_yaml}\n"
+            f"  bash scripts/07_list_potential_instances.sh --from_yaml {survivor_yaml}\n"
             "then rerun this rescue script."
         )
     records: List[Dict] = []

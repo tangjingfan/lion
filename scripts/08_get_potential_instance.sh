@@ -6,8 +6,8 @@
 #   • >1 visible          -> view_nearest (closest to sub-path end position)
 #
 # Usage:
-#   bash scripts/select_target_instances.sh --from_yaml configs/selection/one_scene_partial_val_unseen.yaml
-#   bash scripts/select_target_instances.sh --from_yaml ... --print_multi
+#   bash scripts/08_get_potential_instance.sh --from_yaml configs/selection/one_scene_partial_val_unseen.yaml
+#   bash scripts/08_get_potential_instance.sh --from_yaml ... --print_multi
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

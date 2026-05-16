@@ -124,7 +124,7 @@ filter stage 4 semantic_granularity (step 4)
 #### 2.0 Snapshot (drops nothing)
 
 ```bash
-bash scripts/filter.sh 0 --from_yaml "$SEL"
+bash scripts/00_record_original.sh --from_yaml "$SEL"
 ```
 
 Writes `filters/00_snapshot.yaml` and re-points `current.yaml` at it.
@@ -135,7 +135,7 @@ Drops episodes whose reference path crosses a floor (vertical span >
 0.5 m).
 
 ```bash
-bash scripts/filter.sh 1 --from_yaml "$SEL"
+bash scripts/01_filter_multi_floor.sh --from_yaml "$SEL"
 ```
 
 #### 2.2 LLM rewrite
@@ -146,7 +146,8 @@ plus a per-component breakdown. Then drops landmarks that are hard to
 refer to / ground (blacklist contains words like door, window, …).
 
 ```bash
-GEMINI_API_KEY=... bash scripts/filter.sh 2 --from_yaml "$SEL"
+GEMINI_API_KEY=... bash scripts/02_rewrite_subinstruction.sh --from_yaml "$SEL"
+bash scripts/03_blacklist_landmark.sh --from_yaml "$SEL"
 ```
 
 Produces:
@@ -167,7 +168,7 @@ segment, picking the cut point from `rollout_viz/{scan}/frames.jsonl`
 (see geometry note below). Drops sub-paths where partition errored.
 
 ```bash
-bash scripts/filter.sh 3 --from_yaml "$SEL"
+bash scripts/04_partition.sh --from_yaml "$SEL"
 ```
 
 Produces:
@@ -221,7 +222,7 @@ list, matching the labels used by rollout viz. This is the **only** allowed
 vocabulary for the refine step below.
 
 ```bash
-bash scripts/list_scene_categories.sh --from_yaml "$SEL" --objects_only
+bash scripts/05_get_object_list.sh --from_yaml "$SEL" --objects_only
 ```
 
 Writes:
@@ -237,7 +238,7 @@ that scan's `objects.json`. Overwrites the previous
 `landmark_mapping_filtered.json` in place.
 
 ```bash
-GEMINI_API_KEY=... bash scripts/refine_landmark_mapping.sh --from_yaml "$SEL"
+GEMINI_API_KEY=... bash scripts/06_refine_landmark_mapping.sh --from_yaml "$SEL"
 ```
 
 > **Why `max_tokens` is large**: the model in
@@ -264,11 +265,11 @@ extra disambiguation. A per-candidate mask PNG is rendered at the
 same pose by default.
 
 ```bash
-bash scripts/list_target_instances.sh --from_yaml "$SEL"
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL"
 # skip the per-candidate viz PNGs (faster):
-bash scripts/list_target_instances.sh --from_yaml "$SEL" --no_save_viz
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL" --no_save_viz
 # tighten the pixel threshold per instance:
-bash scripts/list_target_instances.sh --from_yaml "$SEL" --min_pixel_count 100
+bash scripts/07_list_potential_instances.sh --from_yaml "$SEL" --min_pixel_count 100
 ```
 
 Reads:
@@ -306,13 +307,13 @@ Rule:
   largest-pixel instance (`view_nearest_fallback`).
 
 ```bash
-bash scripts/select_target_instances.sh --from_yaml "$SEL"
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL"
 # list every multi-candidate sub-path with its chosen id + distances:
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --print_multi
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --print_multi
 # lighter .house-only debug image instead of the Habitat render:
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --viz_mode topdown
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --viz_mode topdown
 # skip viz altogether:
-bash scripts/select_target_instances.sh --from_yaml "$SEL" --no_save_viz
+bash scripts/08_get_potential_instance.sh --from_yaml "$SEL" --no_save_viz
 ```
 
 Writes:
@@ -354,16 +355,16 @@ detection box.
 
 ```bash
 # Dry run — see which coarse sub-paths will be sent to the detector:
-bash scripts/build_vlm_pixel_grounded_rescue.sh \
+bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
     --dry_run
 
 # Run for real (first call auto-downloads ~340MB YOLO-World weights + CLIP):
-bash scripts/build_vlm_pixel_grounded_rescue.sh \
+bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
 
 # Optional VLM fallback (only invoked when YOLO finds nothing above threshold):
-GEMINI_API_KEY=... bash scripts/build_vlm_pixel_grounded_rescue.sh \
+GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
     --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml \
     --enable_vlm_fallback
 ```
@@ -436,7 +437,7 @@ Rule:
 
 ```bash
 # After rescue, use the stage-3 survivor set as input for the final filter:
-bash scripts/filter.sh 4 --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
+bash scripts/10_filter_semantic_granularity.sh --from_yaml results/val_unseen_partial_one_scene/filters/03_partition.yaml
 
 # Report counts only, without writing 04_semantic_granularity.yaml or
 # moving current.yaml:

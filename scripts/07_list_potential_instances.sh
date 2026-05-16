@@ -14,11 +14,12 @@
 # (viz PNGs under .../target_instances/viz/{scan}/{ep}/...)
 #
 # Usage:
-#   bash scripts/list_target_instances.sh [--from_yaml configs/selection/exp.yaml]
-#   bash scripts/list_target_instances.sh --from_yaml ... --no_save_viz
+#   bash scripts/07_list_potential_instances.sh [--from_yaml configs/selection/exp.yaml]
+#   bash scripts/07_list_potential_instances.sh --from_yaml ... --no_save_viz
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 CONFIG="${CONFIG:-configs/rollout/rollout_landmark_rxr.yaml}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
 
 python src/check/list_target_instances.py --config "${CONFIG}" "$@"
