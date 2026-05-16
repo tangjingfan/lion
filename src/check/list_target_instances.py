@@ -203,7 +203,8 @@ def main() -> None:
     if not prior_subs:
         raise SystemExit(
             "survivor.yaml has no `sub_paths` field — list_target_instances "
-            "expects sub-path-level survivors (run filter stages 1-3 first).",
+            "expects sub-path-level survivors (run scripts 02→03→04 first: "
+            "rewrite → blacklist → partition).",
         )
 
     # Locate per-episode rewrite JSONs.
@@ -402,7 +403,7 @@ def main() -> None:
                 "expname":         cfg.get("output", {}).get("expname"),
                 "run_name":        cfg.get("output", {}).get("run_name"),
                 "min_pixel_count": args.min_pixel_count,
-                "source_keep":     str(current.resolve()),
+                "source_keep":     str(survivor.resolve()),
                 "annotations":     scan_annotations,
             }
             with open(scan_out, "w") as f:

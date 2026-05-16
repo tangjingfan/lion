@@ -54,7 +54,7 @@ from src.check.build_semantic_rescue_categories import (
     _load_json,
     _load_yaml,
 )
-from src.check.filter_semantic_granularity import (
+from src.process.coarse_labels import (
     DEFAULT_COARSE_LABELS,
     _is_only_coarse_label,
     _label_candidates,
@@ -1138,12 +1138,17 @@ def main() -> None:
                     payload["vlm_fallback_model"] = vlm_model
                 payloads[scan] = payload
 
+            # Record the LANDMARK as the rescued category so the output uses
+            # the same word that was passed to YOLO as the prompt — downstream
+            # consumers don't have to map the detector's class names (e.g.
+            # "cooktop") back to the instruction phrase (e.g. "stove").
+            recorded_category = (rec.get("landmark") or grounding["category"] or "unknown").strip().lower()
             key = str(instance_id)
             entry = payload["instances"].setdefault(key, {
                 "instance_id": int(instance_id),
-                "category": grounding["category"],
+                "category": recorded_category,
                 "confidence": grounding["confidence"],
-                "is_rescuable": grounding["category"] != "unknown",
+                "is_rescuable": recorded_category != "unknown",
                 "semantic_category": pixel_info.get("semantic_category"),
                 "grounding_method": source,
                 "landmarks": [],
@@ -1151,9 +1156,9 @@ def main() -> None:
                 "image_paths": [],
             })
             if grounding["confidence"] == "high" or entry.get("category") in ("", "unknown"):
-                entry["category"] = grounding["category"]
+                entry["category"] = recorded_category
                 entry["confidence"] = grounding["confidence"]
-                entry["is_rescuable"] = grounding["category"] != "unknown"
+                entry["is_rescuable"] = recorded_category != "unknown"
                 entry["grounding_method"] = source
             if rec["landmark"] and rec["landmark"] not in entry["landmarks"]:
                 entry["landmarks"].append(rec["landmark"])

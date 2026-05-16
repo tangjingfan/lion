@@ -211,11 +211,14 @@ def main() -> None:
 
     survivor = get_survivor_path(cfg)
     if not survivor.exists():
-        raise SystemExit(f"No survivor.yaml at {survivor} — run stage 1 first.")
+        raise SystemExit(
+            f"No survivor.yaml at {survivor} — run 01_filter_multi_floor first."
+        )
 
     # resolve_exp(apply_current=True) already merged survivor.yaml into
     # cfg.selection. Pull prior sub_paths from there — if the prior stage was
-    # episode-level (stage 1, no sub_paths key), every sub-path is allowed.
+    # episode-level (e.g. 01_filter_multi_floor, no sub_paths key), every
+    # sub-path is allowed.
     prior_subs = cfg.get("selection", {}).get("sub_paths")
     episodes = episodes_from_config(cfg)
     if not episodes:

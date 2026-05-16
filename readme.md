@@ -9,13 +9,13 @@ observations.
 This README walks through the four core stages end-to-end:
 
 1. **Rollout** — drive the agent through every selected episode.
-2. **Filter pipeline 0-3** — narrow `(instruction_id, sub_idx)` pairs
+2. **Filter pipeline 00-04** — narrow `(instruction_id, sub_idx)` pairs
    down to the ones worth grounding.
 3. **Target instance selection** — fix one MP40 instance id per
    surviving sub-path as the navigation target.
-4. **Filter pipeline 4 + rescue** — filter final targets by semantic
-   granularity and optionally rescue some coarse instances with
-   YOLO-World (open-vocab detector; VLM as fallback).
+4. **VLM pixel-grounded rescue** — recover coarse MPCAT40 targets
+   (`appliances` / `lighting` / …) into fine categories (`stove` /
+   `lamp` / …) via YOLO-World; VLM as fallback.
 
 ## Setup
 
@@ -121,10 +121,7 @@ filter steps 00-04 (record / multi_floor / rewrite / blacklist / partition)
 target instance selection (step 3, scripts 05-08)
         │
         ▼
-optional VLM semantic rescue (step 4, script 09)
-        │
-        ▼
-final filter: semantic_granularity (step 4, script 10)
+VLM pixel-grounded rescue (step 4, script 09; final)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -338,9 +335,7 @@ Writes:
   — when Habitat rendering is available, an RGB + semantic panorama at
   the sub-path end node with the chosen instance highlighted.
 
-## 4. Filter pipeline (rescue + stage 4)
-
-### 4a. Pixel-grounded semantic rescue (optional, recommended first)
+## 4. VLM pixel-grounded rescue (final step)
 
 Recover MPCAT40-coarse targets (`appliances` / `lighting` / `objects` /
 …) into fine categories (`stove` / `refrigerator` / `lamp` / …) via
@@ -360,6 +355,11 @@ the detector says `stove`); the first detection that yields a
 category-matched instance wins. This can rescue examples with
 `target_instance_ids: []` because the instance id comes from the
 detection box.
+
+The recorded `category` in the rescue output is the **landmark phrase
+from the instruction** (the same word that was passed to YOLO as the
+prompt), not the detector's own class name. So `stove` stays `stove`
+even when YOLO-World fires the `cooktop` class.
 
 ```bash
 # Dry run — see which coarse sub-paths will be sent to the detector:
@@ -406,10 +406,6 @@ Writes:
   last column is the mask overlay; rows where the detector category
   doesn't match the recovered semantic label are flagged `[MISMATCH]`).
 
-Loop back to the filter: stage 4b auto-loads the rescue dict on startup
-and flips matching `(episode_id, sub_idx)` or `target_instance_id` hits
-to `ok_rescued` in the survivor YAML — no extra wiring needed.
-
 The older mask-based rescue is still available:
 
 ```bash
@@ -421,43 +417,9 @@ asking the VLM to name the existing target mask. Useful for auditing an
 existing selection, but it cannot rescue examples without an instance
 id.
 
-### 4b. Semantic granularity filter (final drop, no LLM)
-
-This step filters semantic-taxonomy failures, not low-visibility cases.
-For example, an instruction may say `stove`, but MP3D/MPCAT40 may only
-label the selected target instance as the coarse class `appliances`
-instead of a standalone `stove` semantic label.
-
-This stage first checks `target_instances/{scan}/semantic_rescue_categories.json`.
-If the VLM rescued this `(episode_id, sub_idx)` or the selected instance id
-with a finer category, the sub-path is kept and audit records `ok_rescued`;
-otherwise the coarse target is dropped.
-
-Rule:
-
-- Read the final selected `target_instance_ids` and inspect the selected
-  instance's semantic label.
-- Drop it if the selected label is only a configured coarse label
-  (default: `appliances`, `objects`, `furniture`, `lighting`) and it was
-  not rescued to a finer category.
-- Keep it when the selected instance has a more specific semantic label,
-  or when VLM rescue succeeded.
-
-```bash
-# After rescue, use the stage-3 survivor set as input for the final filter:
-bash scripts/10_filter_semantic_granularity.sh --exp "$SEL"
-
-# Report counts only, without writing the new survivor.yaml:
-python src/check/filter_semantic_granularity.py \
-    --config configs/rollout/rollout_landmark_rxr.yaml \
-    --exp "$SEL" \
-    --report_only
-```
-
-Writes:
-
-- `survivor.yaml` — overwritten with the post-stage survivor set after
-  semantic granularity and rescue checks.
-- `filters/04_semantic_granularity_dropped.yaml` — remaining dropped
-  examples with reason `coarse_semantic_label`, plus `landmark`,
-  `semantic_labels`, `coarse_label`, and `target_instance_ids`.
+Rescue is the **final** step of the pipeline. The previous coarse-label
+filter has been removed: a target that's coarse-bucket-only on its own
+is kept as-is when rescue produces nothing fine — the rescue output
+just doesn't get richer info for it. Downstream consumers can decide
+how to treat such targets by inspecting
+`target_instances/{scan}/semantic_rescue_categories.json` themselves.

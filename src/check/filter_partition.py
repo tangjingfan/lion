@@ -144,7 +144,10 @@ def main() -> None:
 
     survivor = get_survivor_path(cfg)
     if not survivor.exists():
-        raise SystemExit(f"No survivor.yaml at {survivor} — run stage 2 first.")
+        raise SystemExit(
+            f"No survivor.yaml at {survivor} — run 02_rewrite_subinstruction "
+            "and 03_blacklist_landmark first."
+        )
 
     prior_ids = set(int(x) for x in cfg.get("selection", {}).get("instruction_ids") or [])
     if not prior_ids:
@@ -152,8 +155,8 @@ def main() -> None:
     prior_subs = cfg.get("selection", {}).get("sub_paths")
     if not prior_subs:
         raise SystemExit(
-            "survivor.yaml has no `sub_paths` field — stage 3 expects "
-            "sub-path-level survivors (run stage 2 first).",
+            "survivor.yaml has no `sub_paths` field — 04_partition expects "
+            "sub-path-level survivors (run 03_blacklist_landmark first).",
         )
     allowed_subs = {
         int(ep_id): [int(s) for s in subs]
