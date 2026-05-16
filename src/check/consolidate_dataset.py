@@ -150,14 +150,18 @@ def _build_record(
 
     # Target block.
     if target:
-        rec["target_instance_ids"]        = target.get("target_instance_ids") or []
+        target_ids = target.get("target_instance_ids") or []
+        rec["target_instance_ids"]        = target_ids
         rec["target_status"]              = target.get("status")
         rec["matched_semantic_category"]  = target.get("matched_category")
         rec["matched_semantic_categories"] = target.get("matched_categories")
-        rec["landmark_visible_at_partition"] = (
-            target.get("visibility_status") in ("unique", "ambiguous")
-        )
-        rec["visibility_status"]          = target.get("visibility_status")
+        # "Did we end up with a grounded target?" — true whenever the
+        # landmark was visible at the partition point OR rescue found it
+        # on the rollout panorama. The fine-grained signals (partition
+        # visibility_status, rescue grounding_method, …) live in
+        # target_instances/<scan>/target_instances.json for anyone who
+        # needs them.
+        rec["landmark_visible"] = bool(target_ids)
         # Pointer to the partition-point viz PNG (when rendered by 08).
         if "partition_viz_path" in target:
             rec["partition_viz_path"] = target["partition_viz_path"]
