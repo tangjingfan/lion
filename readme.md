@@ -24,9 +24,10 @@ Configs are split in two:
 - **`configs/rollout/rollout_landmark_rxr.yaml`** — host-level paths
   (Landmark-RxR JSON, MP3D scenes, connectivity, output base). Edit
   once per machine.
-- **`configs/selection/<exp>.yaml`** — per-experiment customization
+- **`configs/selection/<split>/<exp>.yaml`** — per-experiment customization
   (`expname`, episode list, agent, viz toggles). One file per
-  experiment; everything below uses one of these.
+  experiment, organized by `split` (e.g. `val_unseen/`); everything
+  below uses one of these.
 
 The output folder is `results/{split}_{expname}/`. The example
 selection used throughout this README is:
@@ -38,18 +39,21 @@ SEL=configs/selection/val_unseen/one_scene_partial.yaml
 # → results/val_unseen_partial_one_scene/
 ```
 
-Inside `results/{run}/`, every per-tool subfolder **except `filters/`**
-is split by scan, so a single experiment touching multiple scenes keeps
-their artifacts isolated:
+Inside `results/{run}/`, the pipeline's canonical state is a single
+`survivor.yaml` at the run root. Per-tool subfolders are split by scan
+so a single experiment touching multiple scenes keeps their artifacts
+isolated; `filters/` (drop diagnostics + audit) stays cross-scan:
 
 ```
 results/val_unseen_partial_one_scene/
+  survivor.yaml            # canonical post-pipeline state (each
+                           # filter stage overwrites this in place)
   rollout_viz/X7HyMhZNoso/...
   rewrite/X7HyMhZNoso/...
   scene_categories/X7HyMhZNoso/...
   partition/X7HyMhZNoso/...
   target_instances/X7HyMhZNoso/...
-  filters/                 # cross-scan; not split
+  filters/                 # per-stage NN_*_dropped.yaml + audit.json
 ```
 
 ## 1. Rollout
@@ -80,45 +84,47 @@ Note: `sub_idx` is **0-indexed** everywhere — folder names are `000/`,
 pipeline (step 2) so that partition cut-points reflect actual rollout
 geometry rather than the reference path.
 
-## 2. Filter pipeline (stages 0-3)
+## 2. Filter pipeline (steps 00-04)
 
 The filter pipeline narrows `(instruction_id, sub_idx)` pairs down to
-the ones worth grounding. Run stages 0-3 first; stage 4 runs after
-target instance selection. Each stage writes to `results/{run}/filters/`:
+the ones worth grounding. Run steps 00-04 first; the final filter
+(step 10) runs after target instance selection.
+
+Each stage overwrites a single canonical `results/{run}/survivor.yaml`
+that captures the current narrower set. Diagnostics live under
+`filters/`:
 
 ```
-NN_{name}.yaml          # selection-compatible survivor list
-NN_{name}_dropped.yaml  # what was dropped + why
-audit.json              # per-(ep, sub) status across every stage
-current.yaml            # symlink to the latest stage's keep file
+{run}/survivor.yaml                  # selection-compatible survivor
+                                     # list; downstream tools auto-merge
+                                     # this on top of any --exp argument
+{run}/filters/NN_{name}_dropped.yaml # per-stage drops + reasons (debug)
+{run}/filters/audit.json             # per-(ep, sub) status across stages
 ```
 
-`current.yaml` is what every downstream tool reads via `--exp`.
-The stages are **pure filter** — each one accepts a survivor set and
-emits a smaller one. Vocabulary prep + visibility live in step 3.
+The stages are **pure filter** — each one accepts the current survivor
+set and emits a smaller one. Vocabulary prep + visibility live in
+step 3.
 
-```bash
-CURRENT=results/val_unseen_partial_one_scene/filters/current.yaml
-```
-
-Note: survivor files such as `filters/current.yaml` or
-`03_partition.yaml` go to `--exp`, not `--config`. The `--config`
-flag is only for rollout configs such as
-`configs/rollout/rollout_landmark_rxr.yaml`.
+The `--exp` flag accepts either a selection YAML path (e.g.
+`configs/selection/val_unseen/one_scene_partial.yaml`) or a bare
+`expname` (e.g. `one_scene_partial`). Either way, `survivor.yaml` is
+auto-merged so downstream stages always see the latest pipeline state
+without the user passing it explicitly.
 
 Execution order:
 
 ```text
-filter stages 0-3
+filter steps 00-04 (record / multi_floor / rewrite / blacklist / partition)
         │
         ▼
-target instance selection (step 3)
+target instance selection (step 3, scripts 05-08)
         │
         ▼
-optional VLM semantic rescue (step 4)
+optional VLM semantic rescue (step 4, script 09)
         │
         ▼
-filter stage 4 semantic_granularity (step 4)
+final filter: semantic_granularity (step 4, script 10)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -127,7 +133,9 @@ filter stage 4 semantic_granularity (step 4)
 bash scripts/00_record_original.sh --exp "$SEL"
 ```
 
-Writes `filters/00_snapshot.yaml` and re-points `current.yaml` at it.
+Initializes `survivor.yaml` from the seed selection when one doesn't
+already exist (won't clobber an in-progress pipeline). Also writes
+`filters/00_original_dropped.yaml` (empty) + `filters/audit.json`.
 
 #### 2.1 Cross-floor filter
 
@@ -178,8 +186,8 @@ partition/X7HyMhZNoso/{instruction_id}/partition.json
 partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png
 ```
 
-After stage 3, `current.yaml` points to `03_partition.yaml` — the
-sub-path-level survivor set used as input by target instance selection.
+After step 04, `survivor.yaml` holds the sub-path-level survivor set
+used as input by target instance selection.
 
 ##### Partition geometry
 
@@ -273,7 +281,7 @@ bash scripts/07_list_potential_instances.sh --exp "$SEL" --min_pixel_count 100
 ```
 
 Reads:
-- `filters/current.yaml`
+- `survivor.yaml` (auto-merged via `--exp`)
 - `rewrite/X7HyMhZNoso/{instruction_id}/sub_instructions_rewritten_filtered.json`
 - `rewrite/X7HyMhZNoso/landmark_mapping_filtered.json`
 - `partition/X7HyMhZNoso/{ep}/partition.json`
@@ -356,16 +364,16 @@ detection box.
 ```bash
 # Dry run — see which coarse sub-paths will be sent to the detector:
 bash scripts/09_vlm_rescue.sh \
-    --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --exp "$SEL" \
     --dry_run
 
 # Run for real (first call auto-downloads ~340MB YOLO-World weights + CLIP):
 bash scripts/09_vlm_rescue.sh \
-    --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml
+    --exp "$SEL"
 
 # Optional VLM fallback (only invoked when YOLO finds nothing above threshold):
 GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
-    --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --exp "$SEL" \
     --enable_vlm_fallback
 ```
 
@@ -405,7 +413,7 @@ to `ok_rescued` in the survivor YAML — no extra wiring needed.
 The older mask-based rescue is still available:
 
 ```bash
-bash scripts/build_semantic_rescue_categories.sh --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml --dry_run
+bash scripts/build_semantic_rescue_categories.sh --exp "$SEL" --dry_run
 ```
 
 It only handles examples that already have `target_instance_ids`,
@@ -437,21 +445,19 @@ Rule:
 
 ```bash
 # After rescue, use the stage-3 survivor set as input for the final filter:
-bash scripts/10_filter_semantic_granularity.sh --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml
+bash scripts/10_filter_semantic_granularity.sh --exp "$SEL"
 
-# Report counts only, without writing 04_semantic_granularity.yaml or
-# moving current.yaml:
+# Report counts only, without writing the new survivor.yaml:
 python src/check/filter_semantic_granularity.py \
     --config configs/rollout/rollout_landmark_rxr.yaml \
-    --exp results/val_unseen_partial_one_scene/filters/03_partition.yaml \
+    --exp "$SEL" \
     --report_only
 ```
 
 Writes:
 
-- `filters/04_semantic_granularity.yaml` — survivor set after semantic
-  granularity and rescue checks.
+- `survivor.yaml` — overwritten with the post-stage survivor set after
+  semantic granularity and rescue checks.
 - `filters/04_semantic_granularity_dropped.yaml` — remaining dropped
   examples with reason `coarse_semantic_label`, plus `landmark`,
   `semantic_labels`, `coarse_label`, and `target_instance_ids`.
-- `filters/current.yaml` — repointed to `04_semantic_granularity.yaml`.
