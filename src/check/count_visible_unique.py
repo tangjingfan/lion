@@ -10,7 +10,7 @@ Usage
 -----
   python src/check/count_visible_unique.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml configs/selection/one_scene_partial_val_unseen.yaml
+      --from_yaml configs/selection/val_unseen/one_scene_partial.yaml
 
   # Or aim at a specific scan's file directly:
   python src/check/count_visible_unique.py \\

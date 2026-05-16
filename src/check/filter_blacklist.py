@@ -1,7 +1,7 @@
 """
 LION-Bench — Stage 2 filter: drop non-referrable / unmapped landmarks.
 
-Reads the prior survivor set (via current.yaml) and the rewriter JSON, then
+Reads the prior survivor set (via survivor.yaml) and the rewriter JSON, then
 drops sub-paths whose landmark cannot be grounded as a
 concrete MP3D object.  Four rules:
 
@@ -22,7 +22,7 @@ Usage
 -----
   python src/check/filter_blacklist.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml results/{exp}/filters/current.yaml
+      --exp configs/selection/exp.yaml
 """
 
 from __future__ import annotations
@@ -43,15 +43,14 @@ from src.check._filter_utils import (
     ensure_sub_path,
     get_filter_dir,
     get_split,
+    get_survivor_path,
     load_audit,
-    load_keep,
     load_rewrite_episodes,
     register_stage,
-    resolve_selection,
+    resolve_exp,
     save_audit,
-    update_current,
     write_drop_yaml,
-    write_keep_yaml,
+    write_survivor,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -192,16 +191,17 @@ def main() -> None:
         description="Stage 2: drop non-referrable / unmapped landmarks",
     )
     ap.add_argument("--config", required=True)
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection / current.yaml carrying expname so this "
-                         "stage knows which experiment's filter dir to read.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "survivor.yaml is auto-merged on top to "
+                         "supply the prior survivor sub_paths.")
     ap.add_argument("--blacklist", nargs="+", default=None,
                     help="Override the default landmark-text blacklist.")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     filt_dir = get_filter_dir(cfg)
     if not filt_dir.exists():
@@ -209,21 +209,17 @@ def main() -> None:
     out_dir = filt_dir.parent
     split   = get_split(cfg)
 
-    current = filt_dir / "current.yaml"
-    prior_path = Path(args.from_yaml).expanduser() if args.from_yaml else current
-    if not prior_path.exists():
-        raise SystemExit(f"No prior survivor YAML at {prior_path} — run stage 1 first.")
+    survivor = get_survivor_path(cfg)
+    if not survivor.exists():
+        raise SystemExit(f"No survivor.yaml at {survivor} — run stage 1 first.")
 
-    prior_keep = load_keep(prior_path.resolve())
-    prior_subs = prior_keep.get("sub_paths")
-
-    # Reload the selected episodes through current.yaml.  If the prior stage
-    # is episode-level (stage 1), classify every sub-path.  If it is already
-    # sub-path-level, preserve that narrower set.
-    resolve_selection(cfg, str(prior_path.resolve()))
+    # resolve_exp(apply_current=True) already merged survivor.yaml into
+    # cfg.selection. Pull prior sub_paths from there — if the prior stage was
+    # episode-level (stage 1, no sub_paths key), every sub-path is allowed.
+    prior_subs = cfg.get("selection", {}).get("sub_paths")
     episodes = episodes_from_config(cfg)
     if not episodes:
-        raise SystemExit("No episodes loaded from current.yaml.")
+        raise SystemExit("No episodes loaded from survivor.yaml.")
     allowed_subs: Dict[int, List[int]] = {}
     if prior_subs:
         allowed_subs = {
@@ -318,11 +314,10 @@ def main() -> None:
                 "subs": {str(k): v for k, v in sorted(ep_drops.items())},
             }
 
-    keep_path = write_keep_yaml(
-        filt_dir, STAGE_NUM, STAGE_NAME, split,
+    survivor_path = write_survivor(
+        cfg, split,
         instruction_ids=sorted(keep_sub_paths.keys()),
         sub_paths=keep_sub_paths,
-        cfg=cfg,
     )
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
@@ -330,7 +325,6 @@ def main() -> None:
         extras={"blacklist": list(blacklist)},
     )
     save_audit(audit, filt_dir)
-    current_path = update_current(filt_dir, keep_path)
 
     n_eps_in   = len(allowed_subs)
     n_eps_keep = len(keep_sub_paths)
@@ -349,9 +343,8 @@ def main() -> None:
 
     print()
     print("Outputs:")
-    print(f"  {keep_path}")
+    print(f"  {survivor_path}")
     print(f"  {drop_path}")
-    print(f"  {current_path}  ->  {keep_path.name}")
     print(f"  {filt_dir / 'audit.json'}")
 
 

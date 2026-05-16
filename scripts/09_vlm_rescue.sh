@@ -3,12 +3,12 @@
 # panoramas, then query Habitat semantic pixels to recover instance ids.
 #
 # Usage:
-#   bash scripts/09_vlm_rescue.sh --from_yaml ... --dry_run
-#   bash scripts/09_vlm_rescue.sh --from_yaml ...
+#   bash scripts/09_vlm_rescue.sh --exp ... --dry_run
+#   bash scripts/09_vlm_rescue.sh --exp ...
 #
 # Optional VLM fallback (only when YOLO finds nothing above threshold):
 #   GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
-#       --from_yaml ... --enable_vlm_fallback
+#       --exp ... --enable_vlm_fallback
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

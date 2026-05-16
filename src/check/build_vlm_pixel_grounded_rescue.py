@@ -46,7 +46,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_filter_dir, get_run_dir, load_keep, resolve_selection
+from src.check._filter_utils import get_filter_dir, get_run_dir, get_survivor_path, load_keep, resolve_exp
 from src.check.build_semantic_rescue_categories import (
     _dump_json,
     _extract_json_object,
@@ -433,7 +433,7 @@ def _collect_from_survivors(
             "No target instance annotations found. Pixel-grounded rescue "
             "runs after list_target_instances and before the final stage-4 "
             "filter. Run:\n"
-            f"  bash scripts/07_list_potential_instances.sh --from_yaml {survivor_yaml}\n"
+            f"  bash scripts/07_list_potential_instances.sh --exp {survivor_yaml}\n"
             "then rerun this rescue script."
         )
     records: List[Dict] = []
@@ -850,7 +850,10 @@ def main() -> None:
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--rewrite_config", default="configs/rewrite/rewrite_subinstructions.yaml")
-    ap.add_argument("--from_yaml", default=None)
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "Auto-merges survivor.yaml; the rescue reads "
+                         "from current.yaml unless --dropped_yaml is given.")
     ap.add_argument("--dropped_yaml", default=None,
                     help="Legacy mode: collect examples from an existing stage-4 dropped YAML.")
     ap.add_argument("--coarse_label", action="append", default=None,
@@ -883,7 +886,7 @@ def main() -> None:
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     rw_cfg = _load_yaml(Path(args.rewrite_config)) if Path(args.rewrite_config).exists() else {}
     vlm_model = args.model or rw_cfg.get("model", "gemini-2.5-flash")
@@ -895,7 +898,7 @@ def main() -> None:
     run_dir = get_run_dir(cfg)
     filt_dir = get_filter_dir(cfg)
     source_yaml = Path(args.dropped_yaml).expanduser() if args.dropped_yaml else (
-        Path(args.from_yaml).expanduser() if args.from_yaml else (filt_dir / "current.yaml")
+        get_survivor_path(cfg)
     )
     if not source_yaml.exists():
         raise SystemExit(f"No source YAML at {source_yaml}")

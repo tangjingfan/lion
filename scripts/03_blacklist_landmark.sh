@@ -14,7 +14,7 @@
 #
 # Usage:
 #   bash scripts/03_blacklist_landmark.sh \
-#       --from_yaml results/.../filters/01_cross_floor.yaml
+#       --exp results/.../filters/01_cross_floor.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

@@ -30,7 +30,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_selection
+from src.check._filter_utils import get_run_dir, resolve_exp
 from src.dataset.landmark_rxr import episodes_from_config
 from src.process.rewriter import make_client, run_rewriter
 
@@ -44,8 +44,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rewrite_config",
                    default="configs/rewrite/rewrite_subinstructions.yaml",
                    help="Rewrite-specific YAML config (model, workers, temperature, …)")
-    p.add_argument("--from_yaml", default=None,
-                   help="Selection YAML to override config's selection.from_yaml")
+    p.add_argument("--exp", default=None,
+                   help="Experiment handle: a selection YAML path (original "
+                        "configs/selection/*.yaml OR a filters/NN_*.yaml) or "
+                        "a bare expname. The latest survivor.yaml is "
+                        "auto-merged on top.")
     p.add_argument("--api_key", default=None,
                    help="Gemini API key (falls back to GEMINI_API_KEY env var)")
     return p.parse_args()
@@ -76,7 +79,7 @@ def main() -> None:
         print("ERROR: Provide --api_key or set GEMINI_API_KEY environment variable.")
         sys.exit(1)
 
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     episodes = episodes_from_config(cfg)
     if not episodes:

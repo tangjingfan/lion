@@ -1,7 +1,7 @@
 """
 LION-Bench — Enumerate candidate target instances at the partition point.
 
-For each surviving sub-path (from the latest ``filters/current.yaml``):
+For each surviving sub-path (from the latest ``survivor.yaml``):
   1. Resolve the landmark text → matched MP40 category labels (via the
      per-scan ``landmark_mapping[_filtered].json`` from refine step 3b).
   2. Render a 360° semantic panorama at the **partition point** (the
@@ -28,7 +28,7 @@ PNG is also written at the same partition pose.
 
 Pipeline prerequisites
 ----------------------
-- ``filters/current.yaml`` after stage 3 (partition) — sub-path-level
+- ``survivor.yaml`` after stage 3 (partition) — sub-path-level
   survivors with ``partition.json`` written.
 - ``rewrite/{scan}/landmark_mapping[_filtered].json`` — preferably the
   refined version from ``refine_landmark_mapping``.
@@ -45,7 +45,7 @@ Usage
 -----
   python src/check/list_target_instances.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml configs/selection/exp.yaml
+      --exp configs/selection/exp.yaml
 """
 
 from __future__ import annotations
@@ -67,9 +67,9 @@ from src.check._filter_utils import (
     get_filter_dir,
     get_run_dir,
     get_split,
+    get_survivor_path,
     iter_rewrite_files,
-    load_keep,
-    resolve_selection,
+    resolve_exp,
 )
 from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
@@ -170,9 +170,11 @@ def main() -> None:
                     "matched category, and tag uniqueness.",
     )
     ap.add_argument("--config", required=True)
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection / current.yaml carrying expname so the "
-                         "tool reads / writes under the right experiment dir.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "Auto-merges survivor.yaml so the survivor "
+                         "sub_paths are restored even when passing the "
+                         "original selection yaml.")
     ap.add_argument("--min_pixel_count", type=int, default=50,
                     help="Min pixels per instance to count as visible (default 50).")
     ap.add_argument("--save_viz", action="store_true", default=True,
@@ -186,23 +188,21 @@ def main() -> None:
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
+    out_dir = get_run_dir(cfg)
     filt_dir = get_filter_dir(cfg)
-    if not filt_dir.exists():
-        raise SystemExit(f"No filters/ at {filt_dir} — run filter pipeline first.")
-    out_dir = filt_dir.parent
     split   = get_split(cfg)
 
-    current = filt_dir / "current.yaml"
-    if not current.exists():
-        raise SystemExit(f"No current.yaml at {current}")
+    survivor = get_survivor_path(cfg)
+    if not survivor.exists():
+        raise SystemExit(f"No survivor.yaml at {survivor} — run filter pipeline first.")
 
-    prior_keep = load_keep(current.resolve())
-    prior_subs = prior_keep.get("sub_paths")
+    # resolve_exp already merged survivor.yaml into cfg.selection.
+    prior_subs = cfg.get("selection", {}).get("sub_paths")
     if not prior_subs:
         raise SystemExit(
-            "Prior current.yaml has no `sub_paths` field — list_target_instances "
+            "survivor.yaml has no `sub_paths` field — list_target_instances "
             "expects sub-path-level survivors (run filter stages 1-3 first).",
         )
 

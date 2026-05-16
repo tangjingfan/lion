@@ -16,7 +16,7 @@ Pipeline placement
 This tool only needs filter stage 2 (rewrite) to have written the
 per-episode rewrite JSONs and ``list_scene_categories`` to have written
 ``scene_categories/{scan}/objects.json``. It does **not** depend on
-partition (filter stage 3); the ``--from_yaml`` argument is used only to
+partition (filter stage 3); the ``--exp`` argument is used only to
 resolve the experiment's run directory, so either the original selection
 YAML or any later ``filters/*.yaml`` works.
 
@@ -29,7 +29,7 @@ Usage
   GEMINI_API_KEY=your_key \\
   python src/check/refine_landmark_mapping.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml configs/selection/exp.yaml
+      --exp configs/selection/exp.yaml
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.check._filter_utils import (
     get_run_dir,
     load_rewrite_by_scan,
-    resolve_selection,
+    resolve_exp,
 )
 from src.process.landmark_remap import remap_scan_mentions
 from src.process.rewriter import make_client, parse_house_objects
@@ -101,13 +101,15 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--rewrite_config",
                     default="configs/rewrite/rewrite_subinstructions.yaml")
-    ap.add_argument("--from_yaml", default=None)
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "Auto-merges survivor.yaml on top.")
     ap.add_argument("--api_key", default=None)
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     rw_cfg: Dict = {}
     rw_path = Path(args.rewrite_config)

@@ -7,13 +7,14 @@ the filter framework so later stages have a clear baseline:
   00_original.yaml          — all selected instruction_ids and all sub_idx
   00_original_dropped.yaml  — empty dropped set
   audit.json               — initial per-episode/sub-path counts
-  current.yaml             — initialized to 00_original.yaml only when missing
+  survivor.yaml            — initialized only when missing (never clobbers
+                             an in-progress pipeline's narrower state)
 
 Usage
 -----
   python src/check/filter_original.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml configs/selection/one_scene_partial_val_unseen.yaml
+      --exp configs/selection/val_unseen/one_scene_partial.yaml
 """
 
 from __future__ import annotations
@@ -32,13 +33,13 @@ from src.check._filter_utils import (
     ensure_sub_path,
     get_filter_dir,
     get_split,
+    get_survivor_path,
     load_audit,
     register_stage,
-    resolve_selection,
+    resolve_exp,
     save_audit,
-    update_current,
     write_drop_yaml,
-    write_keep_yaml,
+    write_survivor,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -53,13 +54,13 @@ def main() -> None:
     )
     ap.add_argument("--config", required=True,
                     help="Rollout / dataset YAML config")
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection YAML to materialize")
+    ap.add_argument("--exp", default=None,
+                    help="Selection YAML to materialize as the seed.")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=False)
 
     episodes = episodes_from_config(cfg)
     if not episodes:
@@ -92,15 +93,18 @@ def main() -> None:
             sp_audit = ensure_sub_path(ep_audit, sub_idx)
             sp_audit["stages"][STAGE_NAME] = {"status": "ok"}
 
-    keep_path = write_keep_yaml(
-        filt_dir,
-        STAGE_NUM,
-        STAGE_NAME,
-        split,
-        instruction_ids=instruction_ids,
-        sub_paths=sub_paths,
-        cfg=cfg,
-    )
+    # Stage 0 only writes survivor.yaml when none exists yet — never
+    # clobber an in-progress pipeline's narrower state.
+    survivor_path = get_survivor_path(cfg)
+    if survivor_path.exists():
+        survivor_note = "(left unchanged)"
+    else:
+        write_survivor(
+            cfg, split,
+            instruction_ids=instruction_ids,
+            sub_paths=sub_paths,
+        )
+        survivor_note = "(initialized)"
     drop_path = write_drop_yaml(
         filt_dir,
         STAGE_NUM,
@@ -110,13 +114,6 @@ def main() -> None:
         extras={"note": "Stage 0 records the original selected set; no drops."},
     )
     save_audit(audit, filt_dir)
-    existing_current = filt_dir / "current.yaml"
-    if existing_current.exists() or existing_current.is_symlink():
-        current_path = existing_current
-        current_note = "(left unchanged)"
-    else:
-        current_path = update_current(filt_dir, keep_path)
-        current_note = f"->  {keep_path.name}"
 
     print(f"=== Stage {STAGE_NUM} — {STAGE_NAME} ===")
     print(f"  episodes       : {len(episodes)}")
@@ -124,9 +121,8 @@ def main() -> None:
     print(f"  avg sub/episode: {n_sub_paths / len(episodes):.2f}")
     print()
     print("Outputs:")
-    print(f"  {keep_path}")
+    print(f"  {survivor_path}  {survivor_note}")
     print(f"  {drop_path}")
-    print(f"  {current_path}  {current_note}")
     print(f"  {filt_dir / 'audit.json'}")
 
 

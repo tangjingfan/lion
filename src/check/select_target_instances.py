@@ -28,7 +28,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_selection
+from src.check._filter_utils import get_run_dir, resolve_exp
 from src.check.query_scene_instance import (
     _draw_house_instance_viz,
     _render_mask_for_rollout_frame,
@@ -435,8 +435,10 @@ def main() -> None:
         description="Select target instance ids from landmark visibility JSON.",
     )
     ap.add_argument("--config", default="configs/rollout/rollout_landmark_rxr.yaml")
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection YAML carrying expname / run_name.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "Auto-merges survivor.yaml so the survivor "
+                         "sub_paths are restored.")
     ap.add_argument("--visibility_json", default=None,
                     help="Legacy direct path to landmark_visibility/visibility.json.")
     ap.add_argument("--target_instances_json", default=None,
@@ -475,7 +477,7 @@ def main() -> None:
         source_paths = _resolve_target_instance_paths(ti_path)
         source_kind = "target_instances_json"
     else:
-        resolve_selection(cfg, args.from_yaml)
+        resolve_exp(cfg, args.exp, apply_current=True)
         run_dir = get_run_dir(cfg)
         ti_path = run_dir / "target_instances" / "target_instances.json"
         source_paths = _resolve_target_instance_paths(ti_path)

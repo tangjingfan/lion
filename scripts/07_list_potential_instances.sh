@@ -14,8 +14,8 @@
 # (viz PNGs under .../target_instances/viz/{scan}/{ep}/...)
 #
 # Usage:
-#   bash scripts/07_list_potential_instances.sh [--from_yaml configs/selection/exp.yaml]
-#   bash scripts/07_list_potential_instances.sh --from_yaml ... --no_save_viz
+#   bash scripts/07_list_potential_instances.sh [--exp configs/selection/exp.yaml]
+#   bash scripts/07_list_potential_instances.sh --exp ... --no_save_viz
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

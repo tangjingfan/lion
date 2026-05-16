@@ -17,7 +17,7 @@
 #
 # Usage:
 #   bash scripts/10_filter_semantic_granularity.sh \
-#       --from_yaml results/.../filters/03_partition.yaml
+#       --exp results/.../filters/03_partition.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

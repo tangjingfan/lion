@@ -26,7 +26,7 @@ Usage
 
   # Infer scans from a selection/filter YAML and dump object lists:
   python src/check/list_scene_categories.py --config ... \\
-      --from_yaml configs/selection/val_unseen_example.yaml --objects_only
+      --exp configs/selection/val_unseen/example.yaml --objects_only
 
   # Filter to categories whose name matches a regex (case-insensitive):
   python src/check/list_scene_categories.py --config ... \\
@@ -51,7 +51,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import apply_selection_yaml, get_run_dir, resolve_selection
+from src.check._filter_utils import apply_selection_yaml, get_run_dir, resolve_exp
 from src.dataset.landmark_rxr import episodes_from_config
 from src.process.rewriter import parse_house_objects
 from src.process.visibility import VisibilityChecker
@@ -113,9 +113,10 @@ def main() -> None:
     ap.add_argument("--selection", default=None,
                     help="Selection YAML to merge before inferring scans "
                          "from selected instructions.")
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection/filter/replay YAML to merge before "
-                         "inferring scans from selected instructions.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle: selection YAML path or expname. "
+                         "Scans are inferred from the selected instructions; "
+                         "the latest survivor.yaml is auto-merged on top.")
     ap.add_argument("--objects_only", action="store_true",
                     help="Only write MPCAT40 object lists for inferred "
                          "or explicit scans; skip Habitat semantic categories.")
@@ -134,7 +135,7 @@ def main() -> None:
         cfg = yaml.safe_load(f)
     if args.selection:
         apply_selection_yaml(cfg, args.selection)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     pattern: Optional[re.Pattern] = (
         re.compile(args.grep, re.IGNORECASE) if args.grep else None
@@ -145,7 +146,7 @@ def main() -> None:
 
     scenes_dir = cfg["scenes"]["scenes_dir"]
     inferred_scans: List[str] = []
-    if args.selection or args.from_yaml:
+    if args.selection or args.exp:
         inferred_scans = _unique_scans_from_episodes(cfg)
         if inferred_scans:
             print("Inferred scans from selected instructions:")
@@ -155,7 +156,7 @@ def main() -> None:
     scans = _merge_unique_scans(args.scan, inferred_scans)
     if not scans:
         raise SystemExit(
-            "No scans provided. Use --scan, --selection, or --from_yaml."
+            "No scans provided. Use --scan, --selection, or --exp."
         )
 
     checker: Optional[VisibilityChecker] = None

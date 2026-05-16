@@ -2,13 +2,22 @@
 Shared helpers for the LION-Bench filter pipeline.
 
 The pipeline is a chain of numbered "stages" that progressively narrow
-down which (instruction_id, sub_idx) pairs survive.  Each stage writes:
+down which (instruction_id, sub_idx) pairs survive.  The current state
+is centralized in a single ``survivor.yaml`` at the run dir root; each
+stage overwrites it as it narrows the pipeline.  Diagnostics live in
+``filters/``:
 
-    {filt_dir}/NN_{name}.yaml          — survivor set after this stage
-    {filt_dir}/NN_{name}_dropped.yaml  — what got dropped + why
-    {filt_dir}/audit.json              — single source of truth, per-stage
-                                          status for every (ep, sub-path)
-    {filt_dir}/current.yaml            — symlink to the latest keep file
+    {run_dir}/survivor.yaml            — single source of truth, the
+                                          latest survivor set (replaces
+                                          the old per-stage NN_*.yaml +
+                                          current.yaml combo)
+    {run_dir}/filters/NN_{name}_dropped.yaml
+                                       — per-stage drop reasons (kept
+                                          only for debugging; not read
+                                          back by downstream tools)
+    {run_dir}/filters/audit.json       — per-stage status for every
+                                          (ep, sub_idx); cross-stage
+                                          trace
 
 Survivor YAML schema
 --------------------
@@ -67,8 +76,24 @@ def get_run_dir(cfg: dict) -> Path:
 
 
 def get_filter_dir(cfg: dict) -> Path:
-    """Resolve ``{base_dir}/{run_name}/filters`` from a rollout-style config."""
+    """Resolve ``{base_dir}/{run_name}/filters`` from a rollout-style config.
+
+    The filters/ directory now holds only diagnostic artifacts —
+    per-stage ``NN_{name}_dropped.yaml`` and ``audit.json``. The
+    canonical survivor state lives at :func:`get_survivor_path`.
+    """
     return get_run_dir(cfg) / "filters"
+
+
+def get_survivor_path(cfg: dict) -> Path:
+    """Resolve ``{base_dir}/{run_name}/survivor.yaml``.
+
+    The single canonical survivor file. Each filter stage overwrites it
+    with the post-stage survivor set; :func:`resolve_exp` auto-merges it
+    on top of any user-passed selection yaml so downstream stages always
+    see the latest pipeline state.
+    """
+    return get_run_dir(cfg) / "survivor.yaml"
 
 
 # ── Rewrite output discovery ──────────────────────────────────────────────
@@ -278,6 +303,46 @@ def resolve_selection(cfg: dict, from_yaml_cli=None) -> dict:
     return cfg
 
 
+def resolve_exp(cfg: dict, exp_arg=None, apply_current: bool = True) -> dict:
+    """Resolve an experiment handle into ``cfg`` + the current pipeline state.
+
+    ``exp_arg`` can be:
+      • a path to a selection-style YAML (the original
+        ``configs/selection/*.yaml`` OR any ``filters/NN_*.yaml`` survivor
+        file) — its fields are merged into ``cfg``.
+      • a bare ``expname`` string — set as ``cfg.output.expname`` so
+        :func:`get_run_dir` can resolve the experiment directory.
+
+    After applying the user's input, when ``apply_current`` is True, look
+    up ``<run_dir>/survivor.yaml`` and merge it on top. This
+    automatically restores the latest pipeline survivor set (including
+    per-episode ``sub_paths`` drops) for stages 2+, so the user only ever
+    has to pass the original selection yaml or the expname — never the
+    survivor file.
+
+    Stages that *create* a survivor set (e.g. stage 0 record_original,
+    stage 1 cross_floor) should pass ``apply_current=False`` so they read
+    the seed input directly.
+    """
+    if exp_arg:
+        as_path = Path(exp_arg)
+        if as_path.is_file():
+            apply_selection_yaml(cfg, as_path)
+        else:
+            cfg.setdefault("output", {})["expname"] = exp_arg
+
+    if apply_current:
+        try:
+            survivor = get_survivor_path(cfg)
+        except Exception:
+            return cfg
+        if survivor.exists():
+            apply_selection_yaml(cfg, survivor)
+            print(f"[resolve_exp] applied {survivor}")
+
+    return cfg
+
+
 # ── Audit ────────────────────────────────────────────────────────────────
 def load_audit(filt_dir: Path, split: str) -> dict:
     """Load existing audit.json or initialize a new one."""
@@ -302,34 +367,26 @@ def register_stage(audit: dict, stage_name: str, **meta) -> None:
 
 
 # ── Survivor / drop YAMLs ────────────────────────────────────────────────
-def write_keep_yaml(
-    filt_dir:        Path,
-    stage_num:       int,
-    stage_name:      str,
+def write_survivor(
+    cfg:             dict,
     split:           str,
     instruction_ids: List[int],
     sub_paths:       Optional[Dict[int, List[int]]] = None,
-    cfg:             Optional[dict] = None,
 ) -> Path:
-    """Write a stage's survivor YAML.
+    """Overwrite the canonical ``{run_dir}/survivor.yaml``.
 
-    When ``cfg`` is provided, ``expname`` / ``run_name`` are echoed into the
-    output so the file is **self-describing**: any downstream tool that
-    reads it via ``--from_yaml`` or ``apply_selection_yaml`` will pick up
-    the right experiment identity automatically (no need to also pass the
-    original experiment selection YAML).
+    Replaces the legacy per-stage ``filters/NN_<name>.yaml`` + ``current.yaml``
+    symlink combo with a single file at the run-dir root that always
+    reflects the latest pipeline state. Self-describing: echoes
+    ``expname`` / ``run_name`` so it doubles as a valid selection yaml —
+    any tool can read it via ``apply_selection_yaml``.
     """
     payload: dict = {"split": split}
-
-    # Echo experiment identity so downstream consumers can resolve the
-    # correct ``filter_dir`` / ``run_name`` from this file alone.
-    if cfg is not None:
-        out_cfg = cfg.get("output", {})
-        if out_cfg.get("expname"):
-            payload["expname"] = out_cfg["expname"]
-        if out_cfg.get("run_name"):
-            payload["run_name"] = out_cfg["run_name"]
-
+    out_cfg = cfg.get("output", {})
+    if out_cfg.get("expname"):
+        payload["expname"] = out_cfg["expname"]
+    if out_cfg.get("run_name"):
+        payload["run_name"] = out_cfg["run_name"]
     payload["scans"]           = []
     payload["languages"]       = []
     payload["instruction_ids"] = sorted(int(x) for x in instruction_ids)
@@ -338,7 +395,9 @@ def write_keep_yaml(
             int(k): sorted({int(v) for v in vs})
             for k, vs in sorted(sub_paths.items(), key=lambda kv: int(kv[0]))
         }
-    path = filt_dir / f"{stage_num:02d}_{stage_name}.yaml"
+    run_dir = get_run_dir(cfg)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "survivor.yaml"
     with open(path, "w") as f:
         yaml.dump(payload, f, default_flow_style=False, sort_keys=False)
     return path
@@ -362,19 +421,11 @@ def write_drop_yaml(
     return path
 
 
-def update_current(filt_dir: Path, keep_path: Path) -> Path:
-    """Repoint ``current.yaml`` at the just-written keep file (relative link)."""
-    current_path = filt_dir / "current.yaml"
-    if current_path.exists() or current_path.is_symlink():
-        current_path.unlink()
-    current_path.symlink_to(keep_path.name)
-    return current_path
-
-
 # ── Survivor lookup (for downstream consumers) ───────────────────────────
 def load_keep(yaml_path: Path) -> dict:
-    """Read a keep YAML.  Returns a dict with keys ``instruction_ids``,
-    ``sub_paths`` (may be missing for episode-level stages)."""
+    """Read a keep/survivor YAML.  Returns a dict with keys
+    ``instruction_ids``, ``sub_paths`` (may be missing for episode-level
+    stages)."""
     with open(yaml_path) as f:
         return yaml.safe_load(f) or {}
 

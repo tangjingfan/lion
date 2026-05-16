@@ -11,7 +11,7 @@
 # Usage:
 #   GEMINI_API_KEY=your_key \
 #   bash scripts/02_rewrite_subinstruction.sh \
-#       --from_yaml results/.../filters/01_cross_floor.yaml
+#       --exp results/.../filters/01_cross_floor.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

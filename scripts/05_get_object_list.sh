@@ -11,7 +11,7 @@
 # flags below cover that use.
 #
 # Usage:
-#   bash scripts/05_get_object_list.sh --from_yaml configs/selection/exp.yaml --objects_only
+#   bash scripts/05_get_object_list.sh --exp configs/selection/exp.yaml --objects_only
 #   bash scripts/05_get_object_list.sh --scan X7HyMhZNoso
 #   bash scripts/05_get_object_list.sh --scan X7HyMhZNoso --grep fridge
 #   bash scripts/05_get_object_list.sh --scan X7HyMhZNoso --scan oLBMNvg9in8

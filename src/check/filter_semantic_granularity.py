@@ -24,14 +24,13 @@ from src.check._filter_utils import (
     ensure_sub_path,
     get_filter_dir,
     get_split,
+    get_survivor_path,
     load_audit,
-    load_keep,
     register_stage,
-    resolve_selection,
+    resolve_exp,
     save_audit,
-    update_current,
     write_drop_yaml,
-    write_keep_yaml,
+    write_survivor,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -188,8 +187,9 @@ def main() -> None:
         description="Stage 4: filter landmarks grounded only to coarse MPCAT40 labels",
     )
     ap.add_argument("--config", required=True)
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection/current YAML; defaults to filters/current.yaml.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "Auto-merges survivor.yaml.")
     ap.add_argument("--coarse_label", action="append", default=None,
                     help="MPCAT40 label to treat as too coarse. May be repeated. "
                          f"Default: {', '.join(sorted(DEFAULT_COARSE_LABELS))}")
@@ -201,7 +201,7 @@ def main() -> None:
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     filt_dir = get_filter_dir(cfg)
     if not filt_dir.exists():
@@ -209,19 +209,17 @@ def main() -> None:
     run_dir = filt_dir.parent
     split = get_split(cfg)
 
-    prior_path = Path(args.from_yaml).expanduser() if args.from_yaml else (filt_dir / "current.yaml")
+    prior_path = get_survivor_path(cfg)
     if not prior_path.exists():
-        raise SystemExit(f"No survivor YAML at {prior_path}.")
-    prior_keep = load_keep(prior_path.resolve())
-    prior_subs = prior_keep.get("sub_paths")
+        raise SystemExit(f"No survivor.yaml at {prior_path}.")
+    prior_subs = cfg.get("selection", {}).get("sub_paths")
     if not prior_subs:
         raise SystemExit("This stage expects sub-path-level survivors in `sub_paths`.")
     allowed_subs = {int(ep): [int(s) for s in subs] for ep, subs in prior_subs.items()}
 
-    resolve_selection(cfg, str(prior_path.resolve()))
     episodes = episodes_from_config(cfg)
     if not episodes:
-        raise SystemExit("No episodes loaded from current.yaml.")
+        raise SystemExit("No episodes loaded from survivor.yaml.")
 
     coarse = {_norm(x) for x in (args.coarse_label or sorted(DEFAULT_COARSE_LABELS))}
     target_db = _load_target_db(run_dir)
@@ -232,11 +230,11 @@ def main() -> None:
             "Stage 4 is a filter stage, but it must run after target-instance "
             "selection because it reads the selected target ids. Run these "
             "steps first, then rerun stage 4:\n"
-            f"  bash scripts/05_get_object_list.sh --from_yaml {prior_path}\n"
-            f"  GEMINI_API_KEY=... bash scripts/06_refine_landmark_mapping.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/07_list_potential_instances.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/08_get_potential_instance.sh --from_yaml {prior_path}\n"
-            f"  bash scripts/10_filter_semantic_granularity.sh --from_yaml {prior_path}"
+            f"  bash scripts/05_get_object_list.sh --exp {args.exp or prior_path}\n"
+            f"  GEMINI_API_KEY=... bash scripts/06_refine_landmark_mapping.sh --exp {args.exp or prior_path}\n"
+            f"  bash scripts/07_list_potential_instances.sh --exp {args.exp or prior_path}\n"
+            f"  bash scripts/08_get_potential_instance.sh --exp {args.exp or prior_path}\n"
+            f"  bash scripts/10_filter_semantic_granularity.sh --exp {args.exp or prior_path}"
         )
     rescue_db = {} if args.no_rescue else _load_rescue_db(run_dir)
 
@@ -347,11 +345,10 @@ def main() -> None:
     if args.report_only:
         return
 
-    keep_path = write_keep_yaml(
-        filt_dir, STAGE_NUM, STAGE_NAME, split,
+    survivor_path = write_survivor(
+        cfg, split,
         instruction_ids=sorted(keep_sub_paths.keys()),
         sub_paths=keep_sub_paths,
-        cfg=cfg,
     )
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
@@ -359,13 +356,11 @@ def main() -> None:
         extras={"coarse_labels": sorted(coarse)},
     )
     save_audit(audit, filt_dir)
-    current_path = update_current(filt_dir, keep_path)
 
     print()
     print("Outputs:")
-    print(f"  {keep_path}")
+    print(f"  {survivor_path}")
     print(f"  {drop_path}")
-    print(f"  {current_path}  ->  {keep_path.name}")
     print(f"  {filt_dir / 'audit.json'}")
 
 

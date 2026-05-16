@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from src.check._filter_utils import (
     get_run_dir,
     load_rewrite_by_scan,
-    resolve_selection,
+    resolve_exp,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import _mp3d_to_habitat, load_connectivity
@@ -428,7 +428,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--partition_config",
                    default="configs/partition/partition.yaml",
                    help="YAML with partition hyper-parameters (turn thresholds, forward distance)")
-    p.add_argument("--from_yaml", default=None)
+    p.add_argument("--exp", default=None,
+                   help="Experiment handle (selection YAML path or expname). "
+                        "Auto-merges survivor.yaml.")
     p.add_argument("--limit",     type=int, default=None,
                    help="Cap the number of episodes rendered")
     return p.parse_args()
@@ -438,7 +440,7 @@ def main() -> None:
     args = parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     part_cfg_path = Path(args.partition_config)
     if part_cfg_path.exists():

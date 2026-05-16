@@ -7,7 +7,7 @@
 # this initial set.
 #
 # Usage:
-#   bash scripts/00_record_original.sh --from_yaml configs/selection/exp.yaml
+#   bash scripts/00_record_original.sh --exp configs/selection/exp.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

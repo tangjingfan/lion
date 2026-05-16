@@ -14,7 +14,7 @@
 #
 # Usage:
 #   bash scripts/04_partition.sh \
-#       --from_yaml results/.../filters/02_blacklist.yaml
+#       --exp results/.../filters/02_blacklist.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

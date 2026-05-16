@@ -9,7 +9,7 @@
 #
 # Usage:
 #   GEMINI_API_KEY=your_key bash scripts/06_refine_landmark_mapping.sh \
-#       --from_yaml configs/selection/exp.yaml
+#       --exp configs/selection/exp.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

@@ -20,11 +20,11 @@ their outputs are on disk for this stage to consume:
 
   python src/check/rewrite_subinstructions.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml results/val_unseen/filters/current.yaml
+      --exp configs/selection/exp.yaml
 
   python src/check/visualize_partition.py \\
       --config configs/rollout/rollout_landmark_rxr.yaml \\
-      --from_yaml results/val_unseen/filters/current.yaml
+      --exp configs/selection/exp.yaml
 
 Then this stage:
 
@@ -49,15 +49,14 @@ from src.check._filter_utils import (
     ensure_sub_path,
     get_filter_dir,
     get_split,
+    get_survivor_path,
     load_audit,
-    load_keep,
     load_rewrite_episodes,
     register_stage,
-    resolve_selection,
+    resolve_exp,
     save_audit,
-    update_current,
     write_drop_yaml,
-    write_keep_yaml,
+    write_survivor,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -124,16 +123,18 @@ def main() -> None:
         description="Stage 3: fold rewriter + partition results into the filter pipeline",
     )
     ap.add_argument("--config", required=True)
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection YAML carrying expname / run_name so this "
-                         "stage knows which experiment's filter dir to read.  "
-                         "Typically the prior stage's current.yaml.")
+    ap.add_argument("--exp", default=None,
+                    help="Experiment handle (selection YAML path or expname). "
+                         "survivor.yaml is auto-merged to supply the "
+                         "prior survivor sub_paths.")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    # Apply experiment identity (expname / run_name) before resolving paths.
-    resolve_selection(cfg, args.from_yaml)
+    # resolve_exp(apply_current=True) applies the user's yaml THEN merges
+    # survivor.yaml on top, so cfg.selection ends up with the latest
+    # survivor set (instruction_ids + sub_paths).
+    resolve_exp(cfg, args.exp, apply_current=True)
 
     filt_dir = get_filter_dir(cfg)
     if not filt_dir.exists():
@@ -141,28 +142,24 @@ def main() -> None:
     out_dir = filt_dir.parent
     split   = get_split(cfg)
 
-    # Read survivors from the prior stage via current.yaml.
-    current = filt_dir / "current.yaml"
-    prior_path = Path(args.from_yaml).expanduser() if args.from_yaml else current
-    if not prior_path.exists():
-        raise SystemExit(f"No prior survivor YAML at {prior_path} — run stage 2 first.")
-    prior_keep = load_keep(prior_path.resolve())
-    prior_ids = set(int(x) for x in prior_keep.get("instruction_ids", []))
+    survivor = get_survivor_path(cfg)
+    if not survivor.exists():
+        raise SystemExit(f"No survivor.yaml at {survivor} — run stage 2 first.")
+
+    prior_ids = set(int(x) for x in cfg.get("selection", {}).get("instruction_ids") or [])
     if not prior_ids:
         raise SystemExit("Prior stage produced no surviving episodes.")
-    prior_subs = prior_keep.get("sub_paths")
+    prior_subs = cfg.get("selection", {}).get("sub_paths")
     if not prior_subs:
         raise SystemExit(
-            "Prior stage's current.yaml has no `sub_paths` field — stage 3 "
-            "expects sub-path-level survivors (run stage 2 first).",
+            "survivor.yaml has no `sub_paths` field — stage 3 expects "
+            "sub-path-level survivors (run stage 2 first).",
         )
     allowed_subs = {
         int(ep_id): [int(s) for s in subs]
         for ep_id, subs in prior_subs.items()
     }
 
-    # Reload the dataset, restricted to prior survivors.
-    resolve_selection(cfg, str(prior_path.resolve()))
     episodes = episodes_from_config(cfg)
     if not episodes:
         raise SystemExit("No episodes loaded from current.yaml.")
@@ -240,18 +237,16 @@ def main() -> None:
             }
 
     # ── Write outputs ────────────────────────────────────────────────
-    keep_path = write_keep_yaml(
-        filt_dir, STAGE_NUM, STAGE_NAME, split,
+    survivor_path = write_survivor(
+        cfg, split,
         instruction_ids=sorted(keep_sub_paths.keys()),
         sub_paths=keep_sub_paths,
-        cfg=cfg,
     )
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
         dropped=dict(sorted(dropped.items(), key=lambda kv: int(kv[0]))),
     )
     save_audit(audit, filt_dir)
-    current_path = update_current(filt_dir, keep_path)
 
     n_eps_keep = len(keep_sub_paths)
     n_eps_drop = len(episodes) - n_eps_keep
@@ -268,9 +263,8 @@ def main() -> None:
     print(f"  sub-paths drop: {n_subs_total - n_subs_keep}")
     print()
     print("Outputs:")
-    print(f"  {keep_path}")
+    print(f"  {survivor_path}")
     print(f"  {drop_path}")
-    print(f"  {current_path}  ->  {keep_path.name}")
     print(f"  {filt_dir / 'audit.json'}")
 
 

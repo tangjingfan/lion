@@ -7,15 +7,14 @@ metres vertically are considered cross-floor and removed from the survivor
 set.  A typical single-floor MP3D path stays under ~1 m of vertical drift;
 a path that climbs or descends a full storey jumps by 2.5+ m.
 
-Outputs (under ``{base_dir}/{run_name}/filters/``):
-  01_cross_floor.yaml          — selection YAML with surviving instruction_ids
-                                 (drop-in for ``--selection`` on any tool)
-  01_cross_floor_dropped.yaml  — rejected ids + Δy reason  (debug only)
-  current.yaml                 — symlink to the latest stage's keep file.
-                                 Downstream tools read from here so they
-                                 always see the most recent survivor set.
-  audit.json                   — per-episode trace, created/updated here.
-                                 Subsequent stages append to the same file.
+Outputs:
+  {run_dir}/survivor.yaml                — canonical post-stage survivor
+                                            set (overwritten; downstream
+                                            tools auto-merge via resolve_exp)
+  {run_dir}/filters/01_cross_floor_dropped.yaml
+                                          — rejected ids + Δy (debug only)
+  {run_dir}/filters/audit.json           — per-episode trace; subsequent
+                                            stages append to the same file
 
 Usage
 -----
@@ -41,11 +40,10 @@ from src.check._filter_utils import (
     get_split,
     load_audit,
     register_stage,
-    resolve_selection,
+    resolve_exp,
     save_audit,
-    update_current,
     write_drop_yaml,
-    write_keep_yaml,
+    write_survivor,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import load_connectivity
@@ -59,9 +57,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Stage 1: drop cross-floor episodes")
     ap.add_argument("--config", required=True,
                     help="Rollout / dataset YAML config")
-    ap.add_argument("--from_yaml", default=None,
-                    help="Selection YAML to restrict the input set "
-                         "(overrides config's selection.from_yaml)")
+    ap.add_argument("--exp", default=None,
+                    help="Selection YAML to restrict the input set. Stage 1 "
+                         "reads the seed YAML directly and does NOT auto-merge "
+                         "survivor.yaml (so reruns process the full set "
+                         "rather than the prior survivor subset).")
     ap.add_argument("--threshold_m", type=float, default=0.5,
                     help="Y-range threshold (m) above which an episode is "
                          "considered cross-floor (default 0.5)")
@@ -69,7 +69,7 @@ def main() -> None:
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    resolve_selection(cfg, args.from_yaml)
+    resolve_exp(cfg, args.exp, apply_current=False)
 
     episodes = episodes_from_config(cfg)
     if not episodes:
@@ -134,16 +134,13 @@ def main() -> None:
             n_subs_keep += n_ep_subs
             keep.append(ep.instruction_id)
 
-    keep_path = write_keep_yaml(
-        filt_dir, STAGE_NUM, STAGE_NAME, split, keep, cfg=cfg,
-    )
+    survivor_path = write_survivor(cfg, split, keep)
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
         dropped={str(k): v for k, v in sorted(dropped.items())},
         extras={"threshold_m": args.threshold_m},
     )
     save_audit(audit, filt_dir)
-    current_path = update_current(filt_dir, keep_path)
 
     n_total  = len(episodes)
     n_keep   = len(keep)
@@ -158,9 +155,8 @@ def main() -> None:
     print(f"  sub-paths drop: {n_subs_drop}")
     print()
     print("Outputs:")
-    print(f"  {keep_path}")
+    print(f"  {survivor_path}")
     print(f"  {drop_path}")
-    print(f"  {current_path}  ->  {keep_path.name}")
     print(f"  {filt_dir / 'audit.json'}")
 
 

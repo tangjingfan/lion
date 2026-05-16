@@ -5,8 +5,8 @@
 # drops those exceeding --threshold_m (default 0.5 m).
 #
 # Usage:
-#   bash scripts/01_filter_multi_floor.sh --from_yaml configs/selection/exp.yaml
-#   bash scripts/01_filter_multi_floor.sh --from_yaml ... --threshold_m 1.0
+#   bash scripts/01_filter_multi_floor.sh --exp configs/selection/exp.yaml
+#   bash scripts/01_filter_multi_floor.sh --exp ... --threshold_m 1.0
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
