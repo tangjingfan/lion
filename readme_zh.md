@@ -93,7 +93,10 @@ filter 步骤 00-04（record / multi_floor / rewrite / blacklist / partition）
 target instance selection（第 3 章，脚本 05-08）
         │
         ▼
-VLM pixel-grounded rescue（第 4 章，脚本 09；最后一步）
+VLM pixel-grounded rescue（第 4 章，脚本 09）
+        │
+        ▼
+把 rescue 结果合回 target_instances.json（第 4 章，脚本 10；最后一步）
 ```
 
 #### 2.0 Snapshot（不丢任何东西）
@@ -302,4 +305,15 @@ bash scripts/build_semantic_rescue_categories.sh --exp "$SEL" --dry_run
 
 它只处理已有 `target_instance_ids` 的样本，让 VLM 在已有 mask 上起更细类别；适合审计已有 selection，但救不了没 instance id 的样本。
 
-rescue 是流水线的**最后一步**。原先 4b 的「粗粒度语义过滤」已经移除：rescue 没救出来的样本不会再被剔除——`category` 字段就是当初 YOLO 的 prompt 词（即 instruction 的 landmark），下游消费者自己看 `target_instances/{scan}/semantic_rescue_categories.json` 决定怎么用就好。
+### 把 rescue 结果合回 target_instances.json
+
+rescue 步骤产出的是 side-car（`semantic_rescue_categories.json`）。Step 10 把里面的命中信息合并回 `target_instances/{scan}/target_instances.json`，让 canonical 的 target selection 记录也反映 rescue 的结果：
+
+- 之前是 `not_visible`（`target_instance_ids` 空）且 rescue 救到了 → 填入 `instance_id`、`status = "rescued"`、记下 `rescue_landmark` / `rescue_category`（= 当初 YOLO prompt 用的 landmark 短语）。
+- 之前已经有 target → 不改 target，只追加 `rescue_landmark` / `rescue_category` / `rescue_instance_id`，让下游知道 rescue 也确认过这个。
+
+```bash
+bash scripts/10_apply_rescue.sh --exp "$SEL"
+```
+
+幂等：重跑会先清掉旧的 `rescue_*` 注释再写新的，跑几次结果都一样。原先 4b 的「粗粒度语义过滤」已经移除：rescue 没救出来的样本不会再被剔除——下游消费者自己看 `target_instances/{scan}/semantic_rescue_categories.json` 决定怎么用就好。

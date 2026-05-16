@@ -121,7 +121,10 @@ filter steps 00-04 (record / multi_floor / rewrite / blacklist / partition)
 target instance selection (step 3, scripts 05-08)
         │
         ▼
-VLM pixel-grounded rescue (step 4, script 09; final)
+VLM pixel-grounded rescue (step 4, script 09)
+        │
+        ▼
+apply rescue back into target_instances.json (step 4, script 10; final)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -417,9 +420,30 @@ asking the VLM to name the existing target mask. Useful for auditing an
 existing selection, but it cannot rescue examples without an instance
 id.
 
-Rescue is the **final** step of the pipeline. The previous coarse-label
-filter has been removed: a target that's coarse-bucket-only on its own
-is kept as-is when rescue produces nothing fine — the rescue output
-just doesn't get richer info for it. Downstream consumers can decide
-how to treat such targets by inspecting
-`target_instances/{scan}/semantic_rescue_categories.json` themselves.
+### Apply rescue back into target_instances.json
+
+The rescue step writes a side-car (`semantic_rescue_categories.json`).
+Step 10 fans those hits back into the live
+`target_instances/{scan}/target_instances.json` so the canonical
+target-selection record reflects the rescue:
+
+- A sub-path that was previously `not_visible` (empty
+  `target_instance_ids`) and has a rescue hit → fill in the rescued
+  `instance_id`, set `status = "rescued"`, record `rescue_landmark`
+  and `rescue_category` (= the landmark phrase used as the YOLO prompt).
+- A sub-path that already had a target → leave the chosen instance
+  untouched, annotate `rescue_landmark` / `rescue_category` /
+  `rescue_instance_id` so downstream consumers know the rescue
+  confirmed it.
+
+```bash
+bash scripts/10_apply_rescue.sh --exp "$SEL"
+```
+
+Idempotent: re-running clears stale `rescue_*` annotations and rewrites
+them, so running it twice produces the same result. The previous
+coarse-label drop filter has been removed entirely — a target that's
+coarse-bucket-only and gets no rescue hit is kept as-is rather than
+dropped, since the original coarse semantic label is still a valid
+grounding. Downstream consumers can decide how to treat such targets
+themselves.
