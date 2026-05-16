@@ -16,6 +16,8 @@ This README walks through the four core stages end-to-end:
 4. **VLM pixel-grounded rescue** — recover coarse MPCAT40 targets
    (`appliances` / `lighting` / …) into fine categories (`stove` /
    `lamp` / …) via YOLO-World; VLM as fallback.
+5. **Consolidate dataset** — stitch every surviving sub-trajectory's
+   text / geometry / target / rescue info into one `dataset.json`.
 
 ## Setup
 
@@ -124,7 +126,10 @@ target instance selection (step 3, scripts 05-08)
 VLM pixel-grounded rescue (step 4, script 09)
         │
         ▼
-apply rescue back into target_instances.json (step 4, script 10; final)
+apply rescue back into target_instances.json (step 4, script 10)
+        │
+        ▼
+consolidate surviving sub-trajectories → dataset.json (step 5, script 11)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -447,3 +452,24 @@ coarse-bucket-only and gets no rescue hit is kept as-is rather than
 dropped, since the original coarse semantic label is still a valid
 grounding. Downstream consumers can decide how to treat such targets
 themselves.
+
+## 5. Consolidate surviving sub-trajectories
+
+Reads `survivor.yaml` + per-sub-path artifacts produced by all earlier
+stages and stitches them into one record per surviving sub-trajectory:
+text (full + sub-split + landmark / spatial), path geometry
+(`sub_path_nodes` / `spatial_path` / `landmark_path` / heading /
+partition kind), the chosen target instance + whether the landmark was
+visible from the partition point, any rescue annotations, and pointers
+to viz files. Pure aggregation — no LLM / simulator / detector calls.
+
+```bash
+bash scripts/11_consolidate.sh --exp "$SEL"
+```
+
+Writes:
+
+- `results/{run}/dataset.json` — top-level JSON list of records, one
+  per surviving (scan, instruction_id, sub_idx). Each record carries
+  the union of fields from the rewrite, partition, and target_instances
+  JSONs plus the dataset-level instruction text.
