@@ -74,8 +74,10 @@ COARSE_BUCKETS = {
 APPROACH_THRESHOLD_M = 0.5
 
 # An instance must have at least this many visible pixels at the end
-# pose to be considered a viable replacement landmark.
-MIN_VISIBLE_PIXELS = 200
+# pose to be considered a viable replacement landmark. 1000 px in a
+# 1024×512 panorama (~0.19% of FOV) is a small but visually obvious
+# object; 200 (the previous default) admitted near-invisible specks.
+MIN_VISIBLE_PIXELS = 1000
 
 
 def _load_yaml(path: Path) -> dict:
