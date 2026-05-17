@@ -55,9 +55,11 @@ from src.process.visibility import VisibilityChecker
 
 # Category names that are unreferrable on their own — we never pick
 # these as a replacement landmark, even when they dominate the FOV.
+# "railing" was previously included but user feedback flagged it as
+# a valid navigation landmark ("walk to the railing"), so it stays out.
 LANDMARK_BLACKLIST_CATS = {
     "wall", "floor", "ceiling", "door", "window", "doorway",
-    "railing", "blinds", "curtain", "misc", "void",
+    "blinds", "curtain", "misc", "void",
 }
 
 # Coarse buckets that we'd prefer NOT to pick because they're not
