@@ -221,8 +221,14 @@ def _pick_replacement_landmark(
     fine = [c for c in pool if c["category"] not in COARSE_BUCKETS]
     pool = fine or pool
 
-    # Tier 3: closest to end pose wins; pixel count breaks remaining ties.
-    pool.sort(key=lambda c: (c["dist_end_m"], -c["pixel_count"]))
+    # Tier 3: balance proximity-to-end against visual prominence.
+    # ``score = dist_end_m / sqrt(pixel_count)`` — interprets as
+    # "distance per unit visual size", so a small-but-close instance
+    # (e.g. a tiny stair at 3 m) doesn't beat a huge-but-farther one
+    # (e.g. a railing filling the FOV at 5 m). Lower = better.
+    for c in pool:
+        c["score"] = c["dist_end_m"] / max(1.0, float(c["pixel_count"]) ** 0.5)
+    pool.sort(key=lambda c: c["score"])
     chosen = pool[0]
     chosen["scene_instance_count"]    = int(scene_category_counts.get(chosen["category"], 0))
     chosen["fov_instance_count"]      = int(cat_visible_count[chosen["category"]])
