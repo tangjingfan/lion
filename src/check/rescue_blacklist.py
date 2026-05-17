@@ -360,6 +360,40 @@ def main() -> None:
                     skipped_no_candidate += 1
                     continue
 
+                # Partition-pose visibility check for the chosen category,
+                # matching original-record semantics (step 07/08 measure
+                # at partition pose with a 50-px threshold).
+                PARTITION_MIN_PIXELS = 50
+                partition_visibility_status = "not_visible"
+                chosen_visible_at_partition = False
+                n_visible_at_partition      = 0
+                pick_pixels_at_partition    = 0
+                try:
+                    p_obs = checker.render_observation(
+                        partition_pos.astype(np.float32), 0.0,
+                    )
+                    p_sem = p_obs.get("semantic")
+                    if p_sem is not None:
+                        p_vis = _visible_instance_pixels(p_sem)
+                        for iid, pix in p_vis.items():
+                            if pix < PARTITION_MIN_PIXELS:
+                                continue
+                            if inst_meta.get(iid, {}).get("category") == pick["category"]:
+                                n_visible_at_partition += 1
+                        pick_pixels_at_partition = int(p_vis.get(int(pick["instance_id"]), 0))
+                        chosen_visible_at_partition = (
+                            pick_pixels_at_partition >= PARTITION_MIN_PIXELS
+                        )
+                        if n_visible_at_partition == 1:
+                            partition_visibility_status = "unique"
+                        elif n_visible_at_partition > 1:
+                            partition_visibility_status = "ambiguous"
+                except Exception as exc:
+                    print(
+                        f"  WARN [{scan} ep={ep_id} sub={sub_idx}] partition "
+                        f"visibility check failed: {exc}"
+                    )
+
                 spatial_instr = (part_sub.get("spatial_instruction") or "").strip()
                 new_landmark  = pick["category"]
                 new_sub_instr = _synth_sub_instruction(spatial_instr, new_landmark)
@@ -426,6 +460,10 @@ def main() -> None:
                     "unique_in_scene":      pick["unique_in_scene"],
                     "fov_instance_count":   pick["fov_instance_count"],
                     "scene_instance_count": pick["scene_instance_count"],
+                    "partition_visibility_status":  partition_visibility_status,
+                    "chosen_visible_at_partition":  chosen_visible_at_partition,
+                    "n_visible_at_partition":       n_visible_at_partition,
+                    "pick_pixels_at_partition":     pick_pixels_at_partition,
                     "partition_viz_path":   viz_paths["partition_viz_path"],
                     "end_viz_path":         viz_paths["end_viz_path"],
                 }

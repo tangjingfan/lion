@@ -168,6 +168,12 @@ def _build_synthesized_record(
     rec["matched_semantic_category"]   = rescue_rec.get("new_mpcat40")
     rec["matched_semantic_categories"] = [rescue_rec.get("new_mpcat40")] if rescue_rec.get("new_mpcat40") else []
     rec["landmark_visible"]            = bool(rec["target_instance_ids"])
+    # Partition-pose visibility check (matches original-record semantics
+    # — step 07/08 also measure at partition pose). Synth records may
+    # still have visibility_status="not_visible" at partition even
+    # though the landmark is by construction visible at the end pose;
+    # those two facts are now both surfaced.
+    rec["visibility_status"] = rescue_rec.get("partition_visibility_status") or "not_visible"
     return rec
 
 
