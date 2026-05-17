@@ -154,14 +154,19 @@ def main() -> None:
 
     # ── Final dataset.json snapshot ────────────────────────────────
     final_status: Counter = Counter()
+    final_source: Counter = Counter()
     n_with_target  = 0
     n_rescued      = 0
+    n_synthesized  = 0
     for r in dataset:
         final_status[r.get("target_status") or "unknown"] += 1
+        final_source[r.get("landmark_source") or "unknown"] += 1
         if r.get("target_instance_ids"):
             n_with_target += 1
         if r.get("target_status") == "rescued":
             n_rescued += 1
+        if r.get("landmark_source") == "synthesized":
+            n_synthesized += 1
     n_final_records = len(dataset)
     n_final_eps     = len({r.get("instruction_id") for r in dataset})
 
@@ -197,9 +202,13 @@ def main() -> None:
     print("Post-pipeline target status (records exist but may be unusable):")
     print(f"  with target_instance_ids : {n_with_target}/{n_final_records}")
     print(f"  rescued from not_visible : {n_rescued}")
+    print(f"  synthesized landmarks    : {n_synthesized}  (originally blacklisted, replacement found via step 13)")
     print(f"  status histogram         :")
     for status, count in final_status.most_common():
         print(f"    {status:<25s} {count}")
+    print(f"  landmark_source histogram:")
+    for src, count in final_source.most_common():
+        print(f"    {src:<25s} {count}")
 
     print()
     print("=== overall ===")

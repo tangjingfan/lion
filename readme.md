@@ -16,8 +16,11 @@ This README walks through the four core stages end-to-end:
 4. **VLM pixel-grounded rescue** — recover coarse MPCAT40 targets
    (`appliances` / `lighting` / …) into fine categories (`stove` /
    `lamp` / …) via YOLO-World; VLM as fallback.
-5. **Consolidate dataset** — stitch every surviving sub-trajectory's
-   text / geometry / target / rescue info into one `dataset.json`.
+5. **Blacklist rescue + consolidate** — re-ground sub-paths whose
+   landmark was too generic (`wall` / `door` / `room`) by picking a
+   different referrable instance visible at the sub-path end, then
+   stitch every surviving sub-trajectory (original + synthesized) into
+   one `dataset.json`.
 
 ## Setup
 
@@ -129,7 +132,13 @@ VLM pixel-grounded rescue (step 4, script 09)
 apply rescue back into target_instances.json (step 4, script 10)
         │
         ▼
-consolidate surviving sub-trajectories → dataset.json (step 5, script 11)
+blacklist rescue: find replacement landmarks (step 5, script 13)
+        │
+        ▼
+consolidate (originals + synthesized) → dataset.json (step 5, script 11)
+        │
+        ▼
+attrition report (step 5, script 12 — runnable anytime)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -472,4 +481,39 @@ Writes:
 - `results/{run}/dataset.json` — top-level JSON list of records, one
   per surviving (scan, instruction_id, sub_idx). Each record carries
   the union of fields from the rewrite, partition, and target_instances
-  JSONs plus the dataset-level instruction text.
+  JSONs plus the dataset-level instruction text, plus a
+  `landmark_source ∈ {"original", "synthesized"}` field so consumers
+  can filter on provenance.
+
+### Blacklist rescue (synthesizing replacement landmarks)
+
+A sibling rescue for sub-paths the **blacklist** filter (`03`) cut —
+those where the instruction-derived landmark was too generic ("wall",
+"door", "room", "doorway", ...). Instead of re-grounding the original
+landmark, this step picks a **different** referrable instance visible
+at the sub-path end pose and synthesizes a new sub-instruction. A
+candidate must:
+
+  1. be visible at the end pose with ≥ 200 pixels,
+  2. be **progressively approached** (≥ 0.5 m closer at end than at
+     the partition point),
+  3. have a concrete MPCAT40 category (not in `wall` / `door` /
+     `window` / `floor` / `ceiling` / etc.),
+  4. preferably be the only visible instance of its category at that
+     vantage (unambiguous "the X").
+
+```bash
+bash scripts/13_rescue_blacklist.sh --exp "$SEL"
+bash scripts/11_consolidate.sh --exp "$SEL"   # re-run after rescue
+```
+
+Writes:
+
+- `target_instances/{scan}/blacklist_rescue.json` — side-car per scan
+  with the replacement landmark, the new sub-instruction (currently a
+  simple template `"<spatial>. Walk to a <landmark>."`), the new
+  target instance id, and approach / uniqueness stats.
+
+The consolidate step then emits these as additional records in
+`dataset.json` with `landmark_source = "synthesized"` and a
+`synthesized_from` block carrying the original landmark + drop reason.

@@ -98,6 +98,79 @@ def _target_for_sub(target_db: Dict, ep_id: int, sub_idx: int) -> Optional[Dict]
     )
 
 
+def _load_blacklist_rescue(run_dir: Path, scan: str) -> Dict:
+    p = run_dir / "target_instances" / scan / "blacklist_rescue.json"
+    if not p.exists():
+        return {}
+    with open(p) as f:
+        return json.load(f) or {}
+
+
+def _build_synthesized_record(
+    ep,
+    sub_idx: int,
+    part_json: Optional[Dict],
+    rescue_rec: Dict,
+) -> Dict[str, Any]:
+    """Build a dataset record from a blacklist_rescue entry.
+
+    The geometry is reused from partition.json (the sub-path itself
+    didn't change — only the landmark name + chosen target instance).
+    """
+    part = _partition_for_sub(part_json or {}, sub_idx)
+
+    sub_pair = ep.sub_paths[sub_idx] if sub_idx < len(ep.sub_paths) else [None, None]
+
+    new_landmark = rescue_rec.get("new_landmark") or ""
+    rec: Dict[str, Any] = {
+        "scan":             ep.scan,
+        "instruction_id":   ep.instruction_id,
+        "path_id":          ep.path_id,
+        "sub_idx":          sub_idx,
+        "language":         ep.language,
+        "instruction":      ep.instruction,
+        "sub_instruction":  rescue_rec.get("new_sub_instruction"),
+        "sub_path":         list(sub_pair),
+        "landmark":         new_landmark,
+        "landmark_category": "object",
+        "landmark_instruction": rescue_rec.get("landmark_instruction"),
+        "spatial_instruction":  rescue_rec.get("spatial_instruction"),
+        "components": [{
+            "original_mention": new_landmark,
+            "semantic_label":   rescue_rec.get("new_mpcat40"),
+            "description":      f"Synthesized replacement for {rescue_rec.get('original_landmark')!r}.",
+        }],
+        "landmark_source": "synthesized",
+        "synthesized_from": {
+            "original_landmark": rescue_rec.get("original_landmark"),
+            "blacklist_reason":  rescue_rec.get("original_reason"),
+            "approach_m":        rescue_rec.get("approach_m"),
+            "unique_in_fov":     rescue_rec.get("unique_in_fov"),
+            "unique_in_scene":   rescue_rec.get("unique_in_scene"),
+        },
+    }
+
+    # Reuse geometry from the original partition entry (the path nodes
+    # are unchanged — we only swapped which object the agent is being
+    # told to walk towards).
+    if part:
+        rec["sub_path_nodes"]     = part.get("sub_path_nodes")
+        rec["spatial_path"]       = part.get("spatial_path")
+        rec["landmark_path"]      = part.get("landmark_path")
+        rec["partition_kind"]     = part.get("kind")
+        rec["instruction_kind"]   = part.get("instruction_kind")
+        rec["direction_mismatch"] = part.get("direction_mismatch")
+
+    # Target = the rescued instance. By construction it's visible AND
+    # approached at the sub-path end.
+    rec["target_instance_ids"]         = [int(rescue_rec.get("new_instance_id"))] if rescue_rec.get("new_instance_id") is not None else []
+    rec["target_status"]               = "synthesized"
+    rec["matched_semantic_category"]   = rescue_rec.get("new_mpcat40")
+    rec["matched_semantic_categories"] = [rescue_rec.get("new_mpcat40")] if rescue_rec.get("new_mpcat40") else []
+    rec["landmark_visible"]            = bool(rec["target_instance_ids"])
+    return rec
+
+
 def _build_record(
     ep,
     sub_idx: int,
@@ -147,6 +220,10 @@ def _build_record(
         rec["partition_kind"]    = part.get("kind")
         rec["instruction_kind"]  = part.get("instruction_kind")
         rec["direction_mismatch"] = part.get("direction_mismatch")
+
+    # Provenance: original by default; blacklist-rescued sub-paths get
+    # their own synthesized records emitted in main(), tagged differently.
+    rec["landmark_source"] = "original"
 
     # Target block.
     if target:
@@ -229,6 +306,63 @@ def main() -> None:
             if part_json is None or _partition_for_sub(part_json, sub_idx) is None:
                 missing.append(f"{ep.instruction_id}#{sub_idx}: no partition.json")
 
+    # ── Synthesized records from blacklist rescue (step 13) ───────────
+    # We pull every episode the rescue file mentions — these episodes
+    # may not be in `episodes` if they were entirely blacklisted (e.g.
+    # 882 in val_unseen_one_scene_partial).
+    syn_records: List[Dict[str, Any]] = []
+    per_scan_rescue_cache: Dict[str, Dict] = {}
+    rescued_ep_ids: Dict[int, str] = {}
+    for ep in episodes:
+        per_scan_rescue_cache.setdefault(ep.scan, _load_blacklist_rescue(run_dir, ep.scan))
+    # Resolve every episode mentioned by any rescue file (covers ones
+    # not in `episodes` because the whole episode got blacklist-dropped).
+    extra_ep_ids = set()
+    for rescue_data in per_scan_rescue_cache.values():
+        for ep_id_str in (rescue_data.get("rescues") or {}):
+            try:
+                extra_ep_ids.add(int(ep_id_str))
+            except ValueError:
+                continue
+    extra_ep_ids -= {int(ep.instruction_id) for ep in episodes}
+    extra_episodes: Dict[int, Any] = {}
+    if extra_ep_ids:
+        side_cfg = dict(cfg)
+        side_cfg.setdefault("selection", {}).update({
+            "instruction_ids": sorted(extra_ep_ids),
+            "sub_paths": {},
+        })
+        for ep in episodes_from_config(side_cfg):
+            extra_episodes[int(ep.instruction_id)] = ep
+            per_scan_rescue_cache.setdefault(
+                ep.scan, _load_blacklist_rescue(run_dir, ep.scan),
+            )
+
+    ep_lookup = {int(ep.instruction_id): ep for ep in episodes}
+    ep_lookup.update(extra_episodes)
+
+    for scan, rescue_data in per_scan_rescue_cache.items():
+        for ep_id_str, subs in (rescue_data.get("rescues") or {}).items():
+            try:
+                ep_id = int(ep_id_str)
+            except ValueError:
+                continue
+            ep = ep_lookup.get(ep_id)
+            if ep is None:
+                continue
+            part_json = _load_partition(run_dir, ep.scan, ep.instruction_id)
+            for sub_idx_str, rescue_rec in (subs or {}).items():
+                try:
+                    sub_idx = int(sub_idx_str)
+                except ValueError:
+                    continue
+                syn = _build_synthesized_record(
+                    ep, sub_idx, part_json, rescue_rec,
+                )
+                syn_records.append(syn)
+
+    records.extend(syn_records)
+
     out_path = Path(args.out).expanduser() if args.out else (run_dir / "dataset.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -237,27 +371,28 @@ def main() -> None:
     # Summary print.
     n = len(records)
     by_status = {}
+    by_source = {}
     n_with_target = 0
     n_visible = 0
-    n_rescued = 0
     scans = set()
     for r in records:
         scans.add(r["scan"])
         by_status[r.get("target_status") or "unknown"] = by_status.get(r.get("target_status") or "unknown", 0) + 1
+        by_source[r.get("landmark_source") or "unknown"] = by_source.get(r.get("landmark_source") or "unknown", 0) + 1
         if r.get("target_instance_ids"):
             n_with_target += 1
-        if r.get("landmark_visible_at_partition"):
+        if r.get("landmark_visible"):
             n_visible += 1
-        if r.get("target_status") == "rescued" or r.get("rescue_instance_id") is not None:
-            n_rescued += 1
 
     print()
     print(f"=== consolidate summary ===")
-    print(f"  records             : {n}")
+    print(f"  records             : {n}  ({len(syn_records)} synthesized)")
     print(f"  scans               : {len(scans)}  ({', '.join(sorted(scans))})")
     print(f"  with target_id      : {n_with_target}")
     print(f"  landmark visible    : {n_visible}")
-    print(f"  rescue-touched      : {n_rescued}")
+    print(f"  by landmark_source  :")
+    for src, count in sorted(by_source.items(), key=lambda kv: -kv[1]):
+        print(f"    {src:<25s} {count}")
     print(f"  by target_status    :")
     for status, count in sorted(by_status.items(), key=lambda kv: -kv[1]):
         print(f"    {status:<25s} {count}")
