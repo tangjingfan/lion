@@ -8,7 +8,7 @@
 #
 # Output: target_instances/<scan>/blacklist_rescue.json — consumed by
 # 11_consolidate (which emits these as records with
-# landmark_source="synthesized" alongside the original ones).
+# synthesized=true alongside the original ones).
 #
 # Usage:
 #   bash scripts/13_rescue_blacklist.sh --exp configs/selection/<split>/<exp>.yaml

@@ -338,7 +338,7 @@ bash scripts/11_consolidate.sh --exp "$SEL"
 
 输出：
 
-- `results/{run}/dataset.json` —— 顶层是 JSON list，每条对应一个存活的 `(scan, instruction_id, sub_idx)`。每条记录是 rewrite / partition / target_instances 三个 JSON 的字段并集，外加从 Landmark-RxR 数据集直接拿到的 instruction 原文，再加 `landmark_source ∈ {"original", "synthesized"}` 字段供下游过滤。
+- `results/{run}/dataset.json` —— 顶层是 JSON list，每条对应一个存活的 `(scan, instruction_id, sub_idx)`。每条记录是 rewrite / partition / target_instances 三个 JSON 的字段并集，外加从 Landmark-RxR 数据集直接拿到的 instruction 原文，再加 `synthesized ∈ {false, true}` 字段供下游过滤。
 
 ### Blacklist 拯救（合成新 landmark）
 
@@ -385,4 +385,4 @@ bash scripts/11_consolidate.sh --exp "$SEL"   # 救完重跑 consolidate
 
 - `target_instances/{scan}/blacklist_rescue.json` —— 每 scan 一份，记录新 landmark、合成的 sub-instruction（目前用简单模板 `"<spatial>. Walk to a <landmark>."`）、新 target instance id，外加 approach / uniqueness 统计。
 
-consolidate 这一步把这些作为额外 record 加进 `dataset.json`，标 `landmark_source = "synthesized"`，并在 `synthesized_from` 字段里记下原 landmark + drop 原因。
+consolidate 这一步把这些作为额外 record 加进 `dataset.json`，标 `synthesized = true`，并在 `synthesized_from` 字段里记下原 landmark + drop 原因。

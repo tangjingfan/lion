@@ -106,90 +106,39 @@ def _load_blacklist_rescue(run_dir: Path, scan: str) -> Dict:
         return json.load(f) or {}
 
 
-def _build_synthesized_record(
-    ep,
-    sub_idx: int,
-    part_json: Optional[Dict],
-    rescue_rec: Dict,
-) -> Dict[str, Any]:
-    """Build a dataset record from a blacklist_rescue entry.
-
-    The geometry is reused from partition.json (the sub-path itself
-    didn't change — only the landmark name + chosen target instance).
-    """
-    part = _partition_for_sub(part_json or {}, sub_idx)
-
-    sub_pair = ep.sub_paths[sub_idx] if sub_idx < len(ep.sub_paths) else [None, None]
-
-    new_landmark = rescue_rec.get("new_landmark") or ""
-    rec: Dict[str, Any] = {
-        "scan":             ep.scan,
-        "instruction_id":   ep.instruction_id,
-        "path_id":          ep.path_id,
-        "sub_idx":          sub_idx,
-        "language":         ep.language,
-        "instruction":      ep.instruction,
-        "sub_instruction":  rescue_rec.get("new_sub_instruction"),
-        "sub_path":         list(sub_pair),
-        "landmark":         new_landmark,
-        "landmark_category": "object",
-        "landmark_instruction": rescue_rec.get("landmark_instruction"),
-        "spatial_instruction":  rescue_rec.get("spatial_instruction"),
-        "components": [{
-            "original_mention": new_landmark,
-            "semantic_label":   rescue_rec.get("new_mpcat40"),
-            "description":      f"Synthesized replacement for {rescue_rec.get('original_landmark')!r}.",
-        }],
-        "landmark_source": "synthesized",
-        "synthesized_from": {
-            "original_landmark": rescue_rec.get("original_landmark"),
-            "blacklist_reason":  rescue_rec.get("original_reason"),
-            "approach_m":        rescue_rec.get("approach_m"),
-            "unique_in_fov":     rescue_rec.get("unique_in_fov"),
-            "unique_in_scene":   rescue_rec.get("unique_in_scene"),
-        },
-    }
-
-    # Reuse geometry from the original partition entry (the path nodes
-    # are unchanged — we only swapped which object the agent is being
-    # told to walk towards).
-    if part:
-        rec["sub_path_nodes"]     = part.get("sub_path_nodes")
-        rec["spatial_path"]       = part.get("spatial_path")
-        rec["landmark_path"]      = part.get("landmark_path")
-        rec["partition_kind"]     = part.get("kind")
-        rec["instruction_kind"]   = part.get("instruction_kind")
-        rec["direction_mismatch"] = part.get("direction_mismatch")
-
-    # Target = the rescued instance. By construction it's visible AND
-    # approached at the sub-path end.
-    rec["target_instance_ids"]         = [int(rescue_rec.get("new_instance_id"))] if rescue_rec.get("new_instance_id") is not None else []
-    rec["target_status"]               = "synthesized"
-    rec["matched_semantic_category"]   = rescue_rec.get("new_mpcat40")
-    rec["matched_semantic_categories"] = [rescue_rec.get("new_mpcat40")] if rescue_rec.get("new_mpcat40") else []
-    rec["landmark_visible"]            = bool(rec["target_instance_ids"])
-    # Partition-pose visibility check (matches original-record semantics
-    # — step 07/08 also measure at partition pose). Synth records may
-    # still have visibility_status="not_visible" at partition even
-    # though the landmark is by construction visible at the end pose;
-    # those two facts are now both surfaced.
-    rec["visibility_status"] = rescue_rec.get("partition_visibility_status") or "not_visible"
-    return rec
-
-
 def _build_record(
     ep,
     sub_idx: int,
     part_json: Optional[Dict],
     rewrite_episode: Optional[Dict],
     target_db: Optional[Dict],
+    rescue_rec: Optional[Dict] = None,
 ) -> Dict[str, Any]:
-    part        = _partition_for_sub(part_json or {}, sub_idx)
-    rew         = _rewrite_for_sub(rewrite_episode or {}, sub_idx)
-    target      = _target_for_sub(target_db or {}, ep.instruction_id, sub_idx)
+    """Build one dataset record.
+
+    Both original and synthesized records share an identical field set
+    and ordering. The ``synthesized`` boolean and the
+    ``synthesized_from`` block are the only places they differ in
+    content; ``synthesized_from`` is ``None`` for original records and
+    a populated dict for synthesized ones, but the key is always
+    present so consumers can ``rec["synthesized_from"]`` without
+    branching.
+
+    When ``rescue_rec`` is provided the record is built from a
+    13_rescue_blacklist entry (synthesized replacement landmark);
+    otherwise it is built from the rewrite + target_instances side-cars
+    (original landmark).
+    """
+    is_synth = rescue_rec is not None
+    part     = _partition_for_sub(part_json or {}, sub_idx)
+    rew      = _rewrite_for_sub(rewrite_episode or {}, sub_idx) or {}
+    target   = _target_for_sub(target_db or {}, ep.instruction_id, sub_idx) or {}
 
     sub_pair = ep.sub_paths[sub_idx] if sub_idx < len(ep.sub_paths) else [None, None]
-    sub_text = ep.sub_instructions[sub_idx] if sub_idx < len(ep.sub_instructions) else ""
+    if is_synth:
+        sub_text = rescue_rec.get("new_sub_instruction") or ""
+    else:
+        sub_text = ep.sub_instructions[sub_idx] if sub_idx < len(ep.sub_instructions) else ""
 
     rec: Dict[str, Any] = {
         "scan":            ep.scan,
@@ -202,52 +151,80 @@ def _build_record(
         "sub_path":        list(sub_pair),
     }
 
-    # Rewrite block.
-    if rew:
+    # ── Landmark / text block ────────────────────────────────────────
+    if is_synth:
+        new_landmark = rescue_rec.get("new_landmark") or ""
+        rec["landmark"]             = new_landmark
+        rec["landmark_category"]    = "object"
+        rec["landmark_instruction"] = rescue_rec.get("landmark_instruction")
+        rec["spatial_instruction"]  = rescue_rec.get("spatial_instruction")
+        rec["components"] = [{
+            "original_mention": new_landmark,
+            "semantic_label":   rescue_rec.get("new_mpcat40"),
+            "description":      f"Synthesized replacement for {rescue_rec.get('original_landmark')!r}.",
+        }]
+    else:
         rec["landmark"]             = rew.get("landmark")
         rec["landmark_category"]    = rew.get("landmark_category")
         rec["landmark_instruction"] = rew.get("landmark_instruction")
         rec["spatial_instruction"]  = rew.get("spatial_instruction")
-        components = rew.get("components") or []
         rec["components"] = [
             {
                 "original_mention": c.get("original_mention"),
                 "semantic_label":   c.get("semantic_label"),
                 "description":      c.get("description"),
             }
-            for c in components
+            for c in (rew.get("components") or [])
         ]
 
-    # Partition / geometry block.
+    # ── Partition geometry (same source for both) ────────────────────
     if part:
-        rec["sub_path_nodes"]    = part.get("sub_path_nodes")
-        rec["spatial_path"]      = part.get("spatial_path")
-        rec["landmark_path"]     = part.get("landmark_path")
-        rec["partition_kind"]    = part.get("kind")
-        rec["instruction_kind"]  = part.get("instruction_kind")
+        rec["sub_path_nodes"]     = part.get("sub_path_nodes")
+        rec["spatial_path"]       = part.get("spatial_path")
+        rec["landmark_path"]      = part.get("landmark_path")
+        rec["partition_kind"]     = part.get("kind")
+        rec["instruction_kind"]   = part.get("instruction_kind")
         rec["direction_mismatch"] = part.get("direction_mismatch")
 
-    # Provenance: original by default; blacklist-rescued sub-paths get
-    # their own synthesized records emitted in main(), tagged differently.
-    rec["landmark_source"] = "original"
-
-    # Target block.
-    if target:
+    # ── Target block ─────────────────────────────────────────────────
+    if is_synth:
+        new_iid = rescue_rec.get("new_instance_id")
+        target_ids = [int(new_iid)] if new_iid is not None else []
+        rec["target_instance_ids"]         = target_ids
+        rec["target_status"]               = "synthesized"
+        rec["matched_semantic_category"]   = rescue_rec.get("new_mpcat40")
+        rec["matched_semantic_categories"] = (
+            [rescue_rec.get("new_mpcat40")] if rescue_rec.get("new_mpcat40") else []
+        )
+        rec["landmark_visible"]            = bool(target_ids)
+        # Partition-pose visibility (matches original-record semantics —
+        # step 07/08 measure at partition pose). For synth this may be
+        # "not_visible" even though the landmark IS visible at the end
+        # pose by construction; landmark_visible captures that.
+        rec["visibility_status"] = (
+            rescue_rec.get("partition_visibility_status") or "not_visible"
+        )
+    else:
         target_ids = target.get("target_instance_ids") or []
-        rec["target_instance_ids"]        = target_ids
-        rec["target_status"]              = target.get("status")
-        rec["matched_semantic_category"]  = target.get("matched_category")
+        rec["target_instance_ids"]         = target_ids
+        rec["target_status"]               = target.get("status")
+        rec["matched_semantic_category"]   = target.get("matched_category")
         rec["matched_semantic_categories"] = target.get("matched_categories")
-        # "Did we end up with a grounded target?" — true whenever the
-        # landmark was visible at the partition point OR rescue found it
-        # on the rollout panorama. The fine-grained signals (partition
-        # visibility_status, rescue grounding_method, …) live in
-        # target_instances/<scan>/target_instances.json for anyone who
-        # needs them.
-        rec["landmark_visible"] = bool(target_ids)
-        # Pointer to the partition-point viz PNG (when rendered by 08).
-        if "partition_viz_path" in target:
-            rec["partition_viz_path"] = target["partition_viz_path"]
+        rec["landmark_visible"]            = bool(target_ids)
+        rec["visibility_status"]           = target.get("visibility_status")
+
+    # ── Provenance (uniform key set) ─────────────────────────────────
+    rec["synthesized"] = is_synth
+    if is_synth:
+        rec["synthesized_from"] = {
+            "original_landmark": rescue_rec.get("original_landmark"),
+            "blacklist_reason":  rescue_rec.get("original_reason"),
+            "approach_m":        rescue_rec.get("approach_m"),
+            "unique_in_fov":     rescue_rec.get("unique_in_fov"),
+            "unique_in_scene":   rescue_rec.get("unique_in_scene"),
+        }
+    else:
+        rec["synthesized_from"] = None
 
     return rec
 
@@ -362,8 +339,12 @@ def main() -> None:
                     sub_idx = int(sub_idx_str)
                 except ValueError:
                     continue
-                syn = _build_synthesized_record(
-                    ep, sub_idx, part_json, rescue_rec,
+                syn = _build_record(
+                    ep, sub_idx,
+                    part_json=part_json,
+                    rewrite_episode=None,
+                    target_db=None,
+                    rescue_rec=rescue_rec,
                 )
                 syn_records.append(syn)
 
@@ -377,14 +358,15 @@ def main() -> None:
     # Summary print.
     n = len(records)
     by_status = {}
-    by_source = {}
+    n_synth = 0
     n_with_target = 0
     n_visible = 0
     scans = set()
     for r in records:
         scans.add(r["scan"])
         by_status[r.get("target_status") or "unknown"] = by_status.get(r.get("target_status") or "unknown", 0) + 1
-        by_source[r.get("landmark_source") or "unknown"] = by_source.get(r.get("landmark_source") or "unknown", 0) + 1
+        if r.get("synthesized"):
+            n_synth += 1
         if r.get("target_instance_ids"):
             n_with_target += 1
         if r.get("landmark_visible"):
@@ -392,13 +374,12 @@ def main() -> None:
 
     print()
     print(f"=== consolidate summary ===")
-    print(f"  records             : {n}  ({len(syn_records)} synthesized)")
+    print(f"  records             : {n}")
     print(f"  scans               : {len(scans)}  ({', '.join(sorted(scans))})")
+    print(f"  synthesized=true    : {n_synth}")
+    print(f"  synthesized=false   : {n - n_synth}")
     print(f"  with target_id      : {n_with_target}")
     print(f"  landmark visible    : {n_visible}")
-    print(f"  by landmark_source  :")
-    for src, count in sorted(by_source.items(), key=lambda kv: -kv[1]):
-        print(f"    {src:<25s} {count}")
     print(f"  by target_status    :")
     for status, count in sorted(by_status.items(), key=lambda kv: -kv[1]):
         print(f"    {status:<25s} {count}")

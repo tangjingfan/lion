@@ -482,7 +482,7 @@ Writes:
   per surviving (scan, instruction_id, sub_idx). Each record carries
   the union of fields from the rewrite, partition, and target_instances
   JSONs plus the dataset-level instruction text, plus a
-  `landmark_source ∈ {"original", "synthesized"}` field so consumers
+  `synthesized ∈ {false, true}` field so consumers
   can filter on provenance.
 
 ### Blacklist rescue (synthesizing replacement landmarks)
@@ -559,5 +559,5 @@ Both `unique_in_*` flags flow through to `dataset.json`'s
   the new target instance id, and approach / uniqueness stats.
 
 The consolidate step then emits these as additional records in
-`dataset.json` with `landmark_source = "synthesized"` and a
+`dataset.json` with `synthesized = true` and a
 `synthesized_from` block carrying the original landmark + drop reason.

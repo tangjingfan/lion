@@ -5,8 +5,8 @@ landmark is too generic to ground ("wall", "door", "room", "doorway",
 ...). This rescue does NOT recover the original landmark — it picks a
 **different** referrable landmark visible at the sub-path's end pose,
 producing a synthesized sub-instruction. Records flow through the rest
-of the pipeline marked ``landmark_source = "synthesized"`` so downstream
-consumers can choose to use or skip them.
+of the pipeline marked ``synthesized = True`` so downstream consumers
+can choose to use or skip them.
 
 A good replacement landmark must:
 
