@@ -333,7 +333,7 @@ bash scripts/10_apply_rescue.sh --exp "$SEL"
 读 `survivor.yaml` + 之前各 stage 写的 artifact，把每条存活的 sub-trajectory 拼成一条记录：text（完整 instruction + sub-split + landmark / spatial 分解）、几何（`sub_path_nodes` / `spatial_path` / `landmark_path` / 起始 heading / partition kind）、选中的 target instance + landmark 在 partition 点是否可见、rescue 相关注释、可视化文件路径。纯聚合——不调 LLM / 仿真器 / detector。
 
 ```bash
-bash scripts/11_consolidate.sh --exp "$SEL"
+bash scripts/12_consolidate.sh --exp "$SEL"
 ```
 
 输出：
@@ -345,8 +345,8 @@ bash scripts/11_consolidate.sh --exp "$SEL"
 跟 09 的 rescue 平行，但目标是 **blacklist 剔（03）** 掉的 sub-path —— 那些原 landmark 太泛（"wall"/"door"/"room"/"doorway"）。这里不是重新 ground 原 landmark，而是**直接换一个**。
 
 ```bash
-bash scripts/13_rescue_blacklist.sh --exp "$SEL"
-bash scripts/11_consolidate.sh --exp "$SEL"   # 救完重跑 consolidate
+bash scripts/11_rescue_blacklist.sh --exp "$SEL"
+bash scripts/12_consolidate.sh --exp "$SEL"   # 救完重跑 consolidate
 ```
 
 #### 选择逻辑（[src/check/rescue_blacklist.py:168-228](src/check/rescue_blacklist.py#L168-L228)）

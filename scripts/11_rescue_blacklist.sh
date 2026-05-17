@@ -7,11 +7,11 @@
 # sub-instruction.
 #
 # Output: target_instances/<scan>/blacklist_rescue.json — consumed by
-# 11_consolidate (which emits these as records with
+# 12_consolidate (which emits these as records with
 # synthesized=true alongside the original ones).
 #
 # Usage:
-#   bash scripts/13_rescue_blacklist.sh --exp configs/selection/<split>/<exp>.yaml
+#   bash scripts/11_rescue_blacklist.sh --exp configs/selection/<split>/<exp>.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

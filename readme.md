@@ -132,13 +132,13 @@ VLM pixel-grounded rescue (step 4, script 09)
 apply rescue back into target_instances.json (step 4, script 10)
         │
         ▼
-blacklist rescue: find replacement landmarks (step 5, script 13)
+blacklist rescue: find replacement landmarks (step 5, script 11)
         │
         ▼
-consolidate (originals + synthesized) → dataset.json (step 5, script 11)
+consolidate (originals + synthesized) → dataset.json (step 5, script 12)
         │
         ▼
-attrition report (step 5, script 12 — runnable anytime)
+attrition report (step 5, script 13 — runnable anytime)
 ```
 
 #### 2.0 Snapshot (drops nothing)
@@ -473,7 +473,7 @@ visible from the partition point, any rescue annotations, and pointers
 to viz files. Pure aggregation — no LLM / simulator / detector calls.
 
 ```bash
-bash scripts/11_consolidate.sh --exp "$SEL"
+bash scripts/12_consolidate.sh --exp "$SEL"
 ```
 
 Writes:
@@ -494,8 +494,8 @@ landmark, this step picks a **different** referrable instance visible
 at the sub-path end pose and synthesizes a new sub-instruction.
 
 ```bash
-bash scripts/13_rescue_blacklist.sh --exp "$SEL"
-bash scripts/11_consolidate.sh --exp "$SEL"   # re-run after rescue
+bash scripts/11_rescue_blacklist.sh --exp "$SEL"
+bash scripts/12_consolidate.sh --exp "$SEL"   # re-run after rescue
 ```
 
 #### Selection logic ([src/check/rescue_blacklist.py:168-228](src/check/rescue_blacklist.py#L168-L228))

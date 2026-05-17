@@ -13,7 +13,7 @@
 # any rescue annotations, and pointers to viz files.
 #
 # Usage:
-#   bash scripts/11_consolidate.sh --exp configs/selection/<split>/<exp>.yaml
+#   bash scripts/12_consolidate.sh --exp configs/selection/<split>/<exp>.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

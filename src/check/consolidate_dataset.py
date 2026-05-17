@@ -125,7 +125,7 @@ def _build_record(
     branching.
 
     When ``rescue_rec`` is provided the record is built from a
-    13_rescue_blacklist entry (synthesized replacement landmark);
+    11_rescue_blacklist entry (synthesized replacement landmark);
     otherwise it is built from the rewrite + target_instances side-cars
     (original landmark).
     """

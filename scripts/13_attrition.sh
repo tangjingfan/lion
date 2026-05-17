@@ -6,7 +6,7 @@
 # stage, with drop reasons. No simulator / LLM / detector calls.
 #
 # Usage:
-#   bash scripts/12_attrition.sh --exp configs/selection/<split>/<exp>.yaml
+#   bash scripts/13_attrition.sh --exp configs/selection/<split>/<exp>.yaml
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
