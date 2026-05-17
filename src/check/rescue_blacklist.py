@@ -47,6 +47,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import get_filter_dir, get_run_dir, resolve_exp
+from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import _mp3d_to_habitat, load_connectivity
 from src.process.visibility import VisibilityChecker
@@ -353,6 +354,51 @@ def main() -> None:
                 new_landmark  = pick["category"]
                 new_sub_instr = _synth_sub_instruction(spatial_instr, new_landmark)
 
+                # Render two viz frames for the new landmark:
+                #   - partition pose: matches what 07/08 do for `original`
+                #     records; the mask may be EMPTY for synthesized
+                #     records because the chosen instance is selected for
+                #     end-pose visibility, not partition-pose visibility.
+                #   - end pose: by construction the chosen instance IS
+                #     visible here, so the mask is always populated.
+                viz_dir = (
+                    run_dir / "target_instances" / "viz_blacklist_rescue"
+                    / scan / str(ep_id)
+                )
+                viz_paths: Dict[str, Optional[str]] = {
+                    "partition_viz_path": None,
+                    "end_viz_path":       None,
+                }
+                for pose_key, pos, suffix, action in (
+                    ("partition_viz_path", partition_pos, "partition", "BLACKLIST_RESCUE_P"),
+                    ("end_viz_path",       end_pos,       "end",       "BLACKLIST_RESCUE_E"),
+                ):
+                    try:
+                        rv = _render_mask_for_rollout_frame(
+                            checker=checker,
+                            scan=scan,
+                            instance_id=int(pick["instance_id"]),
+                            frame_record={
+                                "position":       [float(x) for x in pos],
+                                "heading":        0.0,
+                                "instruction_id": ep_id,
+                                "instruction":    new_sub_instr,
+                                "landmark":       new_landmark,
+                                "sub_idx":        sub_idx,
+                                "sub_total":      len(ep.sub_paths),
+                                "step":           0,
+                                "action":         action,
+                            },
+                            out_path=viz_dir / f"sub_{sub_idx:03d}_{suffix}.png",
+                            info_width=300,
+                        )
+                        viz_paths[pose_key] = rv["path"]
+                    except Exception as exc:
+                        print(
+                            f"  WARN [{scan} ep={ep_id} sub={sub_idx}] {suffix} "
+                            f"viz render failed: {exc}"
+                        )
+
                 scan_rescues.setdefault(str(ep_id), {})[str(sub_idx)] = {
                     "original_landmark":    drop_rec.get("landmark"),
                     "original_reason":      drop_rec.get("reason"),
@@ -370,6 +416,8 @@ def main() -> None:
                     "unique_in_scene":      pick["unique_in_scene"],
                     "fov_instance_count":   pick["fov_instance_count"],
                     "scene_instance_count": pick["scene_instance_count"],
+                    "partition_viz_path":   viz_paths["partition_viz_path"],
+                    "end_viz_path":         viz_paths["end_viz_path"],
                 }
                 rescued_count += 1
 
