@@ -491,28 +491,72 @@ A sibling rescue for sub-paths the **blacklist** filter (`03`) cut —
 those where the instruction-derived landmark was too generic ("wall",
 "door", "room", "doorway", ...). Instead of re-grounding the original
 landmark, this step picks a **different** referrable instance visible
-at the sub-path end pose and synthesizes a new sub-instruction. A
-candidate must:
-
-  1. be visible at the end pose with ≥ 200 pixels,
-  2. be **progressively approached** (≥ 0.5 m closer at end than at
-     the partition point),
-  3. have a concrete MPCAT40 category (not in `wall` / `door` /
-     `window` / `floor` / `ceiling` / etc.),
-  4. preferably be the only visible instance of its category at that
-     vantage (unambiguous "the X").
+at the sub-path end pose and synthesizes a new sub-instruction.
 
 ```bash
 bash scripts/13_rescue_blacklist.sh --exp "$SEL"
 bash scripts/11_consolidate.sh --exp "$SEL"   # re-run after rescue
 ```
 
-Writes:
+#### Selection logic ([src/check/rescue_blacklist.py:168-228](src/check/rescue_blacklist.py#L168-L228))
+
+For each dropped sub-path, render a 360° semantic panorama at the
+**end pose** (last node of `landmark_path`) and feed the per-instance
+pixel counts into `_pick_replacement_landmark`. The function returns
+either a chosen instance or `None`.
+
+**Hard filters (each candidate must pass all four):**
+
+1. **Pixel threshold** — visible at the end pose with at least
+   `MIN_VISIBLE_PIXELS = 200` pixels in the 360° pano (rejects
+   instances that are too far / too occluded to be a usable target).
+2. **Category in scene metadata** — the `instance_id` must resolve to
+   a category via the cached `.house` parse (safety check; rare
+   semantic-sensor / .house mismatches are skipped).
+3. **Category not blacklisted** — not in `{wall, floor, ceiling, door,
+   window, doorway, railing, blinds, curtain, misc, void}`.
+4. **Progressively approached** — `dist(partition, center) -
+   dist(end, center) ≥ APPROACH_THRESHOLD_M = 0.5 m`. Confirms the
+   agent was actually moving towards this instance along the landmark
+   half. Only the two endpoints of the sub-path are sampled — a
+   zigzag trajectory could in principle slip through, but sub-paths
+   are short enough in practice.
+
+Each survivor records `{instance_id, category, pixel_count,
+dist_partition_m, dist_end_m, approach_m}`. A side counter
+`cat_visible_count` tallies survivors per category — used by Tier 1
+below.
+
+**Tiered selection (each tier narrows the pool; falls back when empty):**
+
+| Tier | Rule | Why |
+|---|---|---|
+| **1. View-uniqueness** | Keep only candidates whose category has exactly one survivor in the FOV (`cat_visible_count[cat] == 1`). | "Walk to **the** bed" is unambiguous only if one bed is visible at this vantage. |
+| **2. Concrete category** | Drop candidates whose category is in `COARSE_BUCKETS = {appliances, objects, furniture, lighting}`. | Coarse buckets aren't good landmark words on their own — "walk to the lighting" reads weird. Prefer a finer category. |
+| **3. Closest + most prominent** | Sort ascending by `(dist_end_m, -pixel_count)`. | The target should be near where the agent stops; pixel count breaks ties. We sort by distance-to-end (not by approach magnitude) because the destination, not the biggest mover, defines the landmark. |
+
+The `or pool` fallback (`pool = unique_view or candidates`, `pool =
+fine or pool`) means each tier is **best-effort, not mandatory** —
+if no candidate satisfies the tighter rule, we use the previous tier's
+pool. This avoids returning `None` just because nothing happens to be
+unique in the FOV.
+
+The final `chosen` dict gets four extra fields written in:
+
+- `scene_instance_count` — total instances of this category in the whole scan
+- `fov_instance_count`   — survivor count of this category at this vantage
+- `unique_in_fov`        — `fov_instance_count == 1`
+- `unique_in_scene`      — `scene_instance_count == 1`
+
+Both `unique_in_*` flags flow through to `dataset.json`'s
+`synthesized_from` block so downstream filtering can use them.
+
+#### Outputs
 
 - `target_instances/{scan}/blacklist_rescue.json` — side-car per scan
-  with the replacement landmark, the new sub-instruction (currently a
-  simple template `"<spatial>. Walk to a <landmark>."`), the new
-  target instance id, and approach / uniqueness stats.
+  with the replacement landmark, the synthesized sub-instruction
+  (currently a simple template `"<spatial>. Walk to a <landmark>."`),
+  the new target instance id, and approach / uniqueness stats.
 
 The consolidate step then emits these as additional records in
 `dataset.json` with `landmark_source = "synthesized"` and a

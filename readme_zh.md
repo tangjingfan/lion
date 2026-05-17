@@ -342,19 +342,46 @@ bash scripts/11_consolidate.sh --exp "$SEL"
 
 ### Blacklist 拯救（合成新 landmark）
 
-跟 09 的 rescue 平行，但目标是 **blacklist 剔（03）** 掉的 sub-path —— 那些原 landmark 太泛（"wall"/"door"/"room"/"doorway"）。这里不是重新 ground 原 landmark，而是**直接换一个**。候选要求：
-
-  1. sub-path 终点视野里可见（≥ 200 像素）
-  2. **逐渐靠近**（终点距离 比 partition 点近至少 0.5 m）
-  3. MPCAT40 类别 concrete（不在 `wall`/`door`/`window`/`floor`/`ceiling`/... 黑名单里）
-  4. 优先取该视角下**唯一可见的**那一类（"the X" 无歧义）
+跟 09 的 rescue 平行，但目标是 **blacklist 剔（03）** 掉的 sub-path —— 那些原 landmark 太泛（"wall"/"door"/"room"/"doorway"）。这里不是重新 ground 原 landmark，而是**直接换一个**。
 
 ```bash
 bash scripts/13_rescue_blacklist.sh --exp "$SEL"
 bash scripts/11_consolidate.sh --exp "$SEL"   # 救完重跑 consolidate
 ```
 
-输出：
+#### 选择逻辑（[src/check/rescue_blacklist.py:168-228](src/check/rescue_blacklist.py#L168-L228)）
+
+对每条 dropped sub-path，在 **end pose**（`landmark_path` 最后一个节点）渲染 360° 语义全景，把每个 instance 的可见像素数喂给 `_pick_replacement_landmark`，要么返回一个被选中的 instance，要么返回 `None`。
+
+**硬过滤（4 个条件全部必须满足）：**
+
+1. **像素阈值** —— 终点全景里至少 `MIN_VISIBLE_PIXELS = 200` 像素（太小的 instance 太远 / 被遮挡，作为 target 不可靠）。
+2. **能查到元数据** —— `instance_id` 必须在 `.house` 解析出来的 `inst_meta` 里（安全检查，极少数 semantic sensor / .house 对不上的情况会跳过）。
+3. **类别非黑名单** —— 不在 `{wall, floor, ceiling, door, window, doorway, railing, blinds, curtain, misc, void}`。
+4. **逐渐靠近** —— `dist(partition, center) - dist(end, center) ≥ APPROACH_THRESHOLD_M = 0.5 m`。确认 agent 沿 landmark 半段确实是在朝它走。注意只采样 sub-path 起止两点 —— zigzag 路径理论上能蒙混过关，但 sub-path 一般够短，影响不大。
+
+每个通过硬过滤的 instance 存 `{instance_id, category, pixel_count, dist_partition_m, dist_end_m, approach_m}`。同时累加 `cat_visible_count`（每个类别**过滤后**的实例数），Tier 1 会用。
+
+**分层选择（每层缩小池子，空了就回退到上层）：**
+
+| Tier | 规则 | 为什么 |
+|---|---|---|
+| **1. 视野唯一** | 只留视野里该类别**只有 1 个 survivor** 的候选（`cat_visible_count[cat] == 1`）。 | "Walk to **the** bed" 要无歧义，只能在视野里 bed 只有一张时才能这么说。 |
+| **2. 非 coarse 桶** | 把 `COARSE_BUCKETS = {appliances, objects, furniture, lighting}` 里的过滤掉。 | coarse 类别作为 landmark 词很怪 —— "walk to the lighting" 不像话，优先 fine 类别。 |
+| **3. 最近 + 像素最大** | 按 `(dist_end_m, -pixel_count)` 升序排序。 | target 应该靠近 agent 停的地方；像素数破平手。**用 dist_end 而不是 approach magnitude**：终点是目的地的标志，不是走得最远的那个。 |
+
+`pool = unique_view or candidates` / `pool = fine or pool` 这种 `or` 模式意味着每层 tier 是**尽量做但不强求** —— 没候选满足更严的条件时，就回退到上一层池子。避免单纯因为视野里没 unique instance 就返回 `None`。
+
+最终 `chosen` dict 再附加 4 个元字段：
+
+- `scene_instance_count` —— 全 scan 该类别 instance 数
+- `fov_instance_count`   —— 此视角下该类别过滤后 instance 数
+- `unique_in_fov`        —— `fov_instance_count == 1`
+- `unique_in_scene`      —— `scene_instance_count == 1`
+
+两个 `unique_in_*` flag 最终都会进 `dataset.json` 的 `synthesized_from` 块，下游可以基于这些 flag 再做过滤。
+
+#### 输出
 
 - `target_instances/{scan}/blacklist_rescue.json` —— 每 scan 一份，记录新 landmark、合成的 sub-instruction（目前用简单模板 `"<spatial>. Walk to a <landmark>."`）、新 target instance id，外加 approach / uniqueness 统计。
 
