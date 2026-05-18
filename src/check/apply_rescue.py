@@ -1,6 +1,6 @@
-"""Apply VLM pixel-grounded rescue back into ``target_instances.json``.
+"""Apply detection-rescue back into ``target_instances.json``.
 
-The rescue step (``09_vlm_rescue``) writes
+The detection step (``09_detection``) writes
 ``target_instances/<scan>/semantic_rescue_categories.json`` listing every
 ``(episode_id, sub_idx)`` for which YOLO-World (or the VLM fallback) found
 a fine-grained instance for a coarse-bucket target. By default that file
@@ -94,33 +94,55 @@ def _apply_to_target_instances(
     """
     with open(ti_path) as f:
         data = json.load(f)
-    targets = data.get("target_instances") or {}
+    # New layout: one section called ``annotations`` per (ep, sub).
+    # Legacy layout used a separate ``target_instances`` section — we
+    # still merge into both when present so old data is left consistent
+    # for any straggling reader.
+    sections = [
+        data.get("annotations") or {},
+        data.get("target_instances") or {},
+    ]
     n_filled = 0
     n_confirmed = 0
-    for ep_id, subs in targets.items():
-        for sub_idx, rec in subs.items():
-            hit = rescue_index.get((str(ep_id), str(sub_idx)))
-            if not hit:
-                continue
-            # Wipe stale rescue annotations from prior runs first.
-            for k in ("rescue_landmark", "rescue_category",
-                      "rescue_grounding_method", "rescue_semantic_category",
-                      "rescue_instance_id"):
-                rec.pop(k, None)
-            rec["rescue_landmark"]          = hit["landmark"]
-            rec["rescue_category"]          = hit["category"]
-            rec["rescue_grounding_method"]  = hit["grounding_method"]
-            rec["rescue_semantic_category"] = hit["semantic_category"]
-            rec["rescue_instance_id"]       = hit["instance_id"]
-            current_ids = rec.get("target_instance_ids") or []
-            if not current_ids:
-                rec["target_instance_ids"] = [hit["instance_id"]]
-                rec["status"] = "rescued"
-                rec["selection_distance"] = None
-                rec["candidate_distances"] = None
-                n_filled += 1
-            else:
-                n_confirmed += 1
+    seen_keys: set = set()
+    for targets in sections:
+        for ep_id, subs in targets.items():
+            for sub_idx, rec in subs.items():
+                hit = rescue_index.get((str(ep_id), str(sub_idx)))
+                if not hit:
+                    continue
+                # Wipe stale rescue annotations from prior runs first.
+                for k in ("rescue_landmark", "rescue_category",
+                          "rescue_grounding_method", "rescue_semantic_category",
+                          "rescue_instance_id"):
+                    rec.pop(k, None)
+                rec["rescue_landmark"]          = hit["landmark"]
+                rec["rescue_category"]          = hit["category"]
+                rec["rescue_grounding_method"]  = hit["grounding_method"]
+                rec["rescue_semantic_category"] = hit["semantic_category"]
+                rec["rescue_instance_id"]       = hit["instance_id"]
+                current_ids = rec.get("target_instance_ids") or []
+                key = (str(ep_id), str(sub_idx))
+                if not current_ids:
+                    rec["target_instance_ids"] = [hit["instance_id"]]
+                    rec["instance_id"]        = int(hit["instance_id"])
+                    rec["status"]             = "rescued"
+                    rec["rescued"]            = True
+                    # Update visibility/uniqueness to reflect the
+                    # post-rescue state — same split schema as a normal
+                    # step 07/08 record. By construction YOLO landed on
+                    # a single MP3D instance, so uniqueness=True.
+                    rec["visibility"]         = "visible"
+                    rec["uniqueness"]         = True
+                    rec["visibility_status"]  = "visible"
+                    rec["selection_distance"] = None
+                    rec["candidate_distances"] = None
+                    if key not in seen_keys:
+                        n_filled += 1
+                else:
+                    if key not in seen_keys:
+                        n_confirmed += 1
+                seen_keys.add(key)
     with open(ti_path, "w") as f:
         json.dump(data, f, indent=2)
     return n_filled, n_confirmed

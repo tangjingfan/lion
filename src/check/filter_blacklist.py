@@ -39,6 +39,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    active_subs,
     ensure_episode,
     ensure_sub_path,
     get_filter_dir,
@@ -51,6 +52,7 @@ from src.check._filter_utils import (
     save_audit,
     write_drop_yaml,
     write_survivor,
+    _sub_status_map,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -216,24 +218,46 @@ def main() -> None:
         )
 
     # resolve_exp(apply_current=True) already merged survivor.yaml into
-    # cfg.selection. Pull prior sub_paths from there — if the prior stage was
-    # episode-level (e.g. 01_filter_multi_floor, no sub_paths key), every
-    # sub-path is allowed.
-    prior_subs = cfg.get("selection", {}).get("sub_paths")
+    # cfg.selection. We process the *active* set (un-labeled subs that
+    # still need a verdict), but write the *full* set back so labels
+    # accumulate across stages.
+    #
+    # Idempotence: a re-run of this stage strips any labels this stage
+    # previously wrote (matching ``blacklist:*``) and re-classifies from
+    # scratch. Upstream labels (cross_floor, etc. — none today) are
+    # preserved.
+    prior_subs   = cfg.get("selection", {}).get("sub_paths")
+    raw_prior_status = _sub_status_map(cfg)
+    upstream_status: Dict[int, Dict[int, str]] = {}
+    for ep_id, labels in raw_prior_status.items():
+        keep = {s: lbl for s, lbl in labels.items()
+                if not (lbl or "").startswith(f"{STAGE_NAME}:")}
+        if keep:
+            upstream_status[ep_id] = keep
+
     episodes = episodes_from_config(cfg)
     if not episodes:
         raise SystemExit("No episodes loaded from survivor.yaml.")
-    allowed_subs: Dict[int, List[int]] = {}
+    full_subs: Dict[int, List[int]] = {}     # everything alive past cross_floor
     if prior_subs:
-        allowed_subs = {
+        full_subs = {
             int(ep_id): [int(s) for s in subs]
             for ep_id, subs in prior_subs.items()
         }
     else:
-        allowed_subs = {
+        full_subs = {
             int(ep.instruction_id): list(range(len(ep.sub_paths)))
             for ep in episodes
         }
+    # Active = sub_paths minus labels-from-upstream-stages. We strip our
+    # own previous labels, so on a re-run we'll see every sub we should
+    # classify (not just the leftovers from a partial earlier pass).
+    allowed_subs: Dict[int, List[int]] = {}
+    for ep_id, subs in full_subs.items():
+        upstream_labeled = upstream_status.get(ep_id, {})
+        kept = [int(s) for s in subs if int(s) not in upstream_labeled]
+        if kept:
+            allowed_subs[ep_id] = kept
     episode_by_id = {int(ep.instruction_id): ep for ep in episodes}
 
     # Locate rewriter output (per-episode).  Pick the ``_filtered`` variant
@@ -253,13 +277,18 @@ def main() -> None:
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME, blacklist=list(blacklist))
 
+    # Carry forward upstream labels (our own stripped-and-rebuilt).
+    new_sub_status: Dict[int, Dict[int, str]] = {
+        ep_id: dict(labels) for ep_id, labels in upstream_status.items()
+    }
     keep_sub_paths: Dict[int, List[int]] = {}
     dropped:        Dict[str, Dict]      = {}
     n_subs_total = 0
-    n_subs_keep  = 0
+    n_subs_active = 0
+    n_subs_labeled = 0
     reason_counts: Dict[str, int] = {}
 
-    for ep_id_raw, sub_idxs in allowed_subs.items():
+    for ep_id_raw, sub_idxs in full_subs.items():
         # YAML loads bare int keys as int; rewrite JSON keys are strings.
         ep_id      = int(ep_id_raw)
         ep_id_str  = str(ep_id)
@@ -275,11 +304,18 @@ def main() -> None:
             if rewrite_ep else {}
         )
 
-        ep_keep_subs: List[int]      = []
-        ep_drops:     Dict[int, Dict] = {}
+        # Every sub past cross_floor stays in keep_sub_paths.
+        keep_sub_paths[ep_id] = sorted(int(s) for s in sub_idxs)
+
+        ep_active_subs = set(allowed_subs.get(ep_id, []))
+        ep_drops: Dict[int, Dict] = {}
+        ep_n_labeled = 0
 
         for sub_idx in sub_idxs:
             n_subs_total += 1
+            # Skip subs already labeled by an upstream stage (today: none).
+            if int(sub_idx) not in ep_active_subs:
+                continue
             rw = rewrite_subs.get(int(sub_idx))
             if rw is None:
                 payload = {"reason": "missing_in_rewrite"}
@@ -298,20 +334,23 @@ def main() -> None:
                 **payload,
             }
             if keep_it:
-                ep_keep_subs.append(sub_idx)
-                n_subs_keep += 1
+                n_subs_active += 1
             else:
                 ep_drops[sub_idx] = payload
+                n_subs_labeled += 1
+                ep_n_labeled += 1
+                new_sub_status.setdefault(ep_id, {})[int(sub_idx)] = (
+                    f"{STAGE_NAME}:{payload['reason']}"
+                )
                 reason_counts[payload["reason"]] = \
                     reason_counts.get(payload["reason"], 0) + 1
 
+        n_remaining_active = len(ep_active_subs) - ep_n_labeled
         ep_audit["stages"][STAGE_NAME] = {
-            "status":    "ok" if ep_keep_subs else "drop",
-            "kept_sub":  len(ep_keep_subs),
-            "total_sub": len(sub_idxs),
+            "status":    "ok" if n_remaining_active > 0 else "drop",
+            "kept_sub":  n_remaining_active,
+            "total_sub": len(ep_active_subs),
         }
-        if ep_keep_subs:
-            keep_sub_paths[ep_id] = ep_keep_subs
         if ep_drops:
             dropped[ep_id_str] = {
                 "subs": {str(k): v for k, v in sorted(ep_drops.items())},
@@ -321,6 +360,7 @@ def main() -> None:
         cfg, split,
         instruction_ids=sorted(keep_sub_paths.keys()),
         sub_paths=keep_sub_paths,
+        sub_status=new_sub_status,
     )
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
@@ -331,16 +371,16 @@ def main() -> None:
 
     n_eps_in   = len(allowed_subs)
     n_eps_keep = len(keep_sub_paths)
-    pct_subs   = (n_subs_keep / n_subs_total) if n_subs_total else 0.0
+    pct_active = (n_subs_active / n_subs_total) if n_subs_total else 0.0
 
     print(f"=== Stage {STAGE_NUM} — {STAGE_NAME} ===")
-    print(f"  episodes in   : {n_eps_in}")
-    print(f"  episodes keep : {n_eps_keep}")
-    print(f"  sub-paths in  : {n_subs_total}")
-    print(f"  sub-paths keep: {n_subs_keep}  ({pct_subs:.1%})")
-    print(f"  sub-paths drop: {n_subs_total - n_subs_keep}")
+    print(f"  episodes in    : {n_eps_in}")
+    print(f"  episodes keep  : {n_eps_keep}  (every ep past cross_floor stays — labels only)")
+    print(f"  sub-paths in   : {n_subs_total}")
+    print(f"  sub-paths active (un-labeled at this stage): {n_subs_active}  ({pct_active:.1%})")
+    print(f"  sub-paths labeled this stage              : {n_subs_labeled}")
     if reason_counts:
-        print(f"  drop reasons:")
+        print(f"  label reasons:")
         for reason, n in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
             print(f"    {reason:<25s} {n}")
 

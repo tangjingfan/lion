@@ -276,16 +276,16 @@ bash scripts/08_get_potential_instance.sh --exp "$SEL" --no_save_viz
 
 ```bash
 # Dry run：先看会送哪些 coarse sub-path 进 detector
-bash scripts/09_vlm_rescue.sh \
+bash scripts/09_detection.sh \
     --exp "$SEL" \
     --dry_run
 
 # 实际跑（首次会自动下载 ~340MB YOLO-World 权重 + CLIP）：
-bash scripts/09_vlm_rescue.sh \
+bash scripts/09_detection.sh \
     --exp "$SEL"
 
 # 可选 VLM 兜底（YOLO 没检出时才调 Gemini）：
-GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
+GEMINI_API_KEY=... bash scripts/09_detection.sh \
     --exp "$SEL" \
     --enable_vlm_fallback
 ```

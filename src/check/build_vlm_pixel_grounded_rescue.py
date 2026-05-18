@@ -106,27 +106,18 @@ Rules:
 # MP3D fine category names sometimes differ from how a VLM phrases the same
 # object. Keep this list short and only include high-confidence pairs — wrong
 # synonyms will silently misroute the rescue.
-_CATEGORY_SYNONYMS: Dict[str, set] = {
-    "stove": {"oven", "cooktop", "range", "stovetop", "stove top"},
-    "oven": {"stove", "range", "cooktop"},
-    "refrigerator": {"fridge"},
-    "fridge": {"refrigerator"},
-    "couch": {"sofa"},
-    "sofa": {"couch"},
-    "rug": {"carpet", "mat"},
-    "carpet": {"rug"},
-    "lamp": {"light", "lighting", "light fixture", "sconce"},
-    "tv": {"television", "monitor", "screen"},
-    "television": {"tv", "monitor"},
-    "trash can": {"bin", "garbage can", "wastebin", "wastebasket"},
-    "blanket": {"sheet", "comforter", "throw"},
-    "towel rack": {"towel"},
-    "sink": {"basin"},
-    "toilet": {"commode"},
-    "microwave": {"microwave oven"},
-    "dishwasher": {"dish washer"},
-    "curtain": {"drape", "drapes", "curtains"},
-}
+# Hand-curated landmark→synonym table removed. Both consumers used to
+# call into it:
+#   - _build_yolo_prompts: extra class strings for YOLO-World
+#   - _category_match_score: 0.9 score bump when VLM cat == synonym of MP3D cat
+# YOLO-World's class prompts are encoded with CLIP, so "fridge" and
+# "refrigerator" already sit close in the joint text/vision embedding
+# space — passing both as separate prompts is redundant. Pixel-match
+# scoring leans on exact match (1.0), MPCat40 coarse-bucket containment
+# (0.85, the workhorse) and token overlap (0.5-0.75); landmark↔fine
+# synonym pairs are rare in MPCat40 anyway (the vocabulary tops out at
+# coarse buckets like "appliances"), so the synonym branch was firing
+# almost never.
 
 
 # Habitat's MP3D semantic sensor returns MPCat40 category names, which group
@@ -192,8 +183,6 @@ def _category_match_score(vlm_cat: str, sem_name: str) -> float:
         return 0.85
     if b in _COARSE_TO_FINE.get(a, set()):
         return 0.85
-    if b in _CATEGORY_SYNONYMS.get(a, set()) or a in _CATEGORY_SYNONYMS.get(b, set()):
-        return 0.9
     # Whole-word containment (e.g. "kitchen stove" vs "stove").
     a_toks = a.split()
     b_toks = b.split()
@@ -205,21 +194,17 @@ def _category_match_score(vlm_cat: str, sem_name: str) -> float:
 
 
 def _build_yolo_prompts(landmark: str) -> List[str]:
-    """Landmark phrase + high-confidence synonyms for open-vocab detection.
+    """Return the single open-vocab YOLO-World prompt for this landmark.
 
-    YOLO-World takes a list of class strings; we keep the landmark itself
-    first so the highest-confidence match for our exact phrase still ranks
-    where it would have. Synonyms boost recall when the VLM-style canonical
-    name (``refrigerator``) differs from the dataset phrasing (``fridge``).
+    YOLO-World encodes class strings with CLIP, so semantically close
+    phrases ("fridge" / "refrigerator", "couch" / "sofa") already sit
+    near each other in the joint text/vision embedding space — passing
+    a hand-curated synonym list as extra classes was redundant noise.
+    Kept as a function (returning a list) so callers don't need to
+    branch; future expansion can plug in here.
     """
     base = (landmark or "").strip().lower()
-    if not base:
-        return []
-    prompts = [base]
-    for syn in sorted(_CATEGORY_SYNONYMS.get(base, set())):
-        if syn and syn not in prompts:
-            prompts.append(syn)
-    return prompts
+    return [base] if base else []
 
 
 class YoloWorldDetector:
@@ -404,16 +389,18 @@ def _load_target_db(run_dir: Path) -> Dict[str, Dict]:
 
 
 def _target_record(target_db: Dict[str, Dict], scan: str, ep_id: str, sub_idx: str) -> Dict:
+    """Read the per-(ep, sub) record. ``annotations`` is the primary
+    section (after the step 07/08/10 merge); the legacy
+    ``target_instances`` section is checked as a fallback for older runs."""
     data = target_db.get(scan) or {}
-    for section in ("target_instances", "annotations"):
+    for section in ("annotations", "target_instances"):
         ep_entry = (data.get(section) or {}).get(str(ep_id)) or {}
         if not isinstance(ep_entry, dict):
             continue
         rec = ep_entry.get(str(sub_idx)) or {}
         if isinstance(rec, dict) and rec:
-            if section == "annotations":
-                rec = dict(rec)
-                rec.setdefault("target_instance_ids", [])
+            rec = dict(rec)
+            rec.setdefault("target_instance_ids", [])
             return rec
     return {}
 
@@ -445,18 +432,31 @@ def _collect_from_survivors(
                 rec = _target_record(target_db, scan, str(ep_id), str(sub_idx))
                 if not rec:
                     continue
+                landmark = (rec.get("landmark") or "").strip()
+                if not landmark:
+                    continue
                 labels = _label_candidates(rec)
-                is_bad, coarse_label = _is_only_coarse_label(
-                    rec.get("landmark") or "", labels, coarse
+                is_coarse_only, coarse_label = _is_only_coarse_label(
+                    landmark, labels, coarse
                 )
-                if not is_bad:
+                # Three cases reach YOLO:
+                #   - no_match: refined mapping returned [], scene has no
+                #     fine-category label for this landmark. YOLO may still
+                #     find the object visually and land on a coarse-bucket
+                #     MP3D instance (e.g. fridge → instance labeled
+                #     "appliances").
+                #   - coarse-only: every match is a coarse bucket
+                #     (appliances / furniture / objects / lighting) and the
+                #     landmark is fine. YOLO disambiguates the bucket.
+                #   - else (has a real fine match already): skip.
+                if labels and not is_coarse_only:
                     continue
                 records.append({
                     "scan": str(scan),
                     "episode_id": str(ep_id),
                     "sub_idx": str(sub_idx),
-                    "landmark": rec.get("landmark") or "",
-                    "coarse_label": coarse_label,
+                    "landmark": landmark,
+                    "coarse_label": coarse_label or None,
                     "semantic_labels": labels,
                     "previous_target_instance_ids": rec.get("target_instance_ids") or [],
                 })
@@ -487,13 +487,14 @@ def _collect_from_dropped(dropped_yaml: Path) -> List[Dict]:
 
 
 def _build_user_text(rec: Dict, width: int, height: int) -> str:
+    coarse = rec.get("coarse_label") or "(none — landmark has no scene category match)"
     return (
         f"IMAGE_SIZE: width={width}, height={height}\n"
         f"SCAN: {rec['scan']}\n"
         f"EPISODE_ID: {rec['episode_id']}\n"
         f"SUB_IDX: {rec['sub_idx']}\n"
         f"LANDMARK: {rec['landmark']}\n"
-        f"COARSE_SEMANTIC_LABEL: {rec.get('coarse_label')}\n"
+        f"COARSE_SEMANTIC_LABEL: {coarse}\n"
         f"PREVIOUS_TARGET_INSTANCE_IDS: "
         f"{json.dumps(rec.get('previous_target_instance_ids', []), ensure_ascii=False)}\n\n"
         "Find the landmark in this panorama and return one pixel coordinate "
@@ -553,13 +554,18 @@ def _instance_at_pixel(
     radius: int,
     checker: VisibilityChecker,
     preferred_categories: Optional[List[str]] = None,
-    search_radius: int = 140,
+    search_radius: int = 140,   # kept for back-compat; no longer used
     bbox: Optional[List[int]] = None,
 ) -> Dict:
-    h, w = sem.shape[:2]
-    if x < 0 or y < 0 or x >= w or y >= h:
-        return {"instance_id": None, "semantic_category": None, "sample_counts": {}}
+    """Return the dominant MP3D instance inside the YOLO bbox.
 
+    Simplified policy: trust the detection. Take the bbox-majority
+    instance id and let the caller override its category to the
+    landmark name. No category-match verification, no fallback tiers
+    — if YOLO drew the wrong bbox, the override is wrong, and that's
+    a problem for the detection layer, not for instance lookup.
+    """
+    h, w = sem.shape[:2]
     sem_name_map = getattr(checker, "_sem_name_map", None)
 
     def category_for(instance_id: int) -> Optional[str]:
@@ -567,138 +573,36 @@ def _instance_at_pixel(
             return str(sem_name_map[instance_id] or "") or None
         return None
 
-    target_cats = [c for c in (preferred_categories or []) if c and c != "unknown"]
-
     has_bbox = bool(bbox) and len(bbox) == 4 and int(bbox[0]) >= 0
     if has_bbox:
         bx1, by1, bx2, by2 = [int(v) for v in bbox]
     else:
+        # Legacy point-only call site: build a small box around (x, y)
+        # so the rest of the function still works.
         bx1, by1, bx2, by2 = x - 30, y - 30, x + 30, y + 30
-    bw = max(1, bx2 - bx1)
-    bh = max(1, by2 - by1)
+    bx1 = max(0, bx1)
+    by1 = max(0, by1)
+    bx2 = min(w, bx2 + 1)
+    by2 = min(h, by2 + 1)
 
-    def region_for(margin_x: int, margin_y: int) -> Tuple[np.ndarray, Tuple[int, int, int, int], Counter]:
-        rx0 = max(0, bx1 - margin_x)
-        rx1 = min(w, bx2 + margin_x + 1)
-        ry0 = max(0, by1 - margin_y)
-        ry1 = min(h, by2 + margin_y + 1)
-        crop = sem[ry0:ry1, rx0:rx1]
-        cnt: Counter = Counter()
-        if crop.size:
-            vals = crop.reshape(-1)
-            vals = vals[vals >= 0]
-            if vals.size:
-                cnt = Counter(int(v) for v in vals.tolist())
-        return crop, (rx0, ry0, rx1, ry1), cnt
-
-    # Two search shells: tight (bbox+8) and wide (bbox * ~3 or +search_radius).
-    # Tight gives the precise grounding; wide rescues stove/lamp cases where
-    # the VLM box was slightly off and the appliances/lighting instance sits
-    # next to it rather than inside.
-    wide_margin_x = max(8, min(int(search_radius), max(bw, 160)))
-    wide_margin_y = max(8, min(int(search_radius), max(bh, 120)))
-    shells = [
-        ("tight", 8, 8),
-        ("wide", wide_margin_x, wide_margin_y),
-    ]
-
-    def nearest_pixel(instance_id: int, region: np.ndarray, rx0: int, ry0: int) -> Tuple[int, int]:
-        mask_y, mask_x = np.where(region == int(instance_id))
-        if not len(mask_x):
-            return int(x), int(y)
-        mx = mask_x + rx0
-        my = mask_y + ry0
-        dist2 = (mx - x) ** 2 + (my - y) ** 2
-        j = int(np.argmin(dist2))
-        return int(mx[j]), int(my[j])
-
-    # 1) Prefer an instance whose MP3D semantic name matches the VLM category.
-    #    The MP3D semantic sensor uses MPCat40 names, so the actual hit is
-    #    almost always via the coarse-bucket containment branch (stove →
-    #    appliances). We search tight first, then a wider shell.
-    for shell_name, mx_margin, my_margin in shells:
-        region, (rx0, ry0, rx1, ry1), region_counts = region_for(mx_margin, my_margin)
-        best_id: Optional[int] = None
-        best_score = 0.0
-        best_pix = 0
-        best_target = ""
-        for inst_id, cnt in region_counts.items():
-            if cnt < 4:
-                continue
-            sem_name = category_for(inst_id) or ""
-            for target in target_cats:
-                s = _category_match_score(target, sem_name)
-                if s <= 0.0:
-                    continue
-                # Prefer exact / coarse-bucket matches; among those, prefer
-                # the larger and more centered instance.
-                mask_y, mask_x = np.where(region == int(inst_id))
-                if not len(mask_x):
-                    continue
-                cx = float(mask_x.mean() + rx0)
-                cy = float(mask_y.mean() + ry0)
-                dist = ((cx - x) ** 2 + (cy - y) ** 2) ** 0.5
-                # Normalise distance against shell diagonal so the size bonus
-                # is comparable across shells.
-                shell_diag = ((rx1 - rx0) ** 2 + (ry1 - ry0) ** 2) ** 0.5 or 1.0
-                proximity = max(0.0, 1.0 - dist / shell_diag)
-                scored = s + 0.10 * proximity + 0.05 * min(cnt, 5000) / 5000.0
-                if scored > best_score or (scored == best_score and cnt > best_pix):
-                    best_id, best_score, best_pix, best_target = inst_id, scored, cnt, target
-
-        if best_id is not None:
-            qx, qy = nearest_pixel(best_id, region, rx0, ry0)
-            return {
-                "instance_id": int(best_id),
-                "semantic_category": category_for(best_id),
-                "sample_counts": {str(k): int(v) for k, v in region_counts.most_common(10)},
-                "sample_pixel_count": int(best_pix),
-                "vlm_pixel": {"x": int(x), "y": int(y)},
-                "query_pixel": {"x": qx, "y": qy},
-                "bbox": [int(rx0), int(ry0), int(rx1 - 1), int(ry1 - 1)],
-                "correction": f"category_match_{shell_name}",
-                "match_score": float(best_score),
-                "match_category": best_target,
-            }
-
-    # No category match at any shell. For the bbox-majority fallback below
-    # use the tight region.
-    region, (rx0, ry0, rx1, ry1), region_counts = region_for(8, 8)
-
-    # 2) Small radius at the VLM pixel.
-    px0, px1 = max(0, x - radius), min(w, x + radius + 1)
-    py0, py1 = max(0, y - radius), min(h, y + radius + 1)
-    pix_vals = sem[py0:py1, px0:px1].reshape(-1)
-    pix_vals = pix_vals[pix_vals >= 0]
-    if pix_vals.size:
-        pix_counts = Counter(int(v) for v in pix_vals.tolist())
-        instance_id, count = pix_counts.most_common(1)[0]
-        return {
-            "instance_id": int(instance_id),
-            "semantic_category": category_for(instance_id),
-            "sample_counts": {str(k): int(v) for k, v in pix_counts.most_common(10)},
-            "sample_pixel_count": int(count),
-            "vlm_pixel": {"x": int(x), "y": int(y)},
-            "query_pixel": {"x": int(x), "y": int(y)},
-            "correction": "vlm_point",
-        }
-
-    # 3) Majority within the broader region.
-    if region_counts:
-        instance_id, count = region_counts.most_common(1)[0]
-        qx, qy = nearest_pixel(instance_id, region, rx0, ry0)
-        return {
-            "instance_id": int(instance_id),
-            "semantic_category": category_for(instance_id),
-            "sample_counts": {str(k): int(v) for k, v in region_counts.most_common(10)},
-            "sample_pixel_count": int(count),
-            "vlm_pixel": {"x": int(x), "y": int(y)},
-            "query_pixel": {"x": qx, "y": qy},
-            "bbox": [int(rx0), int(ry0), int(rx1 - 1), int(ry1 - 1)],
-            "correction": "bbox_majority",
-        }
-
-    return {"instance_id": None, "semantic_category": None, "sample_counts": {}}
+    crop = sem[by1:by2, bx1:bx2]
+    if not crop.size:
+        return {"instance_id": None, "semantic_category": None, "sample_counts": {}}
+    vals = crop.reshape(-1)
+    vals = vals[vals >= 0]
+    if not vals.size:
+        return {"instance_id": None, "semantic_category": None, "sample_counts": {}}
+    counts = Counter(int(v) for v in vals.tolist())
+    instance_id, count = counts.most_common(1)[0]
+    return {
+        "instance_id":        int(instance_id),
+        "semantic_category":  category_for(instance_id),
+        "sample_counts":      {str(k): int(v) for k, v in counts.most_common(10)},
+        "sample_pixel_count": int(count),
+        "vlm_pixel":          {"x": int(x), "y": int(y)},
+        "bbox":               [int(bx1), int(by1), int(bx2 - 1), int(by2 - 1)],
+        "correction":         "bbox_majority",
+    }
 
 
 def _draw_point(rgb_path: Path, x: int, y: int, out_path: Path) -> Path:
@@ -880,6 +784,11 @@ def main() -> None:
     ap.add_argument("--search_radius", type=int, default=140)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--save_viz", action="store_true", default=False,
+                    help="Save debug PNGs (input RGB, point, bbox, mask, "
+                         "contact sheet) for each rescue attempt. Default "
+                         "off — only semantic_rescue_categories.json is "
+                         "produced.")
     ap.add_argument("--append", action="store_true",
                     help="Append to an existing semantic_rescue_categories.json instead of replacing this run's entries.")
     args = ap.parse_args()
@@ -969,10 +878,11 @@ def main() -> None:
                 continue
             h, w = rgb.shape[:2]
 
-            out_dir = run_dir / "target_instances" / scan / "vlm_pixel_grounding" / rec["episode_id"]
+            out_dir = run_dir / "detection" / scan / rec["episode_id"]
             rgb_path = out_dir / f"sub_{int(rec['sub_idx']):03d}_rgb.png"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(rgb).save(rgb_path)
+            if args.save_viz:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                Image.fromarray(rgb).save(rgb_path)
 
             print(f"[{scan} ep={rec['episode_id']} sub={rec['sub_idx']}] {rec['landmark']!r}")
 
@@ -993,33 +903,22 @@ def main() -> None:
             raw_payload: Any = {"detections": detections, "prompts": prompts}
             source = "yolo_world"
 
-            # Walk detections by descending score. Stop at the first one whose
-            # bbox contains a category-matched MP3D instance. If none does,
-            # keep the highest-confidence detection so downstream code still
-            # has something to visualise.
-            for det in detections:
-                bbox_i = [int(round(v)) for v in det["bbox"]]
+            # Take the top-scored detection — _instance_at_pixel now
+            # always returns the bbox-majority instance regardless of
+            # MP3D category, so there's nothing to iterate looking for.
+            # The category override (instance.category := landmark)
+            # happens downstream in the summary record.
+            if detections:
+                chosen_det = detections[0]
+                bbox_i = [int(round(v)) for v in chosen_det["bbox"]]
                 cx = (bbox_i[0] + bbox_i[2]) // 2
                 cy = (bbox_i[1] + bbox_i[3]) // 2
-                preferred = [det["class_name"], rec.get("landmark") or ""]
-                preferred = [c for c in preferred if c]
-                info = _instance_at_pixel(
-                    sem,
-                    cx,
-                    cy,
+                pixel_info = _instance_at_pixel(
+                    sem, cx, cy,
                     max(0, args.sample_radius),
                     checker,
-                    preferred_categories=preferred,
-                    search_radius=max(0, args.search_radius),
                     bbox=bbox_i,
                 )
-                if chosen_det is None:
-                    chosen_det = det
-                    pixel_info = info
-                if str(info.get("correction", "")).startswith("category_match"):
-                    chosen_det = det
-                    pixel_info = info
-                    break
 
             if chosen_det is not None:
                 bbox_i = [int(round(v)) for v in chosen_det["bbox"]]
@@ -1065,15 +964,12 @@ def main() -> None:
                     grounding = g
                     raw_payload = {"detections": detections, "prompts": prompts, "vlm_raw": raw}
                     source = "vlm_fallback"
-                    preferred = [c for c in (g.get("category"), rec.get("landmark")) if c]
                     pixel_info = _instance_at_pixel(
                         sem,
                         g["x"],
                         g["y"],
                         max(0, args.sample_radius),
                         checker,
-                        preferred_categories=preferred,
-                        search_radius=max(0, args.search_radius),
                         bbox=g.get("bbox"),
                     )
 
@@ -1097,25 +993,30 @@ def main() -> None:
                 continue
 
             instance_id = pixel_info.get("instance_id")
-            debug_path = _draw_point(
-                rgb_path,
-                grounding["x"],
-                grounding["y"],
-                out_dir / f"sub_{int(rec['sub_idx']):03d}_point.png",
-            )
-            bbox_path = _draw_bbox(
-                rgb_path,
-                grounding.get("bbox") or [-1, -1, -1, -1],
-                out_dir / f"sub_{int(rec['sub_idx']):03d}_bbox.png",
-            )
-            mask_path = _draw_instance_mask(
-                rgb_path,
-                sem,
-                instance_id,
-                grounding["x"],
-                grounding["y"],
-                out_dir / f"sub_{int(rec['sub_idx']):03d}_mask.png",
-            ) if instance_id is not None else None
+            if args.save_viz:
+                debug_path = _draw_point(
+                    rgb_path,
+                    grounding["x"],
+                    grounding["y"],
+                    out_dir / f"sub_{int(rec['sub_idx']):03d}_point.png",
+                )
+                bbox_path = _draw_bbox(
+                    rgb_path,
+                    grounding.get("bbox") or [-1, -1, -1, -1],
+                    out_dir / f"sub_{int(rec['sub_idx']):03d}_bbox.png",
+                )
+                mask_path = _draw_instance_mask(
+                    rgb_path,
+                    sem,
+                    instance_id,
+                    grounding["x"],
+                    grounding["y"],
+                    out_dir / f"sub_{int(rec['sub_idx']):03d}_mask.png",
+                ) if instance_id is not None else None
+            else:
+                debug_path = None
+                bbox_path  = None
+                mask_path  = None
             if instance_id is None:
                 print(f"  -> bbox {grounding.get('bbox')} no MP3D instance recovered")
                 summaries[scan].append({
@@ -1203,8 +1104,7 @@ def main() -> None:
         print(f"wrote {out_path}")
     for scan, items in sorted(summaries.items()):
         summary_path = (
-            run_dir / "target_instances" / scan
-            / "vlm_pixel_grounding" / "vlm_pixel_grounding_summary.json"
+            run_dir / "detection" / scan / "summary.json"
         )
         _dump_json(summary_path, {
             "scan": scan,
@@ -1215,10 +1115,11 @@ def main() -> None:
             "records": items,
         })
         print(f"wrote {summary_path}")
-        sheet_path = summary_path.with_suffix(".png")
-        made = _make_contact_sheet(summary_path, sheet_path)
-        if made:
-            print(f"wrote {made}")
+        if args.save_viz:
+            sheet_path = summary_path.with_suffix(".png")
+            made = _make_contact_sheet(summary_path, sheet_path)
+            if made:
+                print(f"wrote {made}")
     print(f"Processed VLM records: {processed}")
 
 

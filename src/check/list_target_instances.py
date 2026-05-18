@@ -8,15 +8,24 @@ For each surviving sub-path (from the latest ``survivor.yaml``):
      turn node between this sub-path and the next; usually a virtual
      ``virt:...`` node from ``partition.json``) and list every visible
      MP40 instance whose category matches the landmark.
-  3. Tag each (ep, sub) with a ``uniqueness`` verdict based on **how
-     many candidates are visible from the partition point**:
-       • ``unique``                       — exactly one visible candidate
-       • ``ambiguous``                    — more than one visible candidate
-       • ``not_visible``                  — category matched but no visible
-                                            instance in FOV at partition point
-       • ``no_match``                     — landmark text doesn't map to any
-                                            MP40 category present in the scene
-       • ``partition_pos_unresolvable``   — couldn't compute partition pos
+  3. Tag each (ep, sub) with two fields, **visibility first, then
+     uniqueness**:
+       • ``visibility`` (str):
+           - ``"visible"``                   — at least one matched instance
+                                               visible from the partition pose
+           - ``"not_visible"``               — category matched, zero visible
+           - ``"no_match"``                  — landmark text doesn't map to any
+                                               MP40 category in the scene
+           - ``"partition_pos_unresolvable"`` — couldn't resolve partition pose
+       • ``uniqueness``:
+           - ``True``                        — exactly one visible candidate
+                                               (only meaningful when visible)
+           - ``False``                       — multiple visible candidates
+                                               (only meaningful when visible)
+           - ``"not_visible"``               — mirrors the visibility tag so
+                                               downstream code never has to
+                                               check visibility separately to
+                                               know there's nothing to pick
 
 This step intentionally counts instances **from the agent's vantage
 point at the turn**, not the whole-scene total — because that count is
@@ -55,7 +64,7 @@ import json
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import yaml
@@ -64,6 +73,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    active_subs,
     discover_rewrite_suffix,
     get_filter_dir,
     get_run_dir,
@@ -115,9 +125,16 @@ def _semantic_labels(
 ) -> List[str]:
     """Resolve a sub-path's components to candidate MP40 labels.
 
-    Primary source is the per-scan ``landmark_mapping`` lookup; falls
-    back to each component's own ``semantic_label`` when the mention is
-    absent.  Returns a deduplicated, "unknown"-stripped list.
+    The per-scan ``landmark_mapping`` (refined in step 06) is the sole
+    source of truth — no fallback to the rewriter's per-component
+    ``semantic_label``. That fallback used to let coarse buckets
+    (``appliances`` / ``furniture`` / ``objects`` / ``lighting``) sneak
+    back in for fine-grained mentions like ``fridge`` / ``stove``, even
+    after step 06 dropped them. If the mapping returns ``[]`` the
+    landmark is intentionally treated as unmapped at this stage and the
+    downstream visibility check records ``no_match``.
+
+    Returns a deduplicated, ``"unknown"``-stripped list.
     """
     labels: List[str] = []
 
@@ -128,37 +145,36 @@ def _semantic_labels(
 
     for comp in rewrite_sub.get("components") or []:
         mention = (comp.get("original_mention") or "").strip().lower()
-        mapped  = lookup_mention_labels(landmark_mapping, scan, mention)
-        if mapped:
-            for label in mapped:
-                _add(label)
-        else:
-            _add(comp.get("semantic_label") or "")
+        for label in lookup_mention_labels(landmark_mapping, scan, mention):
+            _add(label)
 
     return labels
 
 
-def _uniqueness_verdict(
+def _classify(
     pos:               Optional[np.ndarray],
     visibility_result: Optional[Dict[str, Any]],
-) -> str:
-    """Map (pos, visibility result) → uniqueness label.
+) -> Tuple[str, Any]:
+    """Split visibility from uniqueness.
 
-    Returns one of: partition_pos_unresolvable / no_match /
-    not_visible / unique / ambiguous.
+    Returns ``(visibility, uniqueness)``:
+
+    - ``visibility`` (str): one of ``"visible"``, ``"not_visible"``,
+      ``"no_match"``, or ``"partition_pos_unresolvable"``. Anything other
+      than ``"visible"`` means the landmark isn't usable at this pose.
+    - ``uniqueness``: ``True`` (exactly 1 visible instance), ``False``
+      (multiple visible instances), or the string ``"not_visible"`` when
+      ``visibility != "visible"``. Using the same string as the visibility
+      tag makes it obvious downstream that there's nothing to pick.
     """
     if pos is None:
-        return "partition_pos_unresolvable"
-    if visibility_result is None:
-        return "no_match"
-    if not (visibility_result.get("matched_categories") or []):
-        return "no_match"
+        return "partition_pos_unresolvable", "not_visible"
+    if visibility_result is None or not (visibility_result.get("matched_categories") or []):
+        return "no_match", "not_visible"
     n = int(visibility_result.get("n_instances") or 0)
     if n == 0:
-        return "not_visible"
-    if n == 1:
-        return "unique"
-    return "ambiguous"
+        return "not_visible", "not_visible"
+    return "visible", (True if n == 1 else False)
 
 
 # ---------------------------------------------------------------------------
@@ -177,13 +193,19 @@ def main() -> None:
                          "Auto-merges survivor.yaml so the survivor "
                          "sub_paths are restored even when passing the "
                          "original selection yaml.")
-    ap.add_argument("--min_pixel_count", type=int, default=50,
-                    help="Min pixels per instance to count as visible (default 50).")
-    ap.add_argument("--save_viz", action="store_true", default=True,
+    ap.add_argument("--min_pixel_count", type=int, default=2000,
+                    help="Min pixels per instance to count as visible. "
+                         "Default 2000 — matches step 11's MIN_VISIBLE_PIXELS, "
+                         "so 'visible' means the same thing everywhere in the "
+                         "pipeline. 2000 px in a 1024x512 panorama (~0.38% of "
+                         "FOV) is the minimum visually recognisable region; "
+                         "smaller regions tend to be easy to miss.")
+    ap.add_argument("--save_viz", action="store_true", default=False,
                     help="Render a rollout-style mask PNG per candidate at "
-                         "the partition pose (default on).")
+                         "the partition pose. Default off — pass this flag "
+                         "to opt in.")
     ap.add_argument("--no_save_viz", action="store_false", dest="save_viz",
-                    help="Skip per-candidate viz PNGs (faster).")
+                    help="(Deprecated; viz is off by default now.)")
     ap.add_argument("--info_width", type=int, default=300,
                     help="Right info panel width for viz panoramas.")
     args = ap.parse_args()
@@ -201,12 +223,16 @@ def main() -> None:
         raise SystemExit(f"No survivor.yaml at {survivor} — run filter pipeline first.")
 
     # resolve_exp already merged survivor.yaml into cfg.selection.
-    prior_subs = cfg.get("selection", {}).get("sub_paths")
+    # Process only sub-paths that are still active (un-labeled by earlier
+    # stages). Labeled drops stay in survivor.sub_paths for inspection /
+    # rescue tooling, but we don't want to spend visibility-check compute
+    # on them here — rescue paths (step 11 + step 09/10) handle them.
+    prior_subs = active_subs(cfg)
     if not prior_subs:
         raise SystemExit(
-            "survivor.yaml has no `sub_paths` field — list_target_instances "
-            "expects sub-path-level survivors (run scripts 02→03→04 first: "
-            "rewrite → blacklist → partition).",
+            "survivor.yaml has no active sub-paths — run scripts 02→03→04 first "
+            "(rewrite → blacklist → partition), and check that any aren't all "
+            "labeled by an earlier filter.",
         )
 
     # Locate per-episode rewrite JSONs.
@@ -335,8 +361,14 @@ def main() -> None:
                         )
                         matched_category = visibility_result.get("matched_category")
 
-                    uniqueness = _uniqueness_verdict(pos, visibility_result)
-                    uniqueness_counts[uniqueness] += 1
+                    visibility, uniqueness = _classify(pos, visibility_result)
+                    # For the breakdown counter, fold the bool form back
+                    # into a stable string key.
+                    counter_key = (
+                        visibility if visibility != "visible"
+                        else ("unique" if uniqueness is True else "ambiguous")
+                    )
+                    uniqueness_counts[counter_key] += 1
                     n_total_candidates += len(candidates)
 
                     # Save the clean partition-pose RGB + semantic panoramas
@@ -376,6 +408,11 @@ def main() -> None:
                         "pixel_count":        int((visibility_result or {}).get("pixel_count") or 0),
                         "pixel_fraction":     float((visibility_result or {}).get("pixel_fraction") or 0.0),
                         "candidates":         candidates,
+                        # Split fields: visibility decides whether the
+                        # landmark is reachable from this pose at all;
+                        # uniqueness is a bool only when visible, else
+                        # mirrors the visibility tag.
+                        "visibility":         visibility,
                         "uniqueness":         uniqueness,
                     }
 
@@ -418,8 +455,12 @@ def main() -> None:
                     ep_anno[str(sub_idx_int)] = record
 
                     cand_summary = ",".join(str(c["id"]) for c in candidates) or "—"
+                    if visibility == "visible":
+                        verdict = f"visible/unique={uniqueness}"
+                    else:
+                        verdict = visibility
                     print(f"  [{ep_id} sub {sub_idx_int:<2}] "
-                          f"{uniqueness:<26s}  "
+                          f"{verdict:<26s}  "
                           f"landmark={landmark!r}  "
                           f"cats={matched_categories or '—'}  "
                           f"ids=[{cand_summary}]")

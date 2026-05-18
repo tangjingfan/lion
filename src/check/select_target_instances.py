@@ -124,14 +124,44 @@ def _candidate_viz_path(record: Dict[str, Any], target_id: int) -> Optional[str]
 
 
 def _record_visibility_status(record: Dict[str, Any]) -> str:
-    """Normalize new ``uniqueness`` and legacy ``status`` fields."""
-    uniqueness = record.get("uniqueness")
-    if uniqueness:
-        return str(uniqueness)
+    """Return the visibility tag for one record.
+
+    Reads the new ``visibility`` field written by ``list_target_instances``.
+    Falls back to a legacy ``uniqueness`` string (when the file was written
+    by an older version where ``uniqueness`` conflated visibility) and
+    finally to ``status`` for the very earliest format.
+    """
+    v = record.get("visibility")
+    if v:
+        return str(v)
+    # Legacy: 3-state uniqueness used to encode visibility too.
+    legacy_uniq = record.get("uniqueness")
+    if isinstance(legacy_uniq, str) and legacy_uniq:
+        if legacy_uniq in ("unique", "ambiguous"):
+            return "visible"
+        return legacy_uniq
     status = record.get("status")
     if status:
         return str(status)
     return "unknown"
+
+
+def _record_is_unique(record: Dict[str, Any]) -> Optional[bool]:
+    """Return ``True`` / ``False`` when the record has a definitive
+    uniqueness verdict, ``None`` when not visible / unknown.
+
+    With the new schema ``uniqueness`` is a bool when visible. The
+    legacy format stored the strings ``"unique"`` / ``"ambiguous"`` /
+    ``"not_visible"`` here instead.
+    """
+    u = record.get("uniqueness")
+    if isinstance(u, bool):
+        return u
+    if u == "unique":
+        return True
+    if u == "ambiguous":
+        return False
+    return None
 
 
 def _select(
@@ -141,14 +171,19 @@ def _select(
     center_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     instances = _record_candidates(record)
-    visibility_status = _record_visibility_status(record)
+    visibility = _record_visibility_status(record)
+    is_unique = _record_is_unique(record)
 
     base = {
         "landmark": record.get("landmark"),
         "semantic_labels": record.get("semantic_labels", []),
         "matched_category": record.get("matched_category"),
         "matched_categories": record.get("matched_categories", []),
-        "visibility_status": visibility_status,
+        # Carry both fields through so consolidate / inspection can show
+        # the split picture without having to re-derive it.
+        "visibility":       visibility,
+        "uniqueness":       record.get("uniqueness"),
+        "visibility_status": visibility,
         "candidates": instances,
         "target_instance_ids": [],
         "selection_distance": None,
@@ -156,13 +191,11 @@ def _select(
         "center_source": center_source,
     }
 
-    if visibility_status in ("visible", "unique", "ambiguous"):
-        pass
-    else:
-        return {**base, "status": f"visibility:{visibility_status}"}
+    if visibility != "visible":
+        return {**base, "status": f"visibility:{visibility}"}
     if not instances:
         return {**base, "status": "no_visible_instance"}
-    if visibility_status == "unique" or len(instances) == 1:
+    if is_unique is True or len(instances) == 1:
         return {
             **base,
             "status": "view_unique",
@@ -448,10 +481,11 @@ def main() -> None:
                     help="Optional aggregate output JSON path. By default the "
                          "selection is written back into each per-scan "
                          "target_instances/{scan}/target_instances.json file.")
-    ap.add_argument("--save_viz", action="store_true", default=True,
-                    help="Save a Habitat mask PNG for each selected target instance.")
+    ap.add_argument("--save_viz", action="store_true", default=False,
+                    help="Save a Habitat mask PNG for each selected target "
+                         "instance. Default off — pass this flag to opt in.")
     ap.add_argument("--no_save_viz", action="store_false", dest="save_viz",
-                    help="Do not save per-target visualization PNGs.")
+                    help="(Deprecated; viz is off by default now.)")
     ap.add_argument("--viz_mode", choices=("mask", "topdown"), default="mask",
                     help="Visualization type. Default: Habitat rollout-style mask.")
     ap.add_argument("--info_width", type=int, default=300,
@@ -718,6 +752,25 @@ def main() -> None:
                         else:
                             viz_count += 1
                             last_frame_instance_viz_count += 1
+                # Merge selection result into the per-(ep, sub) annotations
+                # record in place. Single source of truth — no separate
+                # `target_instances` section so the file stays flat.
+                record.update({
+                    "target_instance_ids": selected.get("target_instance_ids", []),
+                    "instance_id": (
+                        int(selected["target_instance_ids"][0])
+                        if selected.get("target_instance_ids") else None
+                    ),
+                    "status":              selected.get("status"),
+                    "selection_distance":  selected.get("selection_distance"),
+                    "candidate_distances": selected.get("candidate_distances"),
+                    "center_source":       selected.get("center_source"),
+                    "rescued":             record.get("rescued", False),
+                })
+                if selected.get("fallback_reason"):
+                    record["fallback_reason"] = selected["fallback_reason"]
+                if selected.get("viz_error"):
+                    record["viz_error"] = selected["viz_error"]
                 selections.setdefault(ep_id, {})[sub_idx] = selected
                 source_selections.setdefault(ep_id, {})[sub_idx] = selected
                 counts[selected["status"]] += 1
@@ -728,7 +781,6 @@ def main() -> None:
                     "single -> view_unique; multi -> nearest-to-subpath-end"
                 )
                 annotations["selection_summary"] = dict(source_counts)
-                annotations["target_instances"] = source_selections
                 with open(source_path, "w") as f:
                     json.dump(annotations, f, indent=2)
                 written_paths.append(source_path)

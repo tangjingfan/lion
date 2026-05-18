@@ -12,11 +12,16 @@
 #   bash scripts/run_all.sh --exp <bare-expname>
 #
 # Optional:
-#   --from NN   start at step NN (skip earlier ones)
-#   --to NN     stop after step NN (skip later ones)
-#   --dry       just print what would run; don't execute
+#   --from NN        start at step NN (skip earlier ones)
+#   --to NN          stop after step NN (skip later ones)
+#   --with-rollout   also run scripts/rollout.sh first (renders the panoramas
+#                    that step 09 YOLO-World rescue needs). Requires --exp to
+#                    be a selection YAML path, not a bare expname.
+#   --dry            just print what would run; don't execute
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+CONFIG="${CONFIG:-configs/rollout/rollout_landmark_rxr.yaml}"
 
 # Pipeline order — each entry is the numeric prefix of the script.
 STEPS=(
@@ -29,12 +34,15 @@ STEPS=(
   06_refine_landmark_mapping
   07_list_potential_instances
   08_get_potential_instance
-  09_vlm_rescue
+  09_detection
   10_apply_rescue
   11_rescue_blacklist
   12_consolidate
   13_attrition
 )
+# Note: scripts/14_inspection_viz.sh exists but is intentionally NOT in
+# the default chain — viz is off by default. Run it on demand:
+#   bash scripts/14_inspection_viz.sh --exp configs/selection/.../<exp>.yaml
 
 # A few steps need extra fixed flags that aren't relevant to the others
 # (so we can't blindly forward "$@" to every step).
@@ -47,12 +55,14 @@ EXP=""
 FROM=""
 TO=""
 DRY=0
+WITH_ROLLOUT=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --exp)  EXP="$2"; shift 2 ;;
-    --from) FROM="$2"; shift 2 ;;
-    --to)   TO="$2";   shift 2 ;;
-    --dry)  DRY=1;     shift ;;
+    --exp)          EXP="$2"; shift 2 ;;
+    --from)         FROM="$2"; shift 2 ;;
+    --to)           TO="$2";   shift 2 ;;
+    --with-rollout) WITH_ROLLOUT=1; shift ;;
+    --dry)          DRY=1;     shift ;;
     -h|--help)
       sed -n '2,30p' "$0"
       exit 0
@@ -84,7 +94,24 @@ fi
 
 echo "Plan: ${PLAN[*]}"
 echo "exp : $EXP"
+[[ "$WITH_ROLLOUT" -eq 1 ]] && echo "rollout: yes (runs before step 00)"
 echo ""
+
+# ── Optional rollout (renders rollout_viz/<scan>/frames.jsonl) ───────
+if [[ "$WITH_ROLLOUT" -eq 1 ]]; then
+  if [[ ! -f "$EXP" ]]; then
+    echo "ERROR: --with-rollout requires --exp to be a selection YAML path" >&2
+    echo "       (got '$EXP', which is not an existing file)" >&2
+    exit 1
+  fi
+  echo "════════════════════════════════════════════════════════════════"
+  echo "  rollout"
+  echo "    bash scripts/rollout.sh --config $CONFIG --selection $EXP"
+  echo "════════════════════════════════════════════════════════════════"
+  if [[ "$DRY" -ne 1 ]]; then
+    bash scripts/rollout.sh --config "$CONFIG" --selection "$EXP"
+  fi
+fi
 
 # ── Run ──────────────────────────────────────────────────────────────
 for step in "${PLAN[@]}"; do

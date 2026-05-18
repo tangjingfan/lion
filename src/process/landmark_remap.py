@@ -29,30 +29,53 @@ noun-phrase mentions extracted from human navigation instructions about
 that scene.
 
 For EACH mention, return all labels from the SCENE OBJECT LIST that the
-mention could plausibly refer to.  Synonyms count: "fridge" matches
-"refrigerator", "couch" matches "sofa", "stairs" matches "stairs" /
-"stairway" / "staircase".
+mention could plausibly refer to. Be STRICT: only match when the label
+denotes the SAME concrete object as the mention. Synonyms at the SAME
+specificity count ("fridge" ↔ "refrigerator", "couch" ↔ "sofa",
+"stairs" ↔ "stairway"/"staircase").
 
 Rules:
-  • Pick labels ONLY from the SCENE OBJECT LIST verbatim.  Do NOT invent
+  • Pick labels ONLY from the SCENE OBJECT LIST verbatim. Do NOT invent
     labels and do NOT alter casing or spacing.
-  • Multiple labels per mention are allowed when several entries fit.
-  • If nothing in the list fits, return an empty list for that mention.
+  • Multiple labels per mention are allowed when several entries fit at
+    the same specificity.
+  • Hard rule — REJECT coarse-bucket labels for fine-grained mentions.
+    The coarse buckets are: "appliances", "furniture", "objects",
+    "lighting". Examples that MUST return []:
+      - "fridge", "stove", "oven", "microwave" when only "appliances"
+        is in the list (no "refrigerator" / "stove" / etc.)
+      - "sofa", "chair", "bed", "table" when only "furniture" is in
+        the list
+      - "lamp", "chandelier" when only "lighting" is in the list
+    Only return a coarse-bucket label when the MENTION itself is that
+    coarse term (e.g. mention="appliance" → ["appliances"] is OK).
+  • If nothing in the list fits at the right specificity, return [].
   • Mentions are lowercase; matching is semantic / case-insensitive.
 
 Respond with ONLY a JSON object (no markdown) mapping each input mention
 to its list of matched labels.
 
-Example (excerpt object list):
+Example A (refrigerator IS in the list — synonym match keeps it):
   Mentions: ["fridge", "couch", "stairs", "wugbleflub"]
-  Object list: [..., "appliance", "couch", "refrigerator", "sofa",
-                "stairs", "stairway", ...]
+  Object list: [..., "couch", "refrigerator", "sofa", "stairs",
+                "stairway", ...]
   Output:
     {
-      "fridge":     ["refrigerator", "appliance"],
+      "fridge":     ["refrigerator"],
       "couch":      ["sofa", "couch"],
       "stairs":     ["stairs", "stairway"],
       "wugbleflub": []
+    }
+
+Example B (only the coarse bucket is available — REJECT the match):
+  Mentions: ["fridge", "stove", "lamp", "appliance"]
+  Object list: [..., "appliances", "lighting", "furniture", ...]
+  Output:
+    {
+      "fridge":    [],
+      "stove":     [],
+      "lamp":      [],
+      "appliance": ["appliances"]
     }
 """
 
@@ -168,6 +191,31 @@ def _call_llm_json(
     raise RuntimeError(f"LLM failed after {max_retries} retries ({label})")
 
 
+# Coarse MPCAT40 buckets that must never be returned as a match for a
+# fine-grained mention. Mirrors src.process.coarse_labels.DEFAULT_COARSE_LABELS;
+# duplicated here to keep landmark_remap importable in places that don't
+# pull in coarse_labels.
+_COARSE_BUCKETS = {"appliances", "furniture", "objects", "lighting"}
+
+
+def _filter_coarse_for_fine(mention: str, labels: List[str]) -> List[str]:
+    """Drop coarse-bucket labels (``appliances`` / ``furniture`` / ``objects`` /
+    ``lighting``) when the mention itself is a fine-grained term.
+
+    Safety net: even with the prompt updated, the LLM occasionally still
+    returns ``"appliances"`` for ``"fridge"``. Strip those here so the
+    downstream visibility check doesn't get a forced-but-coarse match.
+    A mention IS considered coarse when it matches one of the bucket
+    names (plural or singular), in which case the coarse label stays.
+    """
+    m = (mention or "").strip().lower()
+    coarse_synonyms = set(_COARSE_BUCKETS)
+    coarse_synonyms.update(c[:-1] for c in _COARSE_BUCKETS if c.endswith("s"))
+    if m in coarse_synonyms:
+        return list(labels)
+    return [l for l in labels if (l or "").strip().lower() not in _COARSE_BUCKETS]
+
+
 def remap_scan_mentions(
     client,
     model: str,
@@ -185,6 +233,11 @@ def remap_scan_mentions(
     ``object_list`` (case-insensitive) are silently dropped — the LLM
     sometimes invents close-but-absent vocabulary, and we only want
     grounded matches downstream.
+
+    Coarse-bucket labels (``appliances`` / ``furniture`` / ``objects`` /
+    ``lighting``) are stripped from fine-grained mentions even when the
+    LLM returns them, so e.g. ``"fridge"`` maps to ``[]`` in a scene
+    whose appliance vocabulary only has the coarse bucket.
     """
     if not mentions:
         return {}
@@ -221,7 +274,7 @@ def remap_scan_mentions(
                 continue
             cleaned.append(s)
             seen.add(s)
-        out[mention] = cleaned
+        out[mention] = _filter_coarse_for_fine(mention, cleaned)
     return out
 
 

@@ -433,6 +433,9 @@ def parse_args() -> argparse.Namespace:
                         "Auto-merges survivor.yaml.")
     p.add_argument("--limit",     type=int, default=None,
                    help="Cap the number of episodes rendered")
+    p.add_argument("--save_png",  action="store_true", default=False,
+                   help="Render the matplotlib partition diagram PNG. "
+                        "Default off — partition.json is always written.")
     return p.parse_args()
 
 
@@ -559,23 +562,28 @@ def main() -> None:
             "virtual_nodes": ep_virtual,
         }
 
-        # One folder per (scan, instruction_id), containing its PNG and partition.json.
+        # One folder per (scan, instruction_id), containing partition.json
+        # and (optionally) the matplotlib diagram PNG.
         ep_dir = part_dir / ep.scan / str(ep.instruction_id)
         ep_dir.mkdir(parents=True, exist_ok=True)
-        out_png  = ep_dir / f"{ep.instruction_id}.png"
         out_json = ep_dir / "partition.json"
         with open(out_json, "w") as f:
             json.dump(ep_payload, f, indent=2)
-        try:
-            draw_episode(ep, scan_db, adjacency_cache[ep.scan],
-                         partitions, out_png)
+        if args.save_png:
+            out_png = ep_dir / f"{ep.instruction_id}.png"
+            try:
+                draw_episode(ep, scan_db, adjacency_cache[ep.scan],
+                             partitions, out_png)
+                print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  "
+                      f"scan={ep.scan}  → {ep_dir.name}/  +diagram")
+            except Exception as exc:
+                print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  diagram FAIL: {exc}")
+        else:
             print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  "
                   f"scan={ep.scan}  → {ep_dir.name}/")
-        except Exception as exc:
-            print(f"  [{idx}/{len(episodes)}] ep={ep.instruction_id}  FAIL: {exc}")
 
-    print(f"\nPer-episode outputs  → {part_dir}/<scan>/<instruction_id>/"
-          f"{{<instruction_id>.png, partition.json}}")
+    tail = "{partition.json" + (", <instruction_id>.png}" if args.save_png else "}")
+    print(f"\nPer-episode outputs  → {part_dir}/<scan>/<instruction_id>/{tail}")
 
 
 if __name__ == "__main__":

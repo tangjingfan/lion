@@ -10,15 +10,19 @@ can choose to use or skip them.
 
 A good replacement landmark must:
 
-  1. Be visible at the sub-path **end pose** (we want the thing the
-     agent walked towards).
+  1. Be visible at the sub-path **partition pose** (where the agent
+     finishes the spatial turn and reads the synthesized "walk to a X"
+     instruction — that's when it needs to identify the target).
   2. Be **progressively approached** along the landmark half — i.e.
      ``distance(end_pos, instance_center) < distance(partition_pos, instance_center)``.
+     This is purely geometric (uses .house centers) — confirms the agent
+     walks toward the target rather than away.
   3. Have a concrete MPCAT40 category (not ``wall`` / ``door`` /
      ``window`` / ``floor`` / ``ceiling`` / etc.).
   4. Be referrable — preferentially a category that has **exactly one**
-     instance visible at the end pose, so saying "go to the X" is
-     unambiguous.
+     visible instance at the partition pose, so saying "go to the X" is
+     unambiguous from where the agent stands when reading the
+     instruction.
 
 Output: ``target_instances/{scan}/blacklist_rescue.json`` — one
 record per rescued sub-path. The consolidate step (11) reads this and
@@ -73,11 +77,12 @@ COARSE_BUCKETS = {
 # end pose to count as "progressively approached" (metres).
 APPROACH_THRESHOLD_M = 0.5
 
-# An instance must have at least this many visible pixels at the end
-# pose to be considered a viable replacement landmark. 1000 px in a
-# 1024×512 panorama (~0.19% of FOV) is a small but visually obvious
-# object; 200 (the previous default) admitted near-invisible specks.
-MIN_VISIBLE_PIXELS = 1000
+# An instance must have at least this many visible pixels at the
+# partition pose to be considered a viable replacement landmark.
+# 2000 px in a 1024×512 panorama (~0.38% of FOV) is the minimum visible
+# region we treat as a real, recognisable landmark — smaller regions
+# tend to be too easy to miss when reading the synthesized instruction.
+MIN_VISIBLE_PIXELS = 2000
 
 
 def _load_yaml(path: Path) -> dict:
@@ -176,20 +181,44 @@ def _pick_replacement_landmark(
     partition_pos:     np.ndarray,
     end_pos:           np.ndarray,
     scene_category_counts: Counter,
+    debug_prefix:      str = "",
 ) -> Optional[Dict]:
     """Choose a single replacement landmark, or None if no candidate fits.
+
+    ``visible_pixels`` is the ``{instance_id: pixel_count}`` map from the
+    semantic panorama rendered **at the partition pose** — selection is
+    grounded in what the agent can see when it reads the synthesized
+    "walk to a X" instruction.
 
     Selection priority:
       1. category not in LANDMARK_BLACKLIST_CATS
       2. progressively approached: ``dist(end) < dist(partition) - APPROACH_THRESHOLD_M``
-      3. visible >= MIN_VISIBLE_PIXELS at the end pose
-      4. prefer category with exactly 1 visible instance in this FOV
-         (unambiguous "the X" reference)
+         (geometric, uses .house instance centers)
+      3. visible >= MIN_VISIBLE_PIXELS at the **partition pose**
+      4. prefer category with exactly 1 visible instance in the partition
+         FOV (unambiguous "the X" reference at instruction-read time)
       5. among ties, prefer non-coarse-bucket
-      6. final tiebreak: closest to end_pos
+      6. final tiebreak: balance proximity-to-end against visual prominence
     """
     candidates: List[Dict] = []
     cat_visible_count: Counter = Counter()
+
+    # ── Diagnostic: dump the top-pixel instances at partition pose so
+    # we can see what the panorama actually contained, regardless of
+    # filter outcome. Print before filtering so all noise is visible.
+    print(f"{debug_prefix}  partition-pose visible instances (top 10 by pixels):")
+    top = sorted(visible_pixels.items(), key=lambda kv: -kv[1])[:10]
+    for iid, pix in top:
+        meta = inst_meta.get(iid) or {}
+        cat = meta.get("category") or "?"
+        center = meta.get("center")
+        if center is not None:
+            dist_p = float(np.linalg.norm(partition_pos - center))
+            dist_e = float(np.linalg.norm(end_pos - center))
+            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} pix={pix:>6d} "
+                  f"dist_p={dist_p:.2f}m dist_e={dist_e:.2f}m approach={dist_p-dist_e:+.2f}m")
+        else:
+            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} pix={pix:>6d} (no .house center)")
 
     for iid, pix in visible_pixels.items():
         if iid not in inst_meta or pix < MIN_VISIBLE_PIXELS:
@@ -214,7 +243,14 @@ def _pick_replacement_landmark(
         })
 
     if not candidates:
+        print(f"{debug_prefix}  → no fit candidate (all filtered out)")
         return None
+    print(f"{debug_prefix}  candidates passing filters ({len(candidates)}):")
+    for c in candidates:
+        print(f"{debug_prefix}    iid={c['instance_id']:>4} cat={c['category']:<14s} "
+              f"pix={c['pixel_count']:>6d} dist_p={c['dist_partition_m']:.2f}m "
+              f"dist_e={c['dist_end_m']:.2f}m approach={c['approach_m']:+.2f}m "
+              f"fov_count={cat_visible_count[c['category']]}")
 
     # Tier 1: category has exactly one visible instance in this FOV.
     unique_view = [c for c in candidates if cat_visible_count[c["category"]] == 1]
@@ -235,6 +271,9 @@ def _pick_replacement_landmark(
     chosen["scene_instance_count"]    = int(scene_category_counts.get(chosen["category"], 0))
     chosen["fov_instance_count"]      = int(cat_visible_count[chosen["category"]])
     chosen["unique_in_fov"]           = chosen["fov_instance_count"] == 1
+    print(f"{debug_prefix}  → picked iid={chosen['instance_id']} cat={chosen['category']!r} "
+          f"pix={chosen['pixel_count']} score={chosen['score']:.4f} "
+          f"unique_in_fov={chosen['unique_in_fov']}")
     chosen["unique_in_scene"]         = chosen["scene_instance_count"] == 1
     return chosen
 
@@ -254,6 +293,10 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--exp", default=None,
                     help="Experiment handle (selection YAML path or expname).")
+    ap.add_argument("--save_viz", action="store_true", default=False,
+                    help="Render a rollout-style mask PNG at the partition "
+                         "and end poses for each rescued landmark. Default "
+                         "off — pass this flag to opt in.")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -342,55 +385,51 @@ def main() -> None:
                     skipped_no_pos += 1
                     continue
 
-                obs = checker.render_observation(end_pos.astype(np.float32), 0.0)
+                # Primary render: PARTITION pose. Selection is grounded
+                # in what the agent can see when it reads the synthesized
+                # "walk to a X" instruction.
+                obs = checker.render_observation(
+                    partition_pos.astype(np.float32), 0.0,
+                )
                 sem = obs.get("semantic")
                 if sem is None:
                     skipped_no_pos += 1
                     continue
 
                 visible_pixels = _visible_instance_pixels(sem)
+                print(f"[{scan} ep={ep_id} sub={sub_idx}] rescue selection "
+                      f"(orig_landmark={drop_rec.get('landmark')!r}):")
                 pick = _pick_replacement_landmark(
                     visible_pixels=visible_pixels,
                     inst_meta=inst_meta,
                     partition_pos=partition_pos,
                     end_pos=end_pos,
                     scene_category_counts=scene_cat_counts,
+                    debug_prefix="",
                 )
                 if pick is None:
                     skipped_no_candidate += 1
                     continue
 
-                # Partition-pose visibility check for the chosen category,
-                # matching original-record semantics (step 07/08 measure
-                # at partition pose with a 50-px threshold).
-                PARTITION_MIN_PIXELS = 50
-                partition_visibility_status = "not_visible"
-                chosen_visible_at_partition = False
-                n_visible_at_partition      = 0
-                pick_pixels_at_partition    = 0
+                # Secondary render at END pose — reporting only. Records
+                # whether the chosen landmark is still in view when the
+                # agent finishes the sub-path; useful for inspecting how
+                # well the synthesized instruction tracks the actual
+                # trajectory but not used for selection.
+                pick_pixels_at_end = 0
                 try:
-                    p_obs = checker.render_observation(
-                        partition_pos.astype(np.float32), 0.0,
+                    e_obs = checker.render_observation(
+                        end_pos.astype(np.float32), 0.0,
                     )
-                    p_sem = p_obs.get("semantic")
-                    if p_sem is not None:
-                        p_vis = _visible_instance_pixels(p_sem)
-                        for iid, pix in p_vis.items():
-                            if pix < PARTITION_MIN_PIXELS:
-                                continue
-                            if inst_meta.get(iid, {}).get("category") == pick["category"]:
-                                n_visible_at_partition += 1
-                        pick_pixels_at_partition = int(p_vis.get(int(pick["instance_id"]), 0))
-                        chosen_visible_at_partition = (
-                            pick_pixels_at_partition >= PARTITION_MIN_PIXELS
+                    e_sem = e_obs.get("semantic")
+                    if e_sem is not None:
+                        e_vis = _visible_instance_pixels(e_sem)
+                        pick_pixels_at_end = int(
+                            e_vis.get(int(pick["instance_id"]), 0)
                         )
-                        if n_visible_at_partition == 1:
-                            partition_visibility_status = "unique"
-                        elif n_visible_at_partition > 1:
-                            partition_visibility_status = "ambiguous"
                 except Exception as exc:
                     print(
-                        f"  WARN [{scan} ep={ep_id} sub={sub_idx}] partition "
+                        f"  WARN [{scan} ep={ep_id} sub={sub_idx}] end-pose "
                         f"visibility check failed: {exc}"
                     )
 
@@ -398,50 +437,46 @@ def main() -> None:
                 new_landmark  = pick["category"]
                 new_sub_instr = _synth_sub_instruction(spatial_instr, new_landmark)
 
-                # Render two viz frames for the new landmark:
-                #   - partition pose: matches what 07/08 do for `original`
-                #     records; the mask may be EMPTY for synthesized
-                #     records because the chosen instance is selected for
-                #     end-pose visibility, not partition-pose visibility.
-                #   - end pose: by construction the chosen instance IS
-                #     visible here, so the mask is always populated.
-                viz_dir = (
-                    run_dir / "target_instances" / "viz_blacklist_rescue"
-                    / scan / str(ep_id)
-                )
-                viz_paths: Dict[str, Optional[str]] = {
-                    "partition_viz_path": None,
-                    "end_viz_path":       None,
-                }
-                for pose_key, pos, suffix, action in (
-                    ("partition_viz_path", partition_pos, "partition", "BLACKLIST_RESCUE_P"),
-                    ("end_viz_path",       end_pos,       "end",       "BLACKLIST_RESCUE_E"),
-                ):
-                    try:
-                        rv = _render_mask_for_rollout_frame(
-                            checker=checker,
-                            scan=scan,
-                            instance_id=int(pick["instance_id"]),
-                            frame_record={
-                                "position":       [float(x) for x in pos],
-                                "heading":        0.0,
-                                "instruction_id": ep_id,
-                                "instruction":    new_sub_instr,
-                                "landmark":       new_landmark,
-                                "sub_idx":        sub_idx,
-                                "sub_total":      len(ep.sub_paths),
-                                "step":           0,
-                                "action":         action,
-                            },
-                            out_path=viz_dir / f"sub_{sub_idx:03d}_{suffix}.png",
-                            info_width=300,
-                        )
-                        viz_paths[pose_key] = rv["path"]
-                    except Exception as exc:
-                        print(
-                            f"  WARN [{scan} ep={ep_id} sub={sub_idx}] {suffix} "
-                            f"viz render failed: {exc}"
-                        )
+                if args.save_viz:
+                    # partition + end poses for the chosen replacement
+                    # landmark. PNGs land under
+                    # viz_blacklist_rescue/<scan>/<ep>/ (sibling of
+                    # partition_obs/ and detection/, out of target_instances/
+                    # which now holds only data). Paths are not recorded
+                    # in the JSON to keep records compact — locate them
+                    # by (ep, sub) on disk.
+                    viz_dir = (
+                        run_dir / "viz_blacklist_rescue"
+                        / scan / str(ep_id)
+                    )
+                    for pos, suffix, action in (
+                        (partition_pos, "partition", "BLACKLIST_RESCUE_P"),
+                        (end_pos,       "end",       "BLACKLIST_RESCUE_E"),
+                    ):
+                        try:
+                            _render_mask_for_rollout_frame(
+                                checker=checker,
+                                scan=scan,
+                                instance_id=int(pick["instance_id"]),
+                                frame_record={
+                                    "position":       [float(x) for x in pos],
+                                    "heading":        0.0,
+                                    "instruction_id": ep_id,
+                                    "instruction":    new_sub_instr,
+                                    "landmark":       new_landmark,
+                                    "sub_idx":        sub_idx,
+                                    "sub_total":      len(ep.sub_paths),
+                                    "step":           0,
+                                    "action":         action,
+                                },
+                                out_path=viz_dir / f"sub_{sub_idx:03d}_{suffix}.png",
+                                info_width=300,
+                            )
+                        except Exception as exc:
+                            print(
+                                f"  WARN [{scan} ep={ep_id} sub={sub_idx}] {suffix} "
+                                f"viz render failed: {exc}"
+                            )
 
                 scan_rescues.setdefault(str(ep_id), {})[str(sub_idx)] = {
                     "original_landmark":    drop_rec.get("landmark"),
@@ -452,20 +487,13 @@ def main() -> None:
                     "new_sub_instruction":  new_sub_instr,
                     "spatial_instruction":  spatial_instr,
                     "landmark_instruction": f"Walk to a {new_landmark}.",
-                    "pixel_count_at_end":   pick["pixel_count"],
-                    "dist_partition_m":     round(pick["dist_partition_m"], 3),
-                    "dist_end_m":           round(pick["dist_end_m"], 3),
-                    "approach_m":           round(pick["approach_m"], 3),
-                    "unique_in_fov":        pick["unique_in_fov"],
-                    "unique_in_scene":      pick["unique_in_scene"],
-                    "fov_instance_count":   pick["fov_instance_count"],
-                    "scene_instance_count": pick["scene_instance_count"],
-                    "partition_visibility_status":  partition_visibility_status,
-                    "chosen_visible_at_partition":  chosen_visible_at_partition,
-                    "n_visible_at_partition":       n_visible_at_partition,
-                    "pick_pixels_at_partition":     pick_pixels_at_partition,
-                    "partition_viz_path":   viz_paths["partition_viz_path"],
-                    "end_viz_path":         viz_paths["end_viz_path"],
+                    # Same split-schema as step 07/08 records:
+                    # visibility is always "visible" by construction
+                    # (selection requires partition-pose pixels ≥
+                    # MIN_VISIBLE_PIXELS); uniqueness reflects whether
+                    # the chosen category is unique in the partition FOV.
+                    "visibility":           "visible",
+                    "uniqueness":           bool(pick["unique_in_fov"]),
                 }
                 rescued_count += 1
 

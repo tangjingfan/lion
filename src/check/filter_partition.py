@@ -45,6 +45,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    active_subs,
     ensure_episode,
     ensure_sub_path,
     get_filter_dir,
@@ -57,6 +58,7 @@ from src.check._filter_utils import (
     save_audit,
     write_drop_yaml,
     write_survivor,
+    _sub_status_map,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -158,10 +160,28 @@ def main() -> None:
             "survivor.yaml has no `sub_paths` field — 04_partition expects "
             "sub-path-level survivors (run 03_blacklist_landmark first).",
         )
-    allowed_subs = {
-        int(ep_id): [int(s) for s in subs]
+    raw_prior_status = _sub_status_map(cfg)
+    # Idempotence: a re-run strips labels this stage wrote (matching
+    # ``partition:*``) and re-classifies from scratch. Upstream labels
+    # (blacklist, etc.) are preserved.
+    upstream_status: Dict[int, Dict[int, str]] = {}
+    for ep_id, labels in raw_prior_status.items():
+        keep = {s: lbl for s, lbl in labels.items()
+                if not (lbl or "").startswith(f"{STAGE_NAME}:")}
+        if keep:
+            upstream_status[ep_id] = keep
+    # full_subs keeps everything past cross_floor (including blacklist
+    # labels); allowed_subs is the active subset we still need to verdict.
+    full_subs = {
+        int(ep_id): sorted({int(s) for s in subs})
         for ep_id, subs in prior_subs.items()
     }
+    allowed_subs: Dict[int, List[int]] = {}
+    for ep_id, subs in full_subs.items():
+        upstream_labeled = upstream_status.get(ep_id, {})
+        kept = [int(s) for s in subs if int(s) not in upstream_labeled]
+        if kept:
+            allowed_subs[ep_id] = kept
 
     episodes = episodes_from_config(cfg)
     if not episodes:
@@ -178,11 +198,18 @@ def main() -> None:
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME)
 
-    keep_sub_paths: Dict[int, List[int]] = {}
+    # Carry forward upstream labels (our own stripped-and-rebuilt).
+    new_sub_status: Dict[int, Dict[int, str]] = {
+        ep_id: dict(labels) for ep_id, labels in upstream_status.items()
+    }
+    keep_sub_paths: Dict[int, List[int]] = {
+        ep_id: list(subs) for ep_id, subs in full_subs.items()
+    }
     dropped:        Dict[str, Dict]      = {}
-    n_subs_total  = 0
-    n_subs_keep   = 0
-    n_eps_no_data = 0
+    n_subs_total    = 0
+    n_subs_active   = 0
+    n_subs_labeled  = 0
+    n_eps_no_data   = 0
 
     for ep in episodes:
         ep_id_str = str(ep.instruction_id)
@@ -191,11 +218,21 @@ def main() -> None:
         rewrite_ep   = rewrite_episodes.get(ep_id_str)
         partition_ep = _load_partition(out_dir, ep.scan, ep.instruction_id)
 
+        ep_allowed_subs = allowed_subs.get(ep.instruction_id, [])
+
         if rewrite_ep is None or partition_ep is None:
             n_eps_no_data += 1
             reason = "rewrite_missing" if rewrite_ep is None else "partition_missing"
             ep_audit["stages"][STAGE_NAME] = {"status": "drop", "reason": reason}
             dropped[ep_id_str] = {"scan": ep.scan, "reason": reason}
+            # Label every previously-active sub of this ep with the
+            # missing-data reason so they show up in inspection viz.
+            for sub_idx in ep_allowed_subs:
+                n_subs_total   += 1
+                n_subs_labeled += 1
+                new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
+                    f"{STAGE_NAME}:{reason}"
+                )
             continue
 
         rewrite_subs = {
@@ -205,10 +242,11 @@ def main() -> None:
             int(s["sub_idx"]): s for s in partition_ep.get("partitions", [])
         }
 
-        ep_keep_subs: List[int]      = []
         ep_drops:     Dict[int, Dict] = {}
+        ep_n_active  = 0
+        ep_n_labeled = 0
 
-        for sub_idx in allowed_subs.get(ep.instruction_id, []):
+        for sub_idx in ep_allowed_subs:
             n_subs_total += 1
             keep_it, payload = _classify_sub_path(
                 rewrite_subs.get(sub_idx),
@@ -220,19 +258,36 @@ def main() -> None:
                 **payload,
             }
             if keep_it:
-                ep_keep_subs.append(sub_idx)
-                n_subs_keep += 1
+                ep_n_active   += 1
+                n_subs_active += 1
             else:
                 ep_drops[sub_idx] = payload
+                ep_n_labeled   += 1
+                n_subs_labeled += 1
+                # Compact reason: "rewrite_error" / "partition_error" /
+                # "rewrite_missing" / "partition_missing".
+                if payload.get("rewrite") in (None, "ok"):
+                    short_reason = (
+                        payload.get("partition") or "drop"
+                    ).split(":")[0]
+                    short_reason = (
+                        f"partition_{short_reason}"
+                        if short_reason not in ("missing", "drop")
+                        else f"partition_{short_reason}"
+                    )
+                else:
+                    rw = payload.get("rewrite") or "drop"
+                    short_reason = f"rewrite_{rw.split(':')[0]}"
+                new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
+                    f"{STAGE_NAME}:{short_reason}"
+                )
 
         ep_audit["stages"][STAGE_NAME] = {
-            "status":    "ok" if ep_keep_subs else "drop",
-            "kept_sub":  len(ep_keep_subs),
-            "total_sub": len(ep.sub_paths),
+            "status":    "ok" if ep_n_active > 0 else "drop",
+            "kept_sub":  ep_n_active,
+            "total_sub": len(ep_allowed_subs),
         }
 
-        if ep_keep_subs:
-            keep_sub_paths[ep.instruction_id] = ep_keep_subs
         if ep_drops:
             dropped[ep_id_str] = {
                 "scan": ep.scan,
@@ -244,6 +299,7 @@ def main() -> None:
         cfg, split,
         instruction_ids=sorted(keep_sub_paths.keys()),
         sub_paths=keep_sub_paths,
+        sub_status=new_sub_status,
     )
     drop_path = write_drop_yaml(
         filt_dir, STAGE_NUM, STAGE_NAME, split,
@@ -252,18 +308,16 @@ def main() -> None:
     save_audit(audit, filt_dir)
 
     n_eps_keep = len(keep_sub_paths)
-    n_eps_drop = len(episodes) - n_eps_keep
-    pct_subs   = (n_subs_keep / n_subs_total) if n_subs_total else 0.0
+    pct_active = (n_subs_active / n_subs_total) if n_subs_total else 0.0
 
     print(f"=== Stage {STAGE_NUM} — {STAGE_NAME} ===")
-    print(f"  episodes in   : {len(episodes)}")
-    print(f"  episodes keep : {n_eps_keep}")
-    print(f"  episodes drop : {n_eps_drop}  (no surviving sub-path)")
+    print(f"  episodes in    : {len(episodes)}")
+    print(f"  episodes keep  : {n_eps_keep}  (every ep past cross_floor stays — labels only)")
     if n_eps_no_data:
-        print(f"    of which {n_eps_no_data} for missing rewrite/partition data")
-    print(f"  sub-paths in  : {n_subs_total}")
-    print(f"  sub-paths keep: {n_subs_keep}  ({pct_subs:.1%})")
-    print(f"  sub-paths drop: {n_subs_total - n_subs_keep}")
+        print(f"    of which {n_eps_no_data} had missing rewrite/partition data (all subs labeled)")
+    print(f"  sub-paths processed (this stage): {n_subs_total}")
+    print(f"  sub-paths active (un-labeled)   : {n_subs_active}  ({pct_active:.1%})")
+    print(f"  sub-paths labeled this stage    : {n_subs_labeled}")
     print()
     print("Outputs:")
     print(f"  {survivor_path}")

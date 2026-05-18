@@ -40,6 +40,7 @@ from src.check._filter_utils import (
     discover_rewrite_suffix,
     get_run_dir,
     resolve_exp,
+    sub_status_for,
 )
 from src.dataset.landmark_rxr import episodes_from_config
 
@@ -90,12 +91,19 @@ def _load_target_db(run_dir: Path, scan: str) -> Optional[Dict]:
 
 
 def _target_for_sub(target_db: Dict, ep_id: int, sub_idx: int) -> Optional[Dict]:
-    return (
-        (target_db or {})
-        .get("target_instances", {})
-        .get(str(ep_id), {})
-        .get(str(sub_idx))
-    )
+    """Look up the per-(ep, sub) record. Prefers the new ``annotations``
+    section (single source of truth after the step 07/08/10 merge);
+    falls back to the legacy ``target_instances`` section if present."""
+    db = target_db or {}
+    for section in ("annotations", "target_instances"):
+        sub = (
+            (db.get(section) or {})
+            .get(str(ep_id), {})
+            .get(str(sub_idx))
+        )
+        if sub:
+            return sub
+    return None
 
 
 def _load_blacklist_rescue(run_dir: Path, scan: str) -> Dict:
@@ -113,6 +121,7 @@ def _build_record(
     rewrite_episode: Optional[Dict],
     target_db: Optional[Dict],
     rescue_rec: Optional[Dict] = None,
+    sub_label:  Optional[str]  = None,
 ) -> Dict[str, Any]:
     """Build one dataset record.
 
@@ -128,8 +137,15 @@ def _build_record(
     11_rescue_blacklist entry (synthesized replacement landmark);
     otherwise it is built from the rewrite + target_instances side-cars
     (original landmark).
+
+    ``sub_label`` is the value from ``survivor.sub_status[ep][sub]`` (e.g.
+    ``"blacklist:llm_keep_false"``). For labeled-but-not-rescued subs the
+    record still carries rewrite + partition geometry so inspection /
+    follow-up rescue tools have everything they need; ``target_status``
+    is just the label and ``target_instance_ids`` stays empty.
     """
     is_synth = rescue_rec is not None
+    is_labeled = (not is_synth) and bool(sub_label)
     part     = _partition_for_sub(part_json or {}, sub_idx)
     rew      = _rewrite_for_sub(rewrite_episode or {}, sub_idx) or {}
     target   = _target_for_sub(target_db or {}, ep.instruction_id, sub_idx) or {}
@@ -197,20 +213,32 @@ def _build_record(
             [rescue_rec.get("new_mpcat40")] if rescue_rec.get("new_mpcat40") else []
         )
         rec["landmark_visible"]            = bool(target_ids)
-        # Partition-pose visibility (matches original-record semantics —
-        # step 07/08 measure at partition pose). For synth this may be
-        # "not_visible" even though the landmark IS visible at the end
-        # pose by construction; landmark_visible captures that.
-        rec["visibility_status"] = (
-            rescue_rec.get("partition_visibility_status") or "not_visible"
+        # Synth records carry visibility + uniqueness fields directly
+        # from rescue_blacklist (same split schema as step 07/08).
+        rec["visibility"] = rescue_rec.get("visibility") or (
+            "visible" if target_ids else "not_visible"
         )
+        rec["uniqueness"] = (
+            rescue_rec["uniqueness"] if "uniqueness" in rescue_rec
+            else "not_visible"
+        )
+        rec["visibility_status"] = rec["visibility"]
     else:
         target_ids = target.get("target_instance_ids") or []
         rec["target_instance_ids"]         = target_ids
-        rec["target_status"]               = target.get("status")
+        rec["target_status"]               = (
+            sub_label if is_labeled and not target.get("status") else target.get("status")
+        )
+        if is_labeled and not rec["target_status"]:
+            rec["target_status"] = sub_label
         rec["matched_semantic_category"]   = target.get("matched_category")
         rec["matched_semantic_categories"] = target.get("matched_categories")
         rec["landmark_visible"]            = bool(target_ids)
+        # Split fields from step 07's _classify(). visibility is a string
+        # ("visible" / "not_visible" / "no_match" / "partition_pos_unresolvable");
+        # uniqueness is True/False when visible, else "not_visible".
+        rec["visibility"]                  = target.get("visibility")
+        rec["uniqueness"]                  = target.get("uniqueness")
         rec["visibility_status"]           = target.get("visibility_status")
 
     # ── Provenance (uniform key set) ─────────────────────────────────
@@ -219,9 +247,6 @@ def _build_record(
         rec["synthesized_from"] = {
             "original_landmark": rescue_rec.get("original_landmark"),
             "blacklist_reason":  rescue_rec.get("original_reason"),
-            "approach_m":        rescue_rec.get("approach_m"),
-            "unique_in_fov":     rescue_rec.get("unique_in_fov"),
-            "unique_in_scene":   rescue_rec.get("unique_in_scene"),
         }
     else:
         rec["synthesized_from"] = None
@@ -267,8 +292,19 @@ def main() -> None:
     # rewrite JSON / target_instances.json once.
     per_scan_target_cache: Dict[str, Optional[Dict]] = {}
 
+    # Pre-load every per-scan rescue file so the synth-records loop
+    # below can find them. (Originals are filtered out by the "must
+    # have target_instance_ids" rule, not by checking for rescue
+    # presence, so we don't need a per-(ep, sub) rescue lookup here.)
+    per_scan_rescue_cache: Dict[str, Dict] = {}
+    for ep in episodes:
+        per_scan_rescue_cache.setdefault(
+            ep.scan, _load_blacklist_rescue(run_dir, ep.scan),
+        )
+
     records: List[Dict[str, Any]] = []
     missing: List[str] = []
+    n_skipped_unusable = 0
     for ep in episodes:
         ep_subs = sub_paths_filter.get(int(ep.instruction_id))
         if ep_subs is None:
@@ -284,20 +320,36 @@ def main() -> None:
         rewrite_episode = _load_rewrite(run_dir, ep.scan, ep.instruction_id, suffix)
 
         for sub_idx in ep_subs:
-            rec = _build_record(ep, sub_idx, part_json, rewrite_episode, target_db)
+            sub_label = sub_status_for(cfg, ep.instruction_id, sub_idx)
+            # Drop records where the instruction itself isn't usable:
+            #   - blacklist:* labels (instruction text problem — LLM/regex
+            #     judged the landmark non-referrable)
+            #   - visibility:no_match (the landmark text doesn't match any
+            #     MP3D category in this scene's vocabulary — the concept
+            #     doesn't ground here, regardless of pose)
+            # visibility:not_visible / partition_pos_unresolvable stay —
+            # those are valid sub-trajectories where the landmark concept
+            # exists but isn't visible from the partition pose.
+            if sub_label and sub_label.startswith("blacklist:"):
+                n_skipped_unusable += 1
+                continue
+            rec = _build_record(
+                ep, sub_idx, part_json, rewrite_episode, target_db,
+                sub_label=sub_label,
+            )
+            if rec.get("visibility") == "no_match":
+                n_skipped_unusable += 1
+                continue
             records.append(rec)
             if part_json is None or _partition_for_sub(part_json, sub_idx) is None:
                 missing.append(f"{ep.instruction_id}#{sub_idx}: no partition.json")
 
-    # ── Synthesized records from blacklist rescue (step 13) ───────────
+    # ── Synthesized records from blacklist rescue (step 11) ───────────
     # We pull every episode the rescue file mentions — these episodes
     # may not be in `episodes` if they were entirely blacklisted (e.g.
-    # 882 in val_unseen_one_scene_partial).
+    # 882 in val_unseen_one_scene_partial). per_scan_rescue_cache was
+    # populated above so the labeled-record skip could consult it.
     syn_records: List[Dict[str, Any]] = []
-    per_scan_rescue_cache: Dict[str, Dict] = {}
-    rescued_ep_ids: Dict[int, str] = {}
-    for ep in episodes:
-        per_scan_rescue_cache.setdefault(ep.scan, _load_blacklist_rescue(run_dir, ep.scan))
     # Resolve every episode mentioned by any rescue file (covers ones
     # not in `episodes` because the whole episode got blacklist-dropped).
     extra_ep_ids = set()
@@ -380,6 +432,8 @@ def main() -> None:
     print(f"  synthesized=false   : {n - n_synth}")
     print(f"  with target_id      : {n_with_target}")
     print(f"  landmark visible    : {n_visible}")
+    if n_skipped_unusable:
+        print(f"  dropped (unusable)  : {n_skipped_unusable}  (blacklist:* + visibility:no_match; synth records below replace those with a fit)")
     print(f"  by target_status    :")
     for status, count in sorted(by_status.items(), key=lambda kv: -kv[1]):
         print(f"    {status:<25s} {count}")

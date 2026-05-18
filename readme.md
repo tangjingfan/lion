@@ -380,16 +380,16 @@ even when YOLO-World fires the `cooktop` class.
 
 ```bash
 # Dry run — see which coarse sub-paths will be sent to the detector:
-bash scripts/09_vlm_rescue.sh \
+bash scripts/09_detection.sh \
     --exp "$SEL" \
     --dry_run
 
 # Run for real (first call auto-downloads ~340MB YOLO-World weights + CLIP):
-bash scripts/09_vlm_rescue.sh \
+bash scripts/09_detection.sh \
     --exp "$SEL"
 
 # Optional VLM fallback (only invoked when YOLO finds nothing above threshold):
-GEMINI_API_KEY=... bash scripts/09_vlm_rescue.sh \
+GEMINI_API_KEY=... bash scripts/09_detection.sh \
     --exp "$SEL" \
     --enable_vlm_fallback
 ```
