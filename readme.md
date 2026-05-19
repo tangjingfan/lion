@@ -405,8 +405,8 @@ Main CLI options:
 - `--yolo_imgsz`: default `1024`, matches panorama width.
 - `--yolo_device`: override torch device; omit to let ultralytics pick.
 - `--enable_vlm_fallback`: opt-in. Requires `--api_key` / `GEMINI_API_KEY`.
-- `--sample_radius` / `--search_radius`: tight vs wide search shells
-  used during instance recovery.
+- `--save_viz`: opt-in. Writes per-detection debug PNGs (RGB, bbox,
+  point, mask) plus a per-scan contact sheet. Default off.
 
 Writes:
 
@@ -415,24 +415,14 @@ Writes:
   {category, confidence, is_rescuable, semantic_category,
   grounding_method, landmarks, examples, image_paths}`.
   `grounding_method` is `yolo_world` or `vlm_fallback`.
-- `target_instances/{scan}/vlm_pixel_grounding/{episode_id}/sub_{NNN}_{rgb,bbox,point,mask}.png`
-  — clean RGB, detector bbox, bbox center, and the recovered MP3D
-  instance mask overlay.
-- `target_instances/{scan}/vlm_pixel_grounding/vlm_pixel_grounding_summary.{json,png}`
-  — grounding-result JSON plus a contact sheet (4 thumbnails per row,
-  last column is the mask overlay; rows where the detector category
-  doesn't match the recovered semantic label are flagged `[MISMATCH]`).
-
-The older mask-based rescue is still available:
-
-```bash
-bash scripts/build_semantic_rescue_categories.sh --exp "$SEL" --dry_run
-```
-
-It only handles examples that already have `target_instance_ids`,
-asking the VLM to name the existing target mask. Useful for auditing an
-existing selection, but it cannot rescue examples without an instance
-id.
+- `detection/{scan}/{episode_id}/sub_{NNN}_{rgb,bbox,point,mask}.png`
+  (only with `--save_viz`) — clean RGB, detector bbox, bbox center, and
+  the recovered MP3D instance mask overlay.
+- `detection/{scan}/summary.json` — grounding-result JSON. With
+  `--save_viz` a contact sheet `summary.png` is rendered alongside it
+  (4 thumbnails per row, last column is the mask overlay; rows where
+  the detector category doesn't match the recovered semantic label are
+  flagged `[MISMATCH]`).
 
 ### Apply rescue back into target_instances.json
 

@@ -461,16 +461,6 @@ def load_keep(yaml_path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
-def load_sub_path_filter(yaml_path: Path) -> Optional[Dict[int, List[int]]]:
-    """Return ``{instruction_id: [sub_idx, ...]}`` if the YAML is sub-path
-    level, otherwise ``None``."""
-    data = load_keep(yaml_path)
-    sp = data.get("sub_paths")
-    if not sp:
-        return None
-    return {int(k): [int(v) for v in vs] for k, vs in sp.items()}
-
-
 # ── sub_status helpers (label channel inside survivor.yaml) ──────────────
 #
 # After cross_floor, every sub-path past that hard-drop stage stays in

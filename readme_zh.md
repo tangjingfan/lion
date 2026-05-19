@@ -299,21 +299,13 @@ GEMINI_API_KEY=... bash scripts/09_detection.sh \
 - `--yolo_imgsz`：默认 `1024`，匹配全景图宽。
 - `--yolo_device`：覆盖 torch device，缺省走 ultralytics 自动。
 - `--enable_vlm_fallback`：开关；开了才需要 `--api_key` / `GEMINI_API_KEY`。
-- `--sample_radius` / `--search_radius`：instance 恢复时 tight / wide 两层 shell 的搜索范围。
+- `--save_viz`：开关，默认关；开了会把每条 detection 的 RGB / bbox / point / mask 调试 PNG 以及 scan 级的 contact sheet 写到磁盘。
 
 输出：
 
 - `target_instances/{scan}/semantic_rescue_categories.json` —— 每 scan 一份。核心 lookup 是 `instances["{instance_id}"] -> {category, confidence, is_rescuable, semantic_category, grounding_method, landmarks, examples, image_paths}`。`grounding_method` 标 `yolo_world` 或 `vlm_fallback`。
-- `target_instances/{scan}/vlm_pixel_grounding/{episode_id}/sub_{NNN}_{rgb,bbox,point,mask}.png` —— 干净 RGB、detector bbox、bbox 中心、恢复出来的 MP3D instance mask 叠图。
-- `target_instances/{scan}/vlm_pixel_grounding/vlm_pixel_grounding_summary.{json,png}` —— grounding 结果总览 JSON + contact sheet（每行 4 张缩略图，最后一列就是 mask 叠图；detector category 与 sem label 不匹配时标 `[MISMATCH]` 红字）。
-
-旧的 mask-based rescue 仍可用：
-
-```bash
-bash scripts/build_semantic_rescue_categories.sh --exp "$SEL" --dry_run
-```
-
-它只处理已有 `target_instance_ids` 的样本，让 VLM 在已有 mask 上起更细类别；适合审计已有 selection，但救不了没 instance id 的样本。
+- `detection/{scan}/{episode_id}/sub_{NNN}_{rgb,bbox,point,mask}.png`（仅 `--save_viz` 开时写）—— 干净 RGB、detector bbox、bbox 中心、恢复出来的 MP3D instance mask 叠图。
+- `detection/{scan}/summary.json` —— grounding 结果总览 JSON；`--save_viz` 开时会一起写 `summary.png` contact sheet（每行 4 张缩略图，最后一列就是 mask 叠图；detector category 与 sem label 不匹配时标 `[MISMATCH]` 红字）。
 
 ### 把 rescue 结果合回 target_instances.json
 

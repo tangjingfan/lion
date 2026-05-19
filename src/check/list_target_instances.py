@@ -197,9 +197,9 @@ def main() -> None:
                     help="Min pixels per instance to count as visible. "
                          "Default 2000 — matches step 11's MIN_VISIBLE_PIXELS, "
                          "so 'visible' means the same thing everywhere in the "
-                         "pipeline. 2000 px in a 1024x512 panorama (~0.38% of "
-                         "FOV) is the minimum visually recognisable region; "
-                         "smaller regions tend to be easy to miss.")
+                         "pipeline. 2000 px in a 1024x512 panorama is the "
+                         "minimum visually recognisable region; smaller "
+                         "regions tend to be easy to miss.")
     ap.add_argument("--save_viz", action="store_true", default=False,
                     help="Render a rollout-style mask PNG per candidate at "
                          "the partition pose. Default off — pass this flag "

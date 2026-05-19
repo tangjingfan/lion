@@ -1,12 +1,9 @@
 """Pixel-grounded semantic rescue for coarse-target failures.
 
 Primary path: run YOLO-World (open-vocabulary detector) on the re-rendered
-rollout RGB panorama, prompted with the landmark phrase + high-confidence
-synonyms. Each detection is queried against the Habitat semantic panorama
-to recover an MP3D instance id, preferring instances whose MPCat40 name is
-a coarse bucket containing the prompted fine category (e.g. ``appliances``
-for a ``stove`` prompt). The highest-confidence detection that hits a
-category-matched instance wins.
+rollout RGB panorama, prompted with the landmark phrase. The top-scored
+detection's bbox is intersected with the Habitat semantic panorama, and
+the bbox-majority MP3D instance is taken as the recovered target.
 
 Fallback path (opt-in via ``--enable_vlm_fallback``): when YOLO-World
 returns nothing above threshold, ask a VLM for the landmark's pixel and
@@ -14,14 +11,13 @@ bounding box and run the same instance-recovery step.
 
 Steps:
 
-  1. Read the stage-3 survivor YAML and ``target_instances/{scan}/target_instances.json``.
+  1. Read the survivor YAML and ``target_instances/{scan}/target_instances.json``.
   2. For each survivor whose selected target is grounded only to a coarse
-     semantic bucket, find the rollout frame pose for that (scan, episode,
-     sub_idx).
+     semantic bucket (or has no match at all), find the rollout frame pose
+     for that (scan, episode, sub_idx).
   3. Re-render a clean RGB panorama and raw semantic panorama at the same pose.
   4. Run YOLO-World on the panorama to localise the landmark.
-  5. Query the raw semantic panorama inside each detection to recover the
-     instance id via category-aware matching.
+  5. Take the bbox-majority instance id from the semantic panorama.
   6. Write ``target_instances/{scan}/semantic_rescue_categories.json``.
 
 This can rescue examples with ``target_instance_ids: []`` because the
@@ -32,7 +28,9 @@ selector.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -47,13 +45,6 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import get_filter_dir, get_run_dir, get_survivor_path, load_keep, resolve_exp
-from src.check.build_semantic_rescue_categories import (
-    _dump_json,
-    _extract_json_object,
-    _image_data_url,
-    _load_json,
-    _load_yaml,
-)
 from src.process.coarse_labels import (
     DEFAULT_COARSE_LABELS,
     _is_only_coarse_label,
@@ -103,23 +94,6 @@ Rules:
 """
 
 
-# MP3D fine category names sometimes differ from how a VLM phrases the same
-# object. Keep this list short and only include high-confidence pairs — wrong
-# synonyms will silently misroute the rescue.
-# Hand-curated landmark→synonym table removed. Both consumers used to
-# call into it:
-#   - _build_yolo_prompts: extra class strings for YOLO-World
-#   - _category_match_score: 0.9 score bump when VLM cat == synonym of MP3D cat
-# YOLO-World's class prompts are encoded with CLIP, so "fridge" and
-# "refrigerator" already sit close in the joint text/vision embedding
-# space — passing both as separate prompts is redundant. Pixel-match
-# scoring leans on exact match (1.0), MPCat40 coarse-bucket containment
-# (0.85, the workhorse) and token overlap (0.5-0.75); landmark↔fine
-# synonym pairs are rare in MPCat40 anyway (the vocabulary tops out at
-# coarse buckets like "appliances"), so the synonym branch was firing
-# almost never.
-
-
 # Habitat's MP3D semantic sensor returns MPCat40 category names, which group
 # many fine objects into a single coarse bucket — e.g. a stove, refrigerator,
 # and dishwasher all share the "appliances" label at the pixel level. The
@@ -162,6 +136,55 @@ _COARSE_TO_FINE: Dict[str, set] = {
     "shelving": {"shelf", "shelves", "rack"},
     "misc": set(),
 }
+
+
+# ── Small I/O helpers (formerly in build_semantic_rescue_categories) ─────
+def _load_yaml(path: Path) -> Dict:
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _load_json(path: Path) -> Dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def _dump_json(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def _image_data_url(path: Path) -> str:
+    mime = mimetypes.guess_type(str(path))[0] or "image/png"
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{data}"
+
+
+def _extract_json_object(raw: str) -> Dict:
+    raw = (raw or "").strip()
+    candidates = [raw]
+    if raw.startswith("```"):
+        body = raw[3:]
+        if body.startswith("json"):
+            body = body[4:]
+        if body.endswith("```"):
+            body = body[:-3]
+        candidates.append(body.strip())
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(raw[first:last + 1])
+    last_err: Exception = ValueError("empty response")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception as exc:
+            last_err = exc
+    raise ValueError(f"could not parse JSON: {last_err}")
 
 
 def _category_match_score(vlm_cat: str, sem_name: str) -> float:
@@ -551,10 +574,7 @@ def _instance_at_pixel(
     sem: np.ndarray,
     x: int,
     y: int,
-    radius: int,
     checker: VisibilityChecker,
-    preferred_categories: Optional[List[str]] = None,
-    search_radius: int = 140,   # kept for back-compat; no longer used
     bbox: Optional[List[int]] = None,
 ) -> Dict:
     """Return the dominant MP3D instance inside the YOLO bbox.
@@ -779,9 +799,6 @@ def main() -> None:
                     help="Only used when --enable_vlm_fallback is set.")
     ap.add_argument("--model", default=None,
                     help="VLM model name for the fallback path.")
-    # Instance recovery options.
-    ap.add_argument("--sample_radius", type=int, default=5)
-    ap.add_argument("--search_radius", type=int, default=140)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--save_viz", action="store_true", default=False,
@@ -914,10 +931,7 @@ def main() -> None:
                 cx = (bbox_i[0] + bbox_i[2]) // 2
                 cy = (bbox_i[1] + bbox_i[3]) // 2
                 pixel_info = _instance_at_pixel(
-                    sem, cx, cy,
-                    max(0, args.sample_radius),
-                    checker,
-                    bbox=bbox_i,
+                    sem, cx, cy, checker, bbox=bbox_i,
                 )
 
             if chosen_det is not None:
@@ -968,7 +982,6 @@ def main() -> None:
                         sem,
                         g["x"],
                         g["y"],
-                        max(0, args.sample_radius),
                         checker,
                         bbox=g.get("bbox"),
                     )
