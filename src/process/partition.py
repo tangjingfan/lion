@@ -34,7 +34,7 @@ import numpy as np
 # ── Hyper-parameters (tunable; see configs/partition/partition.yaml) ──────
 TURN_THRESH_DEG    = 45.0
 AROUND_THRESH_DEG  = 120.0
-FORWARD_DISTANCE_M = 0.3      # metres of forward motion defining spatial part
+FORWARD_DISTANCE_M = 0.5      # metres of forward motion defining spatial part
 MOVE_FORWARD = 1
 TURN_LEFT = 2
 TURN_RIGHT = 3

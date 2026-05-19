@@ -18,4 +18,7 @@ around_thresh_deg: 120.0   # |cumulative turn| >= 120° is "turn around"
 # start from that crossing step and walk this far before cutting. If not,
 # cut after this much motion from the start of the rollout sub-path segment.
 # Without rollout frames, this is applied along the reference sub-path.
-forward_distance_m: 0.3
+# 0.5 m gives one short forward step past the turn — far enough that
+# doorframes / wall corners no longer occlude the destination, short
+# enough to keep the partition pose near the "read instruction" moment.
+forward_distance_m: 0.5
