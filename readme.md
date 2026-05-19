@@ -120,12 +120,15 @@ under `filters/`:
                                      # — see "Reading the audit"
 ```
 
-**Cross-floor is the only hard drop.** Past stage 01, every surviving
-sub-path stays in `survivor.sub_paths`; later stages **label** failures
-into `survivor.sub_status[ep_id][sub_idx]` (e.g.
-`"blacklist:llm_keep_false"`, `"partition:rewrite_error"`) rather than
-deleting the sub. This keeps labeled drops reachable to the rescue
-paths (steps 09 / 11) and to inspection tooling.
+**Cross-floor is the only hard drop**, and it now runs per sub-path:
+each sub-trajectory with `max(y) − min(y) > 0.5 m` is removed from
+`survivor.sub_paths`, but the episode survives as long as at least
+one sub-path stays single-floor. Past stage 01, every surviving
+sub-path stays in `survivor.sub_paths`; later stages **label**
+failures into `survivor.sub_status[ep_id][sub_idx]` (e.g.
+`"blacklist:llm_keep_false"`, `"partition:rewrite_error"`) rather
+than deleting the sub. This keeps labeled drops reachable to the
+rescue paths (steps 09 / 11) and to inspection tooling.
 
 The `--exp` flag accepts either a selection YAML path (e.g.
 `configs/selection/val_unseen/one_scene_partial.yaml`) or a bare
@@ -176,11 +179,16 @@ already exist (won't clobber an in-progress pipeline). Also writes
 
 #### 2.1 Cross-floor filter
 
-Drops episodes whose reference path crosses a floor (vertical span >
-0.5 m).
+Drops sub-paths whose nodes span more than `--threshold_m` (default
+0.5 m) vertically. The episode survives if any of its sub-paths stays
+single-floor; an episode is dropped wholesale only when every sub-path
+crosses floors. The drop yaml records the offending `(ep, sub_idx)`
+pairs with their Δy.
 
 ```bash
 bash scripts/01_filter_multi_floor.sh --exp "$SEL"
+# loosen the threshold:
+bash scripts/01_filter_multi_floor.sh --exp "$SEL" --threshold_m 0.8
 ```
 
 #### 2.2 LLM rewrite
