@@ -20,12 +20,17 @@ filter as they like.
 
 Selection algorithm (per candidate sub-path):
 
-  1. Render a 360° semantic panorama at BOTH the partition pose and
-     the end pose; count per-instance pixels at each.
+  1. Render an RGB + depth + semantic equirectangular panorama at BOTH
+     the partition pose and the end pose. Unproject depth + semantic
+     to a world-frame point cloud per instance, downsample at
+     ``VOXEL_SIZE_M`` (10 cm), and count unique voxels per instance.
+     Voxel counts (vs. pixel counts) decouple "spatial extent visible"
+     from "how close we happen to be" — pixel counts conflate the two.
   2. Visibility filter — require
-     ``partition_pixels[iid] / end_pixels[iid] >= MIN_VISIBILITY_RATIO``
+     ``partition_voxels[iid] / end_voxels[iid] >= MIN_VISIBILITY_RATIO``
      (10%). The agent reads "walk to a X" at the partition pose, so X
-     must already be at least somewhat on screen there.
+     must already cover at least 10% of its eventual voxel footprint
+     from there.
   3. Approach filter — require ``dist_partition > dist_end`` (geometric,
      using ``.house`` instance centers in Habitat coords).
   4. Tier filter (referrability table in
@@ -113,18 +118,24 @@ REFERRABLE_TABLE_PATH = (
 # agent reads "walk to a X", they must already be able to see X
 # clearly enough — a destination that's invisible from where the
 # instruction is read isn't a usable landmark. 0.10 means "at least
-# 10% of the eventual pixel area is already on screen at instruction-
-# read time."
+# 10% of the eventual voxel coverage is already on screen at
+# instruction-read time."
 MIN_VISIBILITY_RATIO = 0.10
 
-# Score saturation point on partition-pose pixel count. Above this the
+# Voxel size for downsampling the unprojected point cloud (metres in
+# world coordinates). 0.1 m = 10 cm cells — small enough to capture
+# the shape of furniture and people, large enough that nearby points
+# collapse into the same cell so a 1-m-wide fridge surface contributes
+# tens of voxels rather than thousands of unique pixels.
+VOXEL_SIZE_M = 0.10
+
+# Score saturation point on partition-pose voxel count. Above this the
 # soft-size penalty contributes ``1.0``; below it the candidate's score
-# is linearly discounted. A 1024×512 panorama has ~524k pixels total,
-# so 2000 px is ~0.38% of FOV — the smallest area we still treat as
-# "clearly visible" (matches the absolute floor the old logic enforced
-# as a hard cut-off). Below that, an instance is small enough that a
-# huge approach distance no longer means it's a confident destination.
-SIZE_SATURATION_PIXELS = 2000
+# is linearly discounted. 200 voxels at 0.10 m ≈ a 0.5-m-cube object's
+# visible surface — the smallest area we still treat as "clearly
+# visible". Below that an instance is small enough that a huge approach
+# distance no longer means it's a confident destination.
+SIZE_SATURATION_VOXELS = 200
 
 # Confidence values from the VLM that count as "accept and use the
 # refined name". Anything else falls through to the next candidate.
@@ -440,24 +451,113 @@ def _resolve_node_pos(
     return None
 
 
-def _visible_instance_pixels(sem_array: np.ndarray) -> Dict[int, int]:
-    """Return ``{instance_id: pixel_count}`` for a rendered semantic
-    panorama (raw instance-id buffer)."""
-    flat = sem_array.ravel()
-    unique, counts = np.unique(flat, return_counts=True)
-    return {int(i): int(c) for i, c in zip(unique, counts) if int(i) >= 0}
+def _unproject_equirect(
+    depth:     np.ndarray,
+    semantic:  np.ndarray,
+    pos:       np.ndarray,
+    heading:   float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Unproject an equirectangular depth + semantic panorama into a
+    flat 3-D point cloud in **world** coordinates.
+
+    Habitat's equirectangular sensor returns radial distance to first
+    hit along each pixel's ray. For pixel ``(u, v)`` on a ``(H, W)``
+    panorama:
+
+      θ = 2π · u / W − π        ∈ [-π, π]   (yaw, +x = right of agent)
+      φ = π/2 − π · v / H       ∈ [-π/2, π/2] (pitch, +y = up)
+
+    The sensor frame at heading=0 has the agent facing −z, so:
+
+      x_local =  d · cos(φ) · sin(θ)
+      y_local =  d · sin(φ)
+      z_local = -d · cos(φ) · cos(θ)
+
+    A heading rotation around y maps local → world before adding ``pos``.
+    Returns ``(points (N, 3) float32, instance_ids (N,) int32)`` with
+    invalid pixels (non-finite depth, zero, or unannotated) filtered
+    out so downstream consumers can voxelise directly.
+    """
+    H, W  = depth.shape[:2]
+    u     = np.arange(W, dtype=np.float32).reshape(1, W)
+    v     = np.arange(H, dtype=np.float32).reshape(H, 1)
+    theta = 2.0 * np.pi * (u / W) - np.pi
+    phi   = 0.5 * np.pi - np.pi * (v / H)
+    cos_phi = np.cos(phi)
+    d       = depth.astype(np.float32, copy=False)
+
+    x_local = d * cos_phi * np.sin(theta)
+    y_local = d * np.sin(phi)
+    z_local = -d * cos_phi * np.cos(theta)
+
+    valid = np.isfinite(d) & (d > 1e-3) & (d < 1e3) & (semantic >= 0)
+    pts_local = np.stack([x_local[valid], y_local[valid], z_local[valid]], axis=1)
+    iids      = semantic[valid].astype(np.int32, copy=False)
+    if pts_local.size == 0:
+        return pts_local.astype(np.float32), iids
+
+    cos_h, sin_h = float(np.cos(heading)), float(np.sin(heading))
+    rot = np.array([[ cos_h, 0.0, sin_h],
+                    [   0.0, 1.0,   0.0],
+                    [-sin_h, 0.0, cos_h]], dtype=np.float32)
+    pts_world = pts_local @ rot.T + np.asarray(pos, dtype=np.float32)
+    return pts_world.astype(np.float32, copy=False), iids
 
 
-def _size_weight(partition_pixels: int) -> float:
-    """Soft penalty for visually-small instances at the partition pose.
+def _voxelise_per_instance(
+    points:    np.ndarray,
+    iids:      np.ndarray,
+    voxel_size: float,
+) -> Dict[int, int]:
+    """Return ``{instance_id: unique_voxel_count}``.
+
+    Each 3-D point is binned into a voxel by ``floor(p / voxel_size)``;
+    for each instance, count how many distinct cells its points occupy.
+    Empty inputs return ``{}``.
+    """
+    if points.size == 0:
+        return {}
+    vox = np.floor(points / float(voxel_size)).astype(np.int64)
+    # Combine instance id + (vx, vy, vz) into a single key so np.unique
+    # gives us (iid, voxel) pairs in one shot.
+    key = np.empty((points.shape[0], 4), dtype=np.int64)
+    key[:, 0]  = iids.astype(np.int64, copy=False)
+    key[:, 1:] = vox
+    uniq = np.unique(key, axis=0)
+    out: Dict[int, int] = {}
+    for row in uniq:
+        i = int(row[0])
+        out[i] = out.get(i, 0) + 1
+    return out
+
+
+def _visible_instance_voxels(
+    depth:    np.ndarray,
+    semantic: np.ndarray,
+    pos:      np.ndarray,
+    heading:  float,
+    voxel_size: float = VOXEL_SIZE_M,
+) -> Dict[int, int]:
+    """Render-time helper: depth + semantic panorama → ``{iid: voxels}``.
+
+    Pipeline: unproject equirect depth into world-frame points, drop
+    invalid pixels, voxel-downsample at ``voxel_size`` metres, count
+    distinct voxels per instance id.
+    """
+    points, iids = _unproject_equirect(depth, semantic, pos, heading)
+    return _voxelise_per_instance(points, iids, voxel_size)
+
+
+def _size_weight(partition_voxels: int) -> float:
+    """Soft penalty for spatially-small instances at the partition pose.
 
     Returns a multiplier in ``[0, 1]`` that saturates at
-    ``SIZE_SATURATION_PIXELS``. A 50-px speck gets weight ≈ 0.03, a
-    2000+ px landmark gets weight 1.0. Multiplied into the candidate
-    score, so a huge approach distance no longer compensates for an
-    invisible-from-here destination.
+    ``SIZE_SATURATION_VOXELS``. A 5-voxel speck gets weight 0.025, a
+    200+ voxel landmark gets weight 1.0. Multiplied into the candidate
+    score so a huge approach distance no longer compensates for a
+    barely-visible destination.
     """
-    return min(1.0, max(0.0, partition_pixels) / float(SIZE_SATURATION_PIXELS))
+    return min(1.0, max(0.0, partition_voxels) / float(SIZE_SATURATION_VOXELS))
 
 
 def _candidate_score(c: Dict) -> float:
@@ -465,15 +565,15 @@ def _candidate_score(c: Dict) -> float:
 
     ``approach × size_weight``. Maximised to pick the best landmark:
     we still want the instance the agent walks toward the most, but
-    that signal is muted when the instance is barely visible at the
-    instruction-read pose.
+    that signal is muted when the instance occupies few voxels at the
+    instruction-read pose (i.e. is spatially small from there).
     """
-    return c["approach_m"] * _size_weight(c["pixel_count"])
+    return c["approach_m"] * _size_weight(c["voxel_count"])
 
 
 def _rank_candidates(
-    partition_pixels: Dict[int, int],
-    end_pixels:       Dict[int, int],
+    partition_voxels: Dict[int, int],
+    end_voxels:       Dict[int, int],
     inst_meta:        Dict[int, Dict],
     partition_pos:    np.ndarray,
     end_pos:          np.ndarray,
@@ -485,12 +585,12 @@ def _rank_candidates(
 
     Per-candidate filters (all must pass):
       1. instance has a known MPCat40 category
-      2. ratio = partition_pixels / end_pixels >= MIN_VISIBILITY_RATIO
+      2. ratio = partition_voxels / end_voxels >= MIN_VISIBILITY_RATIO
       3. dist_partition > dist_end (agent walks toward the instance)
       4. tier(cat) != "too_generic"
 
     Survivors are ranked by ``score = approach_m × size_weight``, where
-    ``size_weight`` saturates at ``SIZE_SATURATION_PIXELS`` so tiny
+    ``size_weight`` saturates at ``SIZE_SATURATION_VOXELS`` so tiny
     instances can't ride a long approach to the top of the list.
 
     No VLM is called here — that happens at pick time in
@@ -498,25 +598,25 @@ def _rank_candidates(
     actually want to commit to.
     """
     candidates: List[Dict] = []
-    all_iids = set(partition_pixels) | set(end_pixels)
+    all_iids = set(partition_voxels) | set(end_voxels)
 
-    print(f"{debug_prefix}  end-pose visible instances (top 10 by pixels):")
-    top = sorted(end_pixels.items(), key=lambda kv: -kv[1])[:10]
-    for iid, end_px in top:
+    print(f"{debug_prefix}  end-pose visible instances (top 10 by voxel count):")
+    top = sorted(end_voxels.items(), key=lambda kv: -kv[1])[:10]
+    for iid, end_vx in top:
         meta = inst_meta.get(iid) or {}
         cat = meta.get("category") or "?"
-        p_px = partition_pixels.get(iid, 0)
-        ratio = (p_px / end_px) if end_px > 0 else 0.0
+        p_vx = partition_voxels.get(iid, 0)
+        ratio = (p_vx / end_vx) if end_vx > 0 else 0.0
         center = meta.get("center")
         if center is not None:
             dist_p = float(np.linalg.norm(partition_pos - center))
             dist_e = float(np.linalg.norm(end_pos - center))
             print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} tier={_tier(referrability, cat):<11s} "
-                  f"e_px={end_px:>6d} p_px={p_px:>6d} ratio={ratio:.2f} "
+                  f"e_vx={end_vx:>5d} p_vx={p_vx:>5d} ratio={ratio:.2f} "
                   f"approach={dist_p-dist_e:+.2f}m")
         else:
             print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} "
-                  f"e_px={end_px:>6d} p_px={p_px:>6d} ratio={ratio:.2f} "
+                  f"e_vx={end_vx:>5d} p_vx={p_vx:>5d} ratio={ratio:.2f} "
                   f"(no .house center)")
 
     for iid in all_iids:
@@ -528,11 +628,11 @@ def _rank_candidates(
         tier = _tier(referrability, cat)
         if tier == "too_generic":
             continue
-        end_px = end_pixels.get(iid, 0)
-        if end_px <= 0:
+        end_vx = end_voxels.get(iid, 0)
+        if end_vx <= 0:
             continue
-        p_px = partition_pixels.get(iid, 0)
-        ratio = p_px / end_px
+        p_vx = partition_voxels.get(iid, 0)
+        ratio = p_vx / end_vx
         if ratio < MIN_VISIBILITY_RATIO:
             continue
         center = inst_meta[iid]["center"]
@@ -545,8 +645,8 @@ def _rank_candidates(
             "instance_id":      iid,
             "category":         cat,
             "tier":             tier,
-            "pixel_count":      p_px,
-            "pixels_at_end":    end_px,
+            "voxel_count":      p_vx,
+            "voxels_at_end":    end_vx,
             "ratio":            ratio,
             "dist_partition_m": dist_p,
             "dist_end_m":       dist_e,
@@ -559,16 +659,16 @@ def _rank_candidates(
         return []
 
     # Sort by descending score (approach × size_weight). Tie-break on
-    # raw partition pixel count so a clearly-visible candidate beats
-    # an equally-scored barely-visible one.
+    # raw partition voxel count so a spatially-clear candidate beats an
+    # equally-scored barely-visible one.
     for c in candidates:
         c["score"] = _candidate_score(c)
-    candidates.sort(key=lambda c: (-c["score"], -c["pixel_count"]))
+    candidates.sort(key=lambda c: (-c["score"], -c["voxel_count"]))
     print(f"{debug_prefix}  candidates ranked by score "
-          f"(approach × min(1, p_px/{SIZE_SATURATION_PIXELS})) — {len(candidates)} total:")
+          f"(approach × min(1, p_vx/{SIZE_SATURATION_VOXELS})) — {len(candidates)} total:")
     for c in candidates:
         print(f"{debug_prefix}    iid={c['instance_id']:>4} cat={c['category']:<14s} "
-              f"tier={c['tier']:<11s} p_px={c['pixel_count']:>6d} e_px={c['pixels_at_end']:>6d} "
+              f"tier={c['tier']:<11s} p_vx={c['voxel_count']:>5d} e_vx={c['voxels_at_end']:>5d} "
               f"ratio={c['ratio']:.2f} approach={c['approach_m']:+.2f}m "
               f"score={c['score']:+.2f}")
     return candidates
@@ -686,8 +786,8 @@ def _resolve_label(
 
 
 def _pick_replacement_landmark(
-    partition_pixels: Dict[int, int],
-    end_pixels:       Dict[int, int],
+    partition_voxels: Dict[int, int],
+    end_voxels:       Dict[int, int],
     inst_meta:        Dict[int, Dict],
     partition_pos:    np.ndarray,
     end_pos:          np.ndarray,
@@ -721,8 +821,8 @@ def _pick_replacement_landmark(
       Return the first candidate that yields a usable label.
     """
     candidates = _rank_candidates(
-        partition_pixels=partition_pixels,
-        end_pixels=end_pixels,
+        partition_voxels=partition_voxels,
+        end_voxels=end_voxels,
         inst_meta=inst_meta,
         partition_pos=partition_pos,
         end_pos=end_pos,
@@ -753,8 +853,8 @@ def _pick_replacement_landmark(
         # category are visible at the partition pose? Tells downstream
         # consumers whether the synthesized landmark is ambiguous.
         cat_in_partition_fov = sum(
-            1 for iid, px in partition_pixels.items()
-            if px > 0 and inst_meta.get(iid, {}).get("category") == chosen["category"]
+            1 for iid, vx in partition_voxels.items()
+            if vx > 0 and inst_meta.get(iid, {}).get("category") == chosen["category"]
         )
         chosen["fov_instance_count"] = cat_in_partition_fov
         chosen["unique_in_fov"]      = cat_in_partition_fov == 1
@@ -953,8 +1053,8 @@ def main() -> None:
                 # Render at BOTH partition and end pose: selection is
                 # driven by the partition/end visibility *ratio* (must be
                 # at least MIN_VISIBILITY_RATIO) plus max distance
-                # change toward the instance, so we need both pixel
-                # counts up-front.
+                # change toward the instance, so we need both
+                # depth-unprojected voxel sets up-front.
                 try:
                     p_obs = checker.render_observation(
                         partition_pos.astype(np.float32), 0.0,
@@ -973,13 +1073,20 @@ def main() -> None:
 
                 p_sem = p_obs.get("semantic")
                 e_sem = e_obs.get("semantic")
-                if p_sem is None or e_sem is None:
+                p_depth = p_obs.get("depth")
+                e_depth = e_obs.get("depth")
+                if (p_sem is None or e_sem is None
+                        or p_depth is None or e_depth is None):
                     skipped_no_pos += 1
                     _failed("no_render")
                     continue
 
-                partition_pixels = _visible_instance_pixels(p_sem)
-                end_pixels       = _visible_instance_pixels(e_sem)
+                partition_voxels = _visible_instance_voxels(
+                    p_depth, p_sem, partition_pos, heading=0.0,
+                )
+                end_voxels = _visible_instance_voxels(
+                    e_depth, e_sem, end_pos, heading=0.0,
+                )
 
                 print(f"[{scan} ep={ep_id} sub={sub_idx}] rescue selection "
                       f"(orig_landmark={drop_rec.get('landmark')!r}):")
@@ -987,8 +1094,8 @@ def main() -> None:
                     run_dir / "viz_blacklist_rescue" / scan / str(ep_id)
                 )
                 pick = _pick_replacement_landmark(
-                    partition_pixels=partition_pixels,
-                    end_pixels=end_pixels,
+                    partition_voxels=partition_voxels,
+                    end_voxels=end_voxels,
                     inst_meta=inst_meta,
                     partition_pos=partition_pos,
                     end_pos=end_pos,
@@ -1094,7 +1201,8 @@ def main() -> None:
                     json.dump({
                         "scan":       scan,
                         "min_visibility_ratio":   MIN_VISIBILITY_RATIO,
-                        "size_saturation_pixels": SIZE_SATURATION_PIXELS,
+                        "voxel_size_m":           VOXEL_SIZE_M,
+                        "size_saturation_voxels": SIZE_SATURATION_VOXELS,
                         "referrable_table":       str(REFERRABLE_TABLE_PATH),
                         "vlm_model":              vlm_model if vlm_client else None,
                         "rescues":    scan_rescues,

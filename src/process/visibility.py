@@ -148,11 +148,6 @@ class VisibilityChecker:
             agent_cfg.height = env_cfg.get("height", 0.88)
             agent_cfg.radius = env_cfg.get("radius", 0.18)
 
-            # Depth is unused — strip it so Habitat-Sim doesn't allocate a
-            # depth render target.
-            if "depth_sensor" in agent_cfg.sim_sensors:
-                del agent_cfg.sim_sensors.depth_sensor
-
             pano_w = int(env_cfg.get("panorama_width", 1024))
             pano_h = pano_w // 2  # equirect: 2:1 aspect
             pano_overrides = {"width": pano_w, "height": pano_h}
@@ -161,6 +156,14 @@ class VisibilityChecker:
                               pano_overrides, self._sensor_h)
             _configure_sensor(agent_cfg.sim_sensors.semantic_sensor,
                               pano_overrides, self._sensor_h)
+            # Depth sensor (configured as equirectangular by
+            # configs/habitat/rgbds_sim.yaml). Used by point-cloud /
+            # voxel-based visibility scoring downstream — unproject
+            # equirect depth + semantic to get per-instance point
+            # clouds, then voxelise.
+            if "depth_sensor" in agent_cfg.sim_sensors:
+                _configure_sensor(agent_cfg.sim_sensors.depth_sensor,
+                                  pano_overrides, self._sensor_h)
 
         self._sim        = make_sim(sim_cfg.type, config=sim_cfg)
         self._scene_file = full_path
@@ -616,6 +619,9 @@ class VisibilityChecker:
         dict with:
           ``rgb``      — (H, W, 3) uint8  equirectangular RGB panorama
           ``semantic`` — (H, W)    int32  raw Habitat-Sim instance ids
+          ``depth``    — (H, W)    float32 radial distance from sensor
+                                            origin to first hit per ray
+                                            (equirectangular geometry)
           ``rgb_viz``  — alias for ``rgb`` (back-compat with viz.py callers)
         """
         if self._sim is None:
@@ -639,6 +645,11 @@ class VisibilityChecker:
             obs["rgb_viz"] = rgb            # alias for viz.py callers
         if "semantic" in raw:
             obs["semantic"] = np.asarray(raw["semantic"], dtype=np.int32)
+        if "depth" in raw:
+            d = np.asarray(raw["depth"], dtype=np.float32)
+            if d.ndim == 3 and d.shape[-1] == 1:
+                d = d[..., 0]
+            obs["depth"] = d
         return obs
 
     def render_rgb(self, pos: np.ndarray, heading: float) -> np.ndarray:
