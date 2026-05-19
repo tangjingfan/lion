@@ -1,12 +1,22 @@
-"""Find replacement landmarks for sub-paths dropped by 03_blacklist_landmark.
+"""Synthesize a replacement landmark when the original can't be grounded.
 
-The blacklist filter drops a sub-path when its instruction-derived
-landmark is too generic to ground ("wall", "door", "room", "doorway",
-...). This rescue does NOT recover the original landmark — it picks a
-**different** referrable landmark visible at the sub-path's end pose,
-producing a synthesized sub-instruction. Records flow through the rest
-of the pipeline marked ``synthesized = True`` so downstream consumers
-can choose to use or skip them.
+Two upstream conditions feed this rescue (both treated uniformly):
+
+  • ``origin = "blacklist"`` — step 02 dropped the sub because its
+    instruction-derived landmark is too generic to ground (``wall``,
+    ``door``, ``room``, ``doorway``, ...). Read from
+    ``filters/02_blacklist_dropped.yaml``.
+  • ``origin = "detection_failure"`` — step 09 YOLO-World (and the
+    optional VLM fallback) couldn't locate the original landmark in the
+    panorama. Read from the lifecycle audit's ``detection`` /
+    ``rescue_failed`` events.
+
+In both cases the original landmark is not recoverable, so we pick a
+**different** referrable landmark visible at the partition pose and
+emit a synthesized sub-instruction. Records flow through the rest of
+the pipeline marked ``synthesized = True`` with ``synthesized_from.origin``
+recording which upstream branch fed them, so downstream consumers can
+filter as they like.
 
 A good replacement landmark must:
 
@@ -24,10 +34,11 @@ A good replacement landmark must:
      unambiguous from where the agent stands when reading the
      instruction.
 
-Output: ``target_instances/{scan}/blacklist_rescue.json`` — one
-record per rescued sub-path. The consolidate step (11) reads this and
-emits synthesized rows into ``dataset.json`` alongside the original
-ones.
+Output: ``target_instances/{scan}/blacklist_rescue.json`` — one record
+per synthesized sub-path. The ``origin`` field on each record
+distinguishes the two upstream sources. The consolidate step (12) reads
+this file and emits synthesized rows into ``dataset.json`` alongside
+the original ones.
 
 Usage
 -----
@@ -108,16 +119,80 @@ def _load_yaml(path: Path) -> dict:
 
 def _blacklist_drops(filt_dir: Path) -> List[Tuple[int, int, Dict]]:
     """Return ``[(ep_id, sub_idx, drop_record), ...]`` from
-    ``02_blacklist_dropped.yaml``."""
+    ``02_blacklist_dropped.yaml``.
+
+    Each ``drop_record`` carries ``landmark`` + ``reason`` + ``origin =
+    "blacklist"`` so the synthesis loop can treat blacklist drops and
+    detection failures uniformly downstream.
+    """
     payload = _load_yaml(filt_dir / "02_blacklist_dropped.yaml")
     out: List[Tuple[int, int, Dict]] = []
     for ep_id_str, info in (payload.get("dropped") or {}).items():
         for sub_idx_str, rec in ((info or {}).get("subs") or {}).items():
             try:
-                out.append((int(ep_id_str), int(sub_idx_str), rec or {}))
+                out.append((
+                    int(ep_id_str),
+                    int(sub_idx_str),
+                    {**(rec or {}), "origin": "blacklist"},
+                ))
             except ValueError:
                 continue
     return out
+
+
+def _detection_failures(audit: dict) -> List[Tuple[int, int, Dict]]:
+    """Return ``[(ep_id, sub_idx, drop_record), ...]`` for every sub where
+    stage 09 (detection) emitted a ``rescue_failed`` event.
+
+    Same shape as :func:`_blacklist_drops` so they can be merged into one
+    candidate list. The original landmark and YOLO failure reason come
+    from the event payload (stage 09 records both); ``origin`` is set to
+    ``"detection_failure"`` so the synthesis output can distinguish the
+    two sources.
+    """
+    out: List[Tuple[int, int, Dict]] = []
+    for ep_id_str, ep in (audit.get("episodes") or {}).items():
+        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
+            failed = [
+                e for e in (sp.get("events") or [])
+                if e.get("stage") == "detection"
+                and e.get("action") == "rescue_failed"
+            ]
+            if not failed:
+                continue
+            last = failed[-1]
+            try:
+                ep_id = int(ep_id_str)
+                sub_idx = int(sub_idx_str)
+            except ValueError:
+                continue
+            out.append((ep_id, sub_idx, {
+                "landmark": last.get("landmark") or "",
+                "reason":   f"detection:{last.get('reason') or 'unknown'}",
+                "origin":   "detection_failure",
+            }))
+    return out
+
+
+def _merge_drops(
+    *sources: List[Tuple[int, int, Dict]],
+) -> List[Tuple[int, int, Dict]]:
+    """Concatenate drop lists and keep the first occurrence per (ep, sub).
+
+    Blacklist drops take precedence over detection failures (we list them
+    first at the call site), since a blacklisted sub never reaches step
+    09 — but guarding anyway in case the upstream order changes.
+    """
+    seen: set = set()
+    merged: List[Tuple[int, int, Dict]] = []
+    for source in sources:
+        for ep, sub, rec in source:
+            key = (ep, sub)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((ep, sub, rec))
+    return merged
 
 
 def _instance_meta_from_house(scenes_dir: str, scan: str) -> Dict[int, Dict]:
@@ -302,7 +377,11 @@ def _synth_sub_instruction(spatial: str, landmark_category: str) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Find replacement landmarks for blacklist-dropped sub-paths.",
+        description=(
+            "Synthesize a replacement landmark for sub-paths whose original "
+            "landmark can't be grounded — either dropped by 02_blacklist or "
+            "failed by 09_detection."
+        ),
     )
     ap.add_argument("--config", required=True)
     ap.add_argument("--exp", default=None,
@@ -329,9 +408,17 @@ def main() -> None:
     strip_stage_events(audit, STAGE_NAME)
 
     run_dir   = get_run_dir(cfg)
-    drops     = _blacklist_drops(filt_dir)
+    blacklist_drops = _blacklist_drops(filt_dir)
+    detection_fails = _detection_failures(audit)
+    drops           = _merge_drops(blacklist_drops, detection_fails)
+    n_bl  = len(blacklist_drops)
+    n_det = len(detection_fails)
+    print(
+        f"Synthesis candidates: {len(drops)}  "
+        f"({n_bl} from blacklist + {n_det} from detection-fail)"
+    )
     if not drops:
-        print("No blacklist drops to rescue.")
+        print("No candidates to rescue.")
         return
 
     # Pull every episode from the dataset so we can look up sub_paths /
@@ -385,6 +472,7 @@ def main() -> None:
                     append_sub_event(
                         ep_audit, sub_idx, stage=STAGE_NAME,
                         action="rescue_failed", reason=reason,
+                        origin=drop_rec.get("origin") or "blacklist",
                         original_landmark=drop_rec.get("landmark"),
                     )
 
@@ -514,7 +602,9 @@ def main() -> None:
                                 f"viz render failed: {exc}"
                             )
 
+                origin = drop_rec.get("origin") or "blacklist"
                 scan_rescues.setdefault(str(ep_id), {})[str(sub_idx)] = {
+                    "origin":               origin,
                     "original_landmark":    drop_rec.get("landmark"),
                     "original_reason":      drop_rec.get("reason"),
                     "new_landmark":         new_landmark,
@@ -533,6 +623,7 @@ def main() -> None:
                 }
                 append_sub_event(
                     ep_audit, sub_idx, stage=STAGE_NAME, action="synthesized",
+                    origin=origin,
                     new_landmark=new_landmark,
                     instance_id=int(pick["instance_id"]),
                     original_landmark=drop_rec.get("landmark"),
@@ -559,13 +650,34 @@ def main() -> None:
     finalize_audit(audit)
     save_audit(audit, filt_dir)
 
+    # Per-origin breakdown of the rescue verdict, so it's clear where
+    # the rescued landmarks (and the misses) came from.
+    by_origin: Dict[str, Dict[str, int]] = {}
+    for ep_id_str, ep in (audit.get("episodes") or {}).items():
+        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
+            for e in sp.get("events") or []:
+                if e.get("stage") != STAGE_NAME:
+                    continue
+                origin = e.get("origin") or "blacklist"
+                slot = by_origin.setdefault(origin, {"synthesized": 0, "rescue_failed": 0})
+                if e.get("action") == "synthesized":
+                    slot["synthesized"] += 1
+                elif e.get("action") == "rescue_failed":
+                    slot["rescue_failed"] += 1
+
     print()
-    print(f"=== blacklist rescue summary ===")
-    print(f"  total blacklist drops      : {len(drops)}")
-    print(f"  rescued                    : {rescued_count}")
+    print(f"=== landmark synthesis summary ===")
+    print(f"  candidates total           : {len(drops)}  "
+          f"({n_bl} blacklist + {n_det} detection-fail)")
+    print(f"  synthesized                : {rescued_count}")
     print(f"  skipped (no partition.json): {skipped_no_partition}")
     print(f"  skipped (no node position) : {skipped_no_pos}")
     print(f"  skipped (no fit candidate) : {skipped_no_candidate}")
+    if by_origin:
+        print(f"  by origin:")
+        for origin, counts in sorted(by_origin.items()):
+            print(f"    {origin:<20s} synthesized={counts['synthesized']}  "
+                  f"rescue_failed={counts['rescue_failed']}")
     print()
     for p in output_paths:
         print(f"  → {p}")

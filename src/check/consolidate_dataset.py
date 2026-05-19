@@ -257,8 +257,9 @@ def _build_record(
     rec["synthesized"] = is_synth
     if is_synth:
         rec["synthesized_from"] = {
+            "origin":            rescue_rec.get("origin") or "blacklist",
             "original_landmark": rescue_rec.get("original_landmark"),
-            "blacklist_reason":  rescue_rec.get("original_reason"),
+            "original_reason":   rescue_rec.get("original_reason"),
         }
     else:
         rec["synthesized_from"] = None

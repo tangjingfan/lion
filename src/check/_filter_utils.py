@@ -608,14 +608,20 @@ def _sub_verdict(events: List[dict]) -> Tuple[str, bool]:
       - ``selected``       → verdict := kept:<status>  (target found)
                              or labeled:<status>       (no target)
       - ``rescued``        → verdict := rescued:<method>
-      - ``synthesized``    → verdict := synthesized:<new_landmark>
+      - ``synthesized``    → verdict := synthesized:<new_landmark> (sticky:
+                             later ``excluded`` events from step 12 refer
+                             to the *original* record being skipped, not
+                             the synth replacement — they don't override)
       - ``rescue_failed``  → (informational; leaves prior verdict)
       - ``applied``        → (informational)
       - ``included``       → in_dataset := True
       - ``excluded``       → verdict := excluded:<reason>, in_dataset := False
+                             (suppressed when a ``synthesized`` event has
+                             already fired for the same cell)
     """
     verdict = "active"
     in_dataset = False
+    synth_seen = False
     for e in events:
         a = e.get("action")
         if a == "dropped":
@@ -634,11 +640,17 @@ def _sub_verdict(events: List[dict]) -> Tuple[str, bool]:
             verdict = f"rescued:{e.get('method') or 'rescued'}"
         elif a == "synthesized":
             verdict = f"synthesized:{e.get('new_landmark') or 'synth'}"
+            synth_seen = True
         elif a == "included":
             in_dataset = True
         elif a == "excluded":
-            verdict = f"excluded:{e.get('reason') or 'excluded'}"
-            in_dataset = False
+            # Step 12 emits one excluded event per skipped original
+            # record. When the same (ep, sub) was synthesized at step 11,
+            # the synth row replaces the original in dataset.json, so the
+            # excluded event isn't the final word.
+            if not synth_seen:
+                verdict = f"excluded:{e.get('reason') or 'excluded'}"
+                in_dataset = False
         # `kept`, `rescue_failed`, `applied` are informational; no-op.
     return verdict, in_dataset
 
