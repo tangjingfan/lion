@@ -1,0 +1,69 @@
+# 3-tier classification of MPCat40 categories for landmark synthesis
+# (consumed by src/check/rescue_blacklist.py, step 11).
+#
+# tier semantics
+# --------------
+# - too_generic — never pick as a landmark. Structural surfaces and
+#   passage markers ("walk to the wall" is not a useful instruction).
+# - collective  — coarse buckets that group many concrete things. Pick
+#   only if the VLM can refine the instance's actual identity from a
+#   rendered mask (e.g. "appliances" → "refrigerator").
+# - fine        — usable directly as the landmark name; the MPCat40
+#   token reads naturally as part of "walk to a X".
+#
+# regenerate via
+# --------------
+#   bash scripts/build_landmark_referrable.sh
+#
+# The build script asks an LLM to classify each MPCat40 token. The
+# response is parsed into this file; review the diff before committing.
+# Hand edits are fine — the build script is the suggested baseline, not
+# the source of truth.
+
+categories:
+  # ── too_generic (filtered out) ───────────────────────────────────────
+  void:         too_generic   # MP3D "no annotation" placeholder
+  wall:         too_generic
+  floor:        too_generic
+  ceiling:      too_generic
+  door:         too_generic   # passage, not destination
+  window:       too_generic   # part of wall
+  beam:         too_generic   # overhead structural
+  column:       too_generic   # structural; ambiguous as a destination
+  board_panel:  too_generic   # often a wall-mounted panel
+  misc:         too_generic   # MP3D catch-all
+
+  # ── collective (VLM refines from a rendered instance mask) ───────────
+  appliances:    collective
+  furniture:     collective
+  lighting:      collective
+  objects:       collective
+  clothes:       collective
+  gym_equipment: collective
+  seating:       collective
+
+  # ── fine (use as-is) ─────────────────────────────────────────────────
+  chair:             fine
+  table:             fine
+  picture:           fine
+  cabinet:           fine
+  cushion:           fine
+  sofa:              fine
+  bed:               fine
+  curtain:           fine
+  chest_of_drawers:  fine
+  plant:             fine
+  sink:              fine
+  stairs:            fine
+  toilet:            fine
+  stool:             fine
+  towel:             fine
+  mirror:            fine
+  tv_monitor:        fine
+  shower:            fine
+  bathtub:           fine
+  counter:           fine
+  fireplace:         fine
+  railing:           fine
+  shelving:          fine
+  blinds:            fine
