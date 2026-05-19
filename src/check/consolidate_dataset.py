@@ -483,6 +483,57 @@ def main() -> None:
         if r.get("landmark_visible"):
             n_visible += 1
 
+    # ── Walk audit for the explicit drop / rescue breakdown ────────────
+    # Goal: anyone running the pipeline knows exactly which (ep, sub)
+    # pairs didn't make it into dataset.json and why, without having to
+    # crack open audit.json by hand.
+    not_in_by_verdict: Dict[str, List[Tuple[str, str, str]]] = {}
+    synth_by_origin:   Dict[str, int] = {}
+    rescued_by_method: Dict[str, int] = {}
+    total_subs_in_audit  = 0
+    in_dataset_count     = 0
+    for ep_id_str, ep in (audit.get("episodes") or {}).items():
+        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
+            total_subs_in_audit += 1
+            events  = sp.get("events") or []
+            verdict = sp.get("verdict") or "(unknown)"
+            if sp.get("in_dataset"):
+                in_dataset_count += 1
+                # Tally synthesis origin / detection rescue method, if any.
+                synth_evt = next(
+                    (e for e in events if e.get("action") == "synthesized"),
+                    None,
+                )
+                if synth_evt:
+                    origin = synth_evt.get("origin") or "?"
+                    synth_by_origin[origin] = synth_by_origin.get(origin, 0) + 1
+                rescued_evt = next(
+                    (e for e in events if e.get("action") == "rescued"),
+                    None,
+                )
+                if rescued_evt:
+                    method = rescued_evt.get("method") or "?"
+                    rescued_by_method[method] = rescued_by_method.get(method, 0) + 1
+                continue
+            # Not in dataset — extract the landmark text for context.
+            # Cross-floor drops have no landmark (geometric only), so fall
+            # back to a Δy hint when present.
+            landmark = next(
+                (e.get("landmark") for e in events if e.get("landmark")),
+                None,
+            )
+            if not landmark:
+                y_range = next(
+                    (e.get("y_range_m") for e in events
+                     if e.get("stage") == "cross_floor"
+                     and e.get("y_range_m") is not None),
+                    None,
+                )
+                landmark = f"(Δy={y_range:.2f}m)" if y_range is not None else "?"
+            not_in_by_verdict.setdefault(verdict, []).append(
+                (ep_id_str, sub_idx_str, str(landmark)),
+            )
+
     print()
     print(f"=== consolidate summary ===")
     print(f"  records             : {n}")
@@ -492,11 +543,48 @@ def main() -> None:
     print(f"  with target_id      : {n_with_target}")
     print(f"  landmark visible    : {n_visible}")
     if n_skipped_unusable:
-        print(f"  dropped (unusable)  : {n_skipped_unusable}  (blacklist:* + visibility:no_match; synth records below replace those with a fit)")
+        print(f"  dropped (unusable)  : {n_skipped_unusable}  (blacklist:* / visibility:no_match / visibility:not_visible; replaced by synth records when step 11 found a fit)")
     print(f"  by target_status    :")
     for status, count in sorted(by_status.items(), key=lambda kv: -kv[1]):
         print(f"    {status:<25s} {count}")
+
+    # ── Rescue / synth breakdown ──
+    if rescued_by_method:
+        print()
+        print(f"  rescued via detection (step 09):")
+        for method, k in sorted(rescued_by_method.items(), key=lambda kv: -kv[1]):
+            print(f"    {method:<25s} {k}")
+    if synth_by_origin:
+        print()
+        print(f"  synthesized via landmark rescue (step 11) by origin:")
+        for origin, k in sorted(synth_by_origin.items(), key=lambda kv: -kv[1]):
+            print(f"    {origin:<25s} {k}")
+
+    # ── Explicit drop breakdown ──
+    n_not_in = total_subs_in_audit - in_dataset_count
+    if n_not_in:
+        print()
+        print(f"=== sub-paths NOT in dataset.json ({n_not_in}/{total_subs_in_audit} past cross_floor) ===")
+        # Group: hard cross_floor losses first (unrescuable), then
+        # excluded-and-no-rescue (could have been rescued but wasn't),
+        # then everything else.
+        def _sort_key(verdict: str) -> Tuple[int, str]:
+            if verdict.startswith("dropped:cross_floor"):
+                return (0, verdict)   # permanent loss — list first
+            if verdict.startswith("excluded:"):
+                return (1, verdict)   # rescue attempted, failed
+            return (2, verdict)
+        for verdict in sorted(not_in_by_verdict.keys(), key=_sort_key):
+            items = not_in_by_verdict[verdict]
+            print(f"  [{len(items)}]  {verdict}")
+            shown = items[:20]
+            for ep_id, sub_idx, landmark in shown:
+                print(f"      ep={ep_id:>6s} sub={sub_idx:<3s}  landmark={landmark!r}")
+            if len(items) > len(shown):
+                print(f"      … +{len(items) - len(shown)} more")
+
     if missing:
+        print()
         print(f"  ⚠ partition missing : {len(missing)} sub-paths")
         for m in missing[:5]:
             print(f"      {m}")
