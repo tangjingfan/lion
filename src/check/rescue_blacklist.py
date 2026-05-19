@@ -117,6 +117,15 @@ REFERRABLE_TABLE_PATH = (
 # read time."
 MIN_VISIBILITY_RATIO = 0.10
 
+# Score saturation point on partition-pose pixel count. Above this the
+# soft-size penalty contributes ``1.0``; below it the candidate's score
+# is linearly discounted. A 1024×512 panorama has ~524k pixels total,
+# so 2000 px is ~0.38% of FOV — the smallest area we still treat as
+# "clearly visible" (matches the absolute floor the old logic enforced
+# as a hard cut-off). Below that, an instance is small enough that a
+# huge approach distance no longer means it's a confident destination.
+SIZE_SATURATION_PIXELS = 2000
+
 # Confidence values from the VLM that count as "accept and use the
 # refined name". Anything else falls through to the next candidate.
 _VLM_ACCEPT_CONFIDENCES = {"high"}
@@ -439,6 +448,29 @@ def _visible_instance_pixels(sem_array: np.ndarray) -> Dict[int, int]:
     return {int(i): int(c) for i, c in zip(unique, counts) if int(i) >= 0}
 
 
+def _size_weight(partition_pixels: int) -> float:
+    """Soft penalty for visually-small instances at the partition pose.
+
+    Returns a multiplier in ``[0, 1]`` that saturates at
+    ``SIZE_SATURATION_PIXELS``. A 50-px speck gets weight ≈ 0.03, a
+    2000+ px landmark gets weight 1.0. Multiplied into the candidate
+    score, so a huge approach distance no longer compensates for an
+    invisible-from-here destination.
+    """
+    return min(1.0, max(0.0, partition_pixels) / float(SIZE_SATURATION_PIXELS))
+
+
+def _candidate_score(c: Dict) -> float:
+    """Selection score for one candidate.
+
+    ``approach × size_weight``. Maximised to pick the best landmark:
+    we still want the instance the agent walks toward the most, but
+    that signal is muted when the instance is barely visible at the
+    instruction-read pose.
+    """
+    return c["approach_m"] * _size_weight(c["pixel_count"])
+
+
 def _rank_candidates(
     partition_pixels: Dict[int, int],
     end_pixels:       Dict[int, int],
@@ -449,13 +481,17 @@ def _rank_candidates(
     debug_prefix:     str = "",
 ) -> List[Dict]:
     """Geometric-filter all instances and return candidates sorted by
-    descending approach.
+    descending score.
 
     Per-candidate filters (all must pass):
       1. instance has a known MPCat40 category
       2. ratio = partition_pixels / end_pixels >= MIN_VISIBILITY_RATIO
       3. dist_partition > dist_end (agent walks toward the instance)
       4. tier(cat) != "too_generic"
+
+    Survivors are ranked by ``score = approach_m × size_weight``, where
+    ``size_weight`` saturates at ``SIZE_SATURATION_PIXELS`` so tiny
+    instances can't ride a long approach to the top of the list.
 
     No VLM is called here — that happens at pick time in
     :func:`_pick_replacement_landmark`, only for the candidate(s) we
@@ -522,13 +558,19 @@ def _rank_candidates(
               f"(too_generic, ratio < {MIN_VISIBILITY_RATIO:.2f}, or not approaching)")
         return []
 
-    # Sort: max approach, tie-break on partition pixel count.
-    candidates.sort(key=lambda c: (-c["approach_m"], -c["pixel_count"]))
-    print(f"{debug_prefix}  candidates ranked by approach ({len(candidates)}):")
+    # Sort by descending score (approach × size_weight). Tie-break on
+    # raw partition pixel count so a clearly-visible candidate beats
+    # an equally-scored barely-visible one.
+    for c in candidates:
+        c["score"] = _candidate_score(c)
+    candidates.sort(key=lambda c: (-c["score"], -c["pixel_count"]))
+    print(f"{debug_prefix}  candidates ranked by score "
+          f"(approach × min(1, p_px/{SIZE_SATURATION_PIXELS})) — {len(candidates)} total:")
     for c in candidates:
         print(f"{debug_prefix}    iid={c['instance_id']:>4} cat={c['category']:<14s} "
               f"tier={c['tier']:<11s} p_px={c['pixel_count']:>6d} e_px={c['pixels_at_end']:>6d} "
-              f"ratio={c['ratio']:.2f} approach={c['approach_m']:+.2f}m")
+              f"ratio={c['ratio']:.2f} approach={c['approach_m']:+.2f}m "
+              f"score={c['score']:+.2f}")
     return candidates
 
 
@@ -719,7 +761,9 @@ def _pick_replacement_landmark(
         print(f"{debug_prefix}  → picked iid={chosen['instance_id']} "
               f"name={chosen['new_landmark']!r} "
               f"(source={chosen['new_landmark_source']}, "
-              f"cat={chosen['category']!r}, approach={chosen['approach_m']:+.2f}m)")
+              f"cat={chosen['category']!r}, "
+              f"approach={chosen['approach_m']:+.2f}m, "
+              f"score={chosen.get('score', 0.0):+.2f})")
         return chosen
 
     print(f"{debug_prefix}  → no candidate produced a usable label "
@@ -1049,9 +1093,10 @@ def main() -> None:
                 with open(out_path, "w") as f:
                     json.dump({
                         "scan":       scan,
-                        "min_visibility_ratio": MIN_VISIBILITY_RATIO,
-                        "referrable_table":     str(REFERRABLE_TABLE_PATH),
-                        "vlm_model":            vlm_model if vlm_client else None,
+                        "min_visibility_ratio":   MIN_VISIBILITY_RATIO,
+                        "size_saturation_pixels": SIZE_SATURATION_PIXELS,
+                        "referrable_table":       str(REFERRABLE_TABLE_PATH),
+                        "vlm_model":              vlm_model if vlm_client else None,
                         "rescues":    scan_rescues,
                     }, f, indent=2)
                 output_paths.append(out_path)
