@@ -6,21 +6,32 @@ Landmark-RxR rollout + dataset-curation pipeline adapted from LION-Bench.
 Habitat-Lab's `rgbds_agent` provides `rgb`, `depth`, and `semantic`
 observations.
 
-This README walks through the four core stages end-to-end:
+This README walks through the five core stages end-to-end:
 
 1. **Rollout** — drive the agent through every selected episode.
-2. **Filter pipeline 00-04** — narrow `(instruction_id, sub_idx)` pairs
-   down to the ones worth grounding.
-3. **Target instance selection** — fix one MP40 instance id per
-   surviving sub-path as the navigation target.
-4. **VLM pixel-grounded rescue** — recover coarse MPCAT40 targets
-   (`appliances` / `lighting` / …) into fine categories (`stove` /
-   `lamp` / …) via YOLO-World; VLM as fallback.
-5. **Blacklist rescue + consolidate** — re-ground sub-paths whose
-   landmark was too generic (`wall` / `door` / `room`) by picking a
-   different referrable instance visible at the sub-path end, then
-   stitch every surviving sub-trajectory (original + synthesized) into
-   one `dataset.json`.
+2. **Filter pipeline 00-04** — record / cross-floor / rewrite /
+   blacklist-label / partition. After cross-floor (the only hard
+   drop), later stages **label** sub-paths via `survivor.sub_status`
+   instead of removing them, so rescue paths can still reach them.
+3. **Target instance selection (05-08)** — build a per-scan
+   vocabulary, refine the mention→label mapping, annotate visibility
+   at the partition pose, and pick one MP40 instance id per
+   surviving sub-path.
+4. **Detection rescue (09-10)** — for sub-paths whose original
+   landmark didn't ground to a fine MPCat40 category, run YOLO-World
+   (optionally VLM as fallback) on the partition-pose panorama, then
+   fan the hits back into `target_instances.json`.
+5. **Landmark synthesis + consolidate (11-13)** — for sub-paths still
+   un-grounded (blacklist drops + detection failures), pick a
+   **different** referrable instance visible at the partition pose
+   and rewrite the instruction. Then stitch every surviving
+   sub-trajectory (original + synthesized) into one `dataset.json`
+   and print an attrition report.
+
+`scripts/run_all.sh --exp "$SEL"` runs 00→13 in one shot;
+`scripts/14_inspection_viz.sh` is an opt-in step that renders one
+per-sub PNG annotated with its current pipeline status (read-only,
+not in the default chain).
 
 ## Setup
 
@@ -92,24 +103,29 @@ geometry rather than the reference path.
 ## 2. Filter pipeline (steps 00-04)
 
 The filter pipeline narrows `(instruction_id, sub_idx)` pairs down to
-the ones worth grounding. Run steps 00-04 first; the final filter
-(step 10) runs after target instance selection.
+the ones worth grounding. Run steps 00-04 first; the rescue / synthesis
+stages (09-12) run after target instance selection.
 
 Each stage overwrites a single canonical `results/{run}/survivor.yaml`
-that captures the current narrower set. Diagnostics live under
-`filters/`:
+that captures the current state. Diagnostics + cross-stage trace live
+under `filters/`:
 
 ```
-{run}/survivor.yaml                  # selection-compatible survivor
-                                     # list; downstream tools auto-merge
-                                     # this on top of any --exp argument
+{run}/survivor.yaml                  # canonical state — sub_paths +
+                                     # sub_status label channel.
+                                     # downstream tools auto-merge it
+                                     # on top of any --exp argument
 {run}/filters/NN_{name}_dropped.yaml # per-stage drops + reasons (debug)
-{run}/filters/audit.json             # per-(ep, sub) status across stages
+{run}/filters/audit.json             # per-(ep, sub) lifecycle events
+                                     # — see "Reading the audit"
 ```
 
-The stages are **pure filter** — each one accepts the current survivor
-set and emits a smaller one. Vocabulary prep + visibility live in
-step 3.
+**Cross-floor is the only hard drop.** Past stage 01, every surviving
+sub-path stays in `survivor.sub_paths`; later stages **label** failures
+into `survivor.sub_status[ep_id][sub_idx]` (e.g.
+`"blacklist:llm_keep_false"`, `"partition:rewrite_error"`) rather than
+deleting the sub. This keeps labeled drops reachable to the rescue
+paths (steps 09 / 11) and to inspection tooling.
 
 The `--exp` flag accepts either a selection YAML path (e.g.
 `configs/selection/val_unseen/one_scene_partial.yaml`) or a bare
@@ -120,26 +136,33 @@ without the user passing it explicitly.
 Execution order:
 
 ```text
-filter steps 00-04 (record / multi_floor / rewrite / blacklist / partition)
+filter 00-04 (record / cross_floor / rewrite / blacklist-label / partition)
         │
         ▼
-target instance selection (step 3, scripts 05-08)
+target instance selection 05-08 (vocab / refine / visibility / select)
         │
         ▼
-VLM pixel-grounded rescue (step 4, script 09)
+detection rescue 09 (YOLO-World, optional VLM fallback)
         │
         ▼
-apply rescue back into target_instances.json (step 4, script 10)
+apply detection rescue back into target_instances.json (10)
         │
         ▼
-blacklist rescue: find replacement landmarks (step 5, script 11)
+landmark synthesis 11 (blacklist drops + detection failures →
+                       replacement landmark via voxels + VLM)
         │
         ▼
-consolidate (originals + synthesized) → dataset.json (step 5, script 12)
+consolidate (originals + synthesized) → dataset.json (12)
         │
         ▼
-attrition report (step 5, script 13 — runnable anytime)
+attrition report (13 — runnable anytime)
+        │
+        ▼
+inspection viz (14 — opt-in; per-sub status thumbnails)
 ```
+
+`scripts/run_all.sh --exp "$SEL"` chains 00→13 with the right flags.
+`--from NN` / `--to NN` re-runs a sub-range; pass `--dry` to preview.
 
 #### 2.0 Snapshot (drops nothing)
 
@@ -209,11 +232,66 @@ Partition reads `rollout_viz/{scan}/frames.jsonl` when present. It
 accumulates signed rollout turn angles (`TURN_RIGHT` positive,
 `TURN_LEFT` negative). If `|cumulative turn| >= turn_thresh_deg` before
 the forward-distance cutoff, the sub-path is treated as "with turn" and
-the partition is placed after another 0.3 m of forward motion from that
-threshold-crossing step. Otherwise it is treated as move-forward and
-cut after 0.3 m from the start of the rollout sub-path segment. If
-rollout frames are missing, it falls back to the reference path using
-the same distance threshold.
+the partition is placed after another `forward_distance_m` of forward
+motion from that threshold-crossing step. Otherwise it is treated as
+move-forward and cut after `forward_distance_m` from the start of the
+rollout sub-path segment. If rollout frames are missing, it falls back
+to the reference path using the same distance threshold.
+
+`forward_distance_m` defaults to **0.5 m** ([configs/partition/partition.yaml](configs/partition/partition.yaml)).
+This is one short step past the turn — far enough that doorframes /
+wall corners no longer occlude the destination, but close enough that
+the partition pose still represents the "agent reads the instruction"
+moment.
+
+#### 2.5 Reading the lifecycle audit
+
+`filters/audit.json` is the single per-(ep, sub) trace covering every
+stage from 00 through 12. Each episode entry holds:
+
+```json
+"1239": {
+  "scan":     "X7HyMhZNoso",
+  "language": "en-IN",
+  "events":   [{ "stage": "cross_floor", "action": "kept", ... }],
+  "verdict":  "kept",
+  "sub_paths": {
+    "2": {
+      "events": [
+        {"stage": "blacklist",        "action": "dropped",       "reason": "llm_keep_false"},
+        {"stage": "rescue_blacklist", "action": "synthesized",   "new_landmark": "fridge"},
+        {"stage": "consolidate",      "action": "included",      "synthesized": true}
+      ],
+      "verdict":    "synthesized:fridge",
+      "in_dataset": true
+    }
+  }
+}
+```
+
+Two-field summary first (`verdict` + `in_dataset`); events for the
+deep dive. Common queries:
+
+```bash
+RUN=results/val_unseen_one_scene_partial
+
+# what's in dataset.json, broken down by verdict
+jq -r '.episodes[] | .sub_paths[]
+       | select(.in_dataset) | .verdict' "$RUN/filters/audit.json" \
+       | sort | uniq -c | sort -rn
+
+# everything the pipeline couldn't keep
+jq -r '.episodes | to_entries[] | .key as $ep | .value.sub_paths
+       | to_entries[] | select(.value.in_dataset == false)
+       | "\($ep)#\(.key)  \(.value.verdict)"' "$RUN/filters/audit.json"
+
+# trace one specific (ep, sub)
+jq '.episodes["1239"].sub_paths["2"]' "$RUN/filters/audit.json"
+```
+
+`scripts/13_attrition.sh --exp "$SEL"` consolidates the same info into
+a per-stage funnel + rescue breakdown — runnable anytime, doesn't
+modify any state.
 
 ## 3. Target instance selection
 
@@ -288,10 +366,10 @@ same pose by default.
 
 ```bash
 bash scripts/07_list_potential_instances.sh --exp "$SEL"
-# skip the per-candidate viz PNGs (faster):
-bash scripts/07_list_potential_instances.sh --exp "$SEL" --no_save_viz
-# tighten the pixel threshold per instance:
-bash scripts/07_list_potential_instances.sh --exp "$SEL" --min_pixel_count 100
+# also render per-candidate viz PNGs (slower):
+bash scripts/07_list_potential_instances.sh --exp "$SEL" --save_viz
+# loosen the pixel threshold per instance (default 2000):
+bash scripts/07_list_potential_instances.sh --exp "$SEL" --min_pixel_count 1000
 ```
 
 Reads:
@@ -305,11 +383,18 @@ Writes:
   `landmark`, `semantic_labels`, `matched_category`,
   `matched_categories`, `matched_by`, `pixel_count`, `pixel_fraction`,
   `candidates[]` (each `{id, category, n_pixels}` plus `viz_path` and
-  `viz_visible_pixels` when viz is on), and `uniqueness` ∈ {`unique`,
-  `ambiguous`, `not_visible`, `no_match`, `partition_pos_unresolvable`}.
+  `viz_visible_pixels` when viz is on), and two split fields:
+  - `visibility` ∈ {`visible`, `not_visible`, `no_match`,
+    `partition_pos_unresolvable`} — whether the landmark is reachable
+    from this pose at all.
+  - `uniqueness` — `True` / `False` when visible (exactly-1 vs >1
+    matching instance), or the string `"not_visible"` mirroring the
+    visibility tag so downstream code never has to check visibility
+    separately to know there's nothing to pick.
 - `target_instances/viz/X7HyMhZNoso/{ep}/sub_{NNN}_cand_{IID}.png` —
   one RGB + semantic panorama per visible candidate, rendered at the
-  partition point with a target-mask strip below.
+  partition point with a target-mask strip below. **Default off** —
+  pass `--save_viz` to opt in.
 
 ### 3d. Choose the target instance
 
@@ -352,7 +437,7 @@ Writes:
   — when Habitat rendering is available, an RGB + semantic panorama at
   the sub-path end node with the chosen instance highlighted.
 
-## 4. VLM pixel-grounded rescue (final step)
+## 4. Detection rescue (step 09)
 
 Recover MPCAT40-coarse targets (`appliances` / `lighting` / `objects` /
 …) into fine categories (`stove` / `refrigerator` / `lamp` / …) via
@@ -360,23 +445,24 @@ open-vocabulary detection. Primary path is YOLO-World; the VLM is only
 used as a fallback when the detector returns nothing (off by default).
 
 Inputs: 3c's `target_instances/{scan}/target_instances.json` + rollout
-`frames.jsonl`. Pipeline: pick sub-paths grounded only to coarse semantic
-labels → re-render an RGB and raw semantic panorama at the same pose →
-prompt YOLO-World with the landmark phrase plus synonym expansions
-(`fridge → {fridge, refrigerator}`, `stove → {stove, oven, cooktop,
-range, ...}`) → for each detection (highest score first), query the
-semantic buffer with category-aware instance recovery, preferring
-instances inside the bbox whose MPCat40 name is the coarse bucket
-containing the detector's fine class (e.g. an `appliances` instance when
-the detector says `stove`); the first detection that yields a
-category-matched instance wins. This can rescue examples with
-`target_instance_ids: []` because the instance id comes from the
-detection box.
+`frames.jsonl`. Pipeline: pick sub-paths grounded only to coarse
+semantic labels (or with no MPCat40 match at all) → re-render RGB +
+raw semantic panorama at the partition pose → prompt YOLO-World with
+the landmark phrase as a single CLIP-encoded class → take the
+top-scored detection's bbox and query the semantic buffer for the
+**bbox-majority instance** (the MP3D instance covering the most
+pixels inside the box). This rescues examples with empty
+`target_instance_ids` since the instance id comes from the detection
+box, not the original mapping.
 
 The recorded `category` in the rescue output is the **landmark phrase
 from the instruction** (the same word that was passed to YOLO as the
 prompt), not the detector's own class name. So `stove` stays `stove`
 even when YOLO-World fires the `cooktop` class.
+
+Sub-paths where YOLO finds nothing (or no MP3D instance is recovered
+from the bbox) emit a `rescue_failed` event into the lifecycle audit;
+step 11 picks them up and tries landmark synthesis instead.
 
 ```bash
 # Dry run — see which coarse sub-paths will be sent to the detector:
@@ -475,79 +561,138 @@ Writes:
   `synthesized ∈ {false, true}` field so consumers
   can filter on provenance.
 
-### Blacklist rescue (synthesizing replacement landmarks)
+### Landmark synthesis (step 11)
 
-A sibling rescue for sub-paths the **blacklist** filter (`03`) cut —
-those where the instruction-derived landmark was too generic ("wall",
-"door", "room", "doorway", ...). Instead of re-grounding the original
-landmark, this step picks a **different** referrable instance visible
-at the sub-path end pose and synthesizes a new sub-instruction.
+A second rescue for sub-paths whose original landmark can't be
+grounded. Unlike step 09 (which tries to *find* the original
+landmark), this step **replaces** it: pick a different referrable
+instance visible at the partition pose and rewrite the
+sub-instruction. Records flow into `dataset.json` with
+`synthesized = true`.
+
+Two upstream sources feed in, both handled uniformly:
+
+- `origin: "blacklist"` — sub-paths labeled by step 02 because the
+  instruction-derived landmark was too generic ("wall", "door",
+  "room", "doorway", ...). Read from `filters/02_blacklist_dropped.yaml`.
+- `origin: "detection_failure"` — sub-paths where step 09 YOLO / VLM
+  couldn't locate the original landmark. Read from the lifecycle
+  audit's `detection` / `rescue_failed` events.
 
 ```bash
 bash scripts/11_rescue_blacklist.sh --exp "$SEL"
 bash scripts/12_consolidate.sh --exp "$SEL"   # re-run after rescue
 ```
 
-#### Selection logic ([src/check/rescue_blacklist.py:168-228](src/check/rescue_blacklist.py#L168-L228))
+#### Pipeline
 
-For each dropped sub-path, render a 360° semantic panorama at the
-**end pose** (last node of `landmark_path`) and feed the per-instance
-pixel counts into `_pick_replacement_landmark`. The function returns
-either a chosen instance or `None`.
+1. Render an RGB + depth + semantic equirectangular panorama at BOTH
+   the partition pose and the end pose.
+2. Unproject the equirect depth + semantic into a world-frame 3D point
+   cloud per instance (pure numpy — no open3d dependency).
+3. Voxelise at `VOXEL_SIZE_M = 0.10 m`; count distinct voxels per
+   instance per pose. Voxel counts measure the spatial extent of the
+   visible surface, decoupled from how close the agent happens to be —
+   cleaner than pixel counts, which conflate size with proximity.
+4. Geometric filters (a candidate must pass all):
+   - `voxels(partition) / voxels(end) ≥ MIN_VISIBILITY_RATIO = 0.10`
+     — at least 10% of the destination view must already be on
+     screen at instruction-read time.
+   - `dist(partition, center) > dist(end, center)` — agent walks
+     toward, not past.
+   - Category tier ≠ `too_generic` (see referrability table below).
+5. Sort survivors by descending score:
 
-**Hard filters (each candidate must pass all four):**
+   ```
+   score = approach_m × min(1, partition_voxels / SIZE_SATURATION_VOXELS=200)
+   ```
 
-1. **Pixel threshold** — visible at the end pose with at least
-   `MIN_VISIBLE_PIXELS = 200` pixels in the 360° pano (rejects
-   instances that are too far / too occluded to be a usable target).
-2. **Category in scene metadata** — the `instance_id` must resolve to
-   a category via the cached `.house` parse (safety check; rare
-   semantic-sensor / .house mismatches are skipped).
-3. **Category not blacklisted** — not in `{wall, floor, ceiling, door,
-   window, doorway, railing, blinds, curtain, misc, void}`.
-4. **Progressively approached** — `dist(partition, center) -
-   dist(end, center) ≥ APPROACH_THRESHOLD_M = 0.5 m`. Confirms the
-   agent was actually moving towards this instance along the landmark
-   half. Only the two endpoints of the sub-path are sampled — a
-   zigzag trajectory could in principle slip through, but sub-paths
-   are short enough in practice.
+   The `size_weight` factor mutes the approach signal when the
+   instance occupies few voxels at the instruction-read pose, so a
+   tiny speck with a huge approach distance can't outrank a clearly-
+   visible nearby landmark.
+6. Walk the sorted candidates. Per candidate:
+   - **`fine` tier** → use the MPCat40 token directly and commit.
+   - **`collective` tier** → render a highlighted instance mask, ask
+     the VLM to identify it specifically; accept its free-text answer
+     when confidence is `high`, else fall through to the next
+     candidate.
 
-Each survivor records `{instance_id, category, pixel_count,
-dist_partition_m, dist_end_m, approach_m}`. A side counter
-`cat_visible_count` tallies survivors per category — used by Tier 1
-below.
+   Return the first candidate that yields a usable name. If all
+   collective candidates come back `unknown`, emit `rescue_failed`.
 
-**Tiered selection (each tier narrows the pool; falls back when empty):**
+#### Referrability table
 
-| Tier | Rule | Why |
+`configs/landmark_referrable.yaml` classifies every MPCat40 category
+into one of three tiers:
+
+| Tier | Categories | Behaviour |
 |---|---|---|
-| **1. View-uniqueness** | Keep only candidates whose category has exactly one survivor in the FOV (`cat_visible_count[cat] == 1`). | "Walk to **the** bed" is unambiguous only if one bed is visible at this vantage. |
-| **2. Concrete category** | Drop candidates whose category is in `COARSE_BUCKETS = {appliances, objects, furniture, lighting}`. | Coarse buckets aren't good landmark words on their own — "walk to the lighting" reads weird. Prefer a finer category. |
-| **3. Closest + most prominent** | Sort ascending by `(dist_end_m, -pixel_count)`. | The target should be near where the agent stops; pixel count breaks ties. We sort by distance-to-end (not by approach magnitude) because the destination, not the biggest mover, defines the landmark. |
+| `too_generic` | wall, floor, ceiling, door, window, beam, column, board_panel, void, misc | Never picked. |
+| `collective` | appliances, furniture, lighting, objects, clothes, gym_equipment, seating | Picked only when the VLM gives a confident specific name. |
+| `fine` | chair, sofa, bed, fridge, stairs, sink, railing, ... | Picked directly using the MPCat40 token. |
 
-The `or pool` fallback (`pool = unique_view or candidates`, `pool =
-fine or pool`) means each tier is **best-effort, not mandatory** —
-if no candidate satisfies the tighter rule, we use the previous tier's
-pool. This avoids returning `None` just because nothing happens to be
-unique in the FOV.
+The table is committed to the repo and hand-editable. Regenerate via
+one LLM call:
 
-The final `chosen` dict gets four extra fields written in:
+```bash
+GEMINI_API_KEY=... bash scripts/build_landmark_referrable.sh
+```
 
-- `scene_instance_count` — total instances of this category in the whole scan
-- `fov_instance_count`   — survivor count of this category at this vantage
-- `unique_in_fov`        — `fov_instance_count == 1`
-- `unique_in_scene`      — `scene_instance_count == 1`
+Review the diff before committing — minor tier flips are normal
+across LLM runs.
 
-Both `unique_in_*` flags flow through to `dataset.json`'s
-`synthesized_from` block so downstream filtering can use them.
+#### VLM refinement (collective tier)
+
+For each `collective` candidate, an instance-highlight PNG is rendered
+at the partition pose and sent to the VLM with:
+
+> "The highlighted region shows a single instance whose coarse
+> MPCat40 category is `<bucket>`. Identify the object more
+> specifically. Return JSON `{name, confidence, reason}` with name as
+> a 1-3 word noun phrase usable in 'walk to a <name>'."
+
+Free-text output — no MPCat40 constraint. Accepted when
+`confidence == "high"` AND the name isn't just the bucket token
+repeated. Per-instance VLM responses are cached at
+`target_instances/<scan>/vlm_instance_labels.json` so repeated runs
+over the same scan don't re-pay the cost.
+
+CLI:
+
+- `--no_vlm_refine` — skip the VLM step (collective candidates always
+  fall through; only `fine` candidates can win).
+- `--vlm_model` — default `gemini-2.5-pro`.
+- `--vlm_api_key` — falls back to `GEMINI_API_KEY` env var. With no
+  key configured, VLM silently disables itself and pipeline runs as
+  if `--no_vlm_refine` was set.
 
 #### Outputs
 
-- `target_instances/{scan}/blacklist_rescue.json` — side-car per scan
-  with the replacement landmark, the synthesized sub-instruction
-  (currently a simple template `"<spatial>. Walk to a <landmark>."`),
-  the new target instance id, and approach / uniqueness stats.
+`target_instances/{scan}/blacklist_rescue.json` — one record per
+synthesized sub-path:
 
-The consolidate step then emits these as additional records in
-`dataset.json` with `synthesized = true` and a
-`synthesized_from` block carrying the original landmark + drop reason.
+```json
+{
+  "origin":               "blacklist" | "detection_failure",
+  "original_landmark":    "<text>",
+  "original_reason":      "blacklist:llm_keep_false" | "detection:no_detection" | ...,
+  "new_landmark":         "refrigerator",
+  "new_landmark_source":  "mpcat40" | "vlm",
+  "new_mpcat40":          "appliances",   // underlying coarse category
+  "new_instance_id":      42,
+  "new_sub_instruction":  "Turn right. Walk to a refrigerator.",
+  "spatial_instruction":  "Turn right.",
+  "visibility":           "visible",
+  "uniqueness":           true,
+  "vlm":                  null | {"confidence": "high", "model": "...", "reason": "..."}
+}
+```
+
+The header records the active hyperparameters
+(`voxel_size_m`, `size_saturation_voxels`, `min_visibility_ratio`,
+`referrable_table`, `vlm_model`) for traceability.
+
+The consolidate step emits these as additional records in
+`dataset.json` with `synthesized = true` and a `synthesized_from`
+block carrying `{origin, original_landmark, original_reason}`.
