@@ -18,21 +18,23 @@ the pipeline marked ``synthesized = True`` with ``synthesized_from.origin``
 recording which upstream branch fed them, so downstream consumers can
 filter as they like.
 
-A good replacement landmark must:
+Selection algorithm (per candidate sub-path):
 
-  1. Be visible at the sub-path **partition pose** (where the agent
-     finishes the spatial turn and reads the synthesized "walk to a X"
-     instruction — that's when it needs to identify the target).
-  2. Be **progressively approached** along the landmark half — i.e.
-     ``distance(end_pos, instance_center) < distance(partition_pos, instance_center)``.
-     This is purely geometric (uses .house centers) — confirms the agent
-     walks toward the target rather than away.
-  3. Have a concrete MPCAT40 category (not ``wall`` / ``door`` /
-     ``window`` / ``floor`` / ``ceiling`` / etc.).
-  4. Be referrable — preferentially a category that has **exactly one**
-     visible instance at the partition pose, so saying "go to the X" is
-     unambiguous from where the agent stands when reading the
-     instruction.
+  1. Render a 360° semantic panorama at BOTH the partition pose and
+     the end pose; count per-instance pixels at each.
+  2. Visibility filter — require
+     ``partition_pixels[iid] / end_pixels[iid] >= MIN_VISIBILITY_RATIO``
+     (10%). The agent reads "walk to a X" at the partition pose, so X
+     must already be at least somewhat on screen there. A landmark
+     that only materialises once you arrive isn't usable.
+  3. Approach filter — require ``dist_partition > dist_end`` (geometric,
+     using ``.house`` instance centers in Habitat coords). The agent
+     must be walking *toward* the instance, not past it.
+  4. Pick the candidate with the **largest** approach
+     ``dist_partition - dist_end``. Tie-break by larger partition pixel
+     count (more visible at instruction-read time).
+  5. Static guard: category exists and is not in
+     ``LANDMARK_BLACKLIST_CATS`` (wall, floor, door, window, ...).
 
 Output: ``target_instances/{scan}/blacklist_rescue.json`` — one record
 per synthesized sub-path. The ``origin`` field on each record
@@ -52,7 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,23 +93,14 @@ LANDMARK_BLACKLIST_CATS = {
     "blinds", "curtain", "misc", "void",
 }
 
-# Coarse buckets that we'd prefer NOT to pick because they're not
-# "concrete enough" on their own. We tolerate them only when nothing
-# better is approached.
-COARSE_BUCKETS = {
-    "appliances", "objects", "furniture", "lighting",
-}
-
-# A landmark must get at least this much closer between partition and
-# end pose to count as "progressively approached" (metres).
-APPROACH_THRESHOLD_M = 0.5
-
-# An instance must have at least this many visible pixels at the
-# partition pose to be considered a viable replacement landmark.
-# 2000 px in a 1024×512 panorama (~0.38% of FOV) is the minimum visible
-# region we treat as a real, recognisable landmark — smaller regions
-# tend to be too easy to miss when reading the synthesized instruction.
-MIN_VISIBLE_PIXELS = 2000
+# A candidate landmark must be at least this fraction as visible at
+# the partition pose as it is at the end pose. The intuition: when the
+# agent reads "walk to a X", they must already be able to see X
+# clearly enough — a destination that's invisible from where the
+# instruction is read isn't a usable landmark. 0.10 means "at least
+# 10% of the eventual pixel area is already on screen at instruction-
+# read time."
+MIN_VISIBILITY_RATIO = 0.10
 
 
 def _load_yaml(path: Path) -> dict:
@@ -265,105 +258,121 @@ def _visible_instance_pixels(sem_array: np.ndarray) -> Dict[int, int]:
 
 
 def _pick_replacement_landmark(
-    visible_pixels:    Dict[int, int],
-    inst_meta:         Dict[int, Dict],
-    partition_pos:     np.ndarray,
-    end_pos:           np.ndarray,
-    scene_category_counts: Counter,
-    debug_prefix:      str = "",
+    partition_pixels: Dict[int, int],
+    end_pixels:       Dict[int, int],
+    inst_meta:        Dict[int, Dict],
+    partition_pos:    np.ndarray,
+    end_pos:          np.ndarray,
+    debug_prefix:     str = "",
 ) -> Optional[Dict]:
     """Choose a single replacement landmark, or None if no candidate fits.
 
-    ``visible_pixels`` is the ``{instance_id: pixel_count}`` map from the
-    semantic panorama rendered **at the partition pose** — selection is
-    grounded in what the agent can see when it reads the synthesized
-    "walk to a X" instruction.
+    Two filters then one pick:
 
-    Selection priority:
-      1. category not in LANDMARK_BLACKLIST_CATS
-      2. progressively approached: ``dist(end) < dist(partition) - APPROACH_THRESHOLD_M``
-         (geometric, uses .house instance centers)
-      3. visible >= MIN_VISIBLE_PIXELS at the **partition pose**
-      4. prefer category with exactly 1 visible instance in the partition
-         FOV (unambiguous "the X" reference at instruction-read time)
-      5. among ties, prefer non-coarse-bucket
-      6. final tiebreak: balance proximity-to-end against visual prominence
+      1. **Visibility ratio.** For each instance visible at the end pose,
+         compare its pixel count at the partition pose:
+
+             ratio = partition_pixels[iid] / end_pixels[iid]
+
+         Require ``ratio >= MIN_VISIBILITY_RATIO`` (10%). The agent reads
+         "walk to a X" at the partition pose, so X must already be at
+         least somewhat visible there — a destination that only appears
+         once you arrive is not a usable landmark.
+
+      2. **Approach.** Require ``dist_partition > dist_end`` — the agent
+         is geometrically walking toward the instance (not past it).
+
+      3. **Pick** the candidate that maximizes ``approach = dist_partition
+         - dist_end``: the landmark whose distance shrinks the most along
+         the landmark half. Tie-break by larger partition pixel count
+         (more salient at instruction-read time).
+
+    Plus one static guard: category must exist and not be in
+    ``LANDMARK_BLACKLIST_CATS`` (wall / floor / door / window / ...).
     """
     candidates: List[Dict] = []
-    cat_visible_count: Counter = Counter()
+    all_iids = set(partition_pixels) | set(end_pixels)
 
-    # ── Diagnostic: dump the top-pixel instances at partition pose so
-    # we can see what the panorama actually contained, regardless of
-    # filter outcome. Print before filtering so all noise is visible.
-    print(f"{debug_prefix}  partition-pose visible instances (top 10 by pixels):")
-    top = sorted(visible_pixels.items(), key=lambda kv: -kv[1])[:10]
-    for iid, pix in top:
+    # ── Diagnostic: top 10 instances by end-pose pixels (so we see
+    # what the agent ends up facing), with their partition-pose ratio.
+    print(f"{debug_prefix}  end-pose visible instances (top 10 by pixels):")
+    top = sorted(end_pixels.items(), key=lambda kv: -kv[1])[:10]
+    for iid, end_px in top:
         meta = inst_meta.get(iid) or {}
         cat = meta.get("category") or "?"
+        p_px = partition_pixels.get(iid, 0)
+        ratio = (p_px / end_px) if end_px > 0 else 0.0
         center = meta.get("center")
         if center is not None:
             dist_p = float(np.linalg.norm(partition_pos - center))
             dist_e = float(np.linalg.norm(end_pos - center))
-            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} pix={pix:>6d} "
-                  f"dist_p={dist_p:.2f}m dist_e={dist_e:.2f}m approach={dist_p-dist_e:+.2f}m")
+            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} "
+                  f"e_px={end_px:>6d} p_px={p_px:>6d} ratio={ratio:.2f} "
+                  f"approach={dist_p-dist_e:+.2f}m")
         else:
-            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} pix={pix:>6d} (no .house center)")
+            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} "
+                  f"e_px={end_px:>6d} p_px={p_px:>6d} ratio={ratio:.2f} "
+                  f"(no .house center)")
 
-    for iid, pix in visible_pixels.items():
-        if iid not in inst_meta or pix < MIN_VISIBLE_PIXELS:
+    for iid in all_iids:
+        if iid not in inst_meta:
             continue
         cat = inst_meta[iid]["category"]
         if not cat or cat in LANDMARK_BLACKLIST_CATS:
             continue
+        end_px = end_pixels.get(iid, 0)
+        if end_px <= 0:
+            continue
+        p_px = partition_pixels.get(iid, 0)
+        ratio = p_px / end_px
+        if ratio < MIN_VISIBILITY_RATIO:
+            continue
         center = inst_meta[iid]["center"]
         dist_p = float(np.linalg.norm(partition_pos - center))
         dist_e = float(np.linalg.norm(end_pos - center))
-        approached = (dist_p - dist_e) >= APPROACH_THRESHOLD_M
-        if not approached:
+        approach = dist_p - dist_e
+        if approach <= 0:
             continue
-        cat_visible_count[cat] += 1
         candidates.append({
-            "instance_id": iid,
-            "category":    cat,
-            "pixel_count": pix,
+            "instance_id":      iid,
+            "category":         cat,
+            "pixel_count":      p_px,
+            "pixels_at_end":    end_px,
+            "ratio":            ratio,
             "dist_partition_m": dist_p,
             "dist_end_m":       dist_e,
-            "approach_m":       dist_p - dist_e,
+            "approach_m":       approach,
         })
 
     if not candidates:
-        print(f"{debug_prefix}  → no fit candidate (all filtered out)")
+        print(f"{debug_prefix}  → no fit candidate "
+              f"(ratio < {MIN_VISIBILITY_RATIO:.2f} or not approaching)")
         return None
     print(f"{debug_prefix}  candidates passing filters ({len(candidates)}):")
     for c in candidates:
         print(f"{debug_prefix}    iid={c['instance_id']:>4} cat={c['category']:<14s} "
-              f"pix={c['pixel_count']:>6d} dist_p={c['dist_partition_m']:.2f}m "
-              f"dist_e={c['dist_end_m']:.2f}m approach={c['approach_m']:+.2f}m "
-              f"fov_count={cat_visible_count[c['category']]}")
+              f"p_px={c['pixel_count']:>6d} e_px={c['pixels_at_end']:>6d} "
+              f"ratio={c['ratio']:.2f} approach={c['approach_m']:+.2f}m")
 
-    # Tier 1: category has exactly one visible instance in this FOV.
-    unique_view = [c for c in candidates if cat_visible_count[c["category"]] == 1]
-    pool = unique_view or candidates
-    # Tier 2: prefer non-coarse buckets.
-    fine = [c for c in pool if c["category"] not in COARSE_BUCKETS]
-    pool = fine or pool
+    # Pick: maximize approach. Tie-break: higher partition pixel count
+    # (so a clearly-visible landmark wins over a barely-visible one when
+    # both have the same approach distance).
+    candidates.sort(key=lambda c: (-c["approach_m"], -c["pixel_count"]))
+    chosen = candidates[0]
 
-    # Tier 3: balance proximity-to-end against visual prominence.
-    # ``score = dist_end_m / sqrt(pixel_count)`` — interprets as
-    # "distance per unit visual size", so a small-but-close instance
-    # (e.g. a tiny stair at 3 m) doesn't beat a huge-but-farther one
-    # (e.g. a railing filling the FOV at 5 m). Lower = better.
-    for c in pool:
-        c["score"] = c["dist_end_m"] / max(1.0, float(c["pixel_count"]) ** 0.5)
-    pool.sort(key=lambda c: c["score"])
-    chosen = pool[0]
-    chosen["scene_instance_count"]    = int(scene_category_counts.get(chosen["category"], 0))
-    chosen["fov_instance_count"]      = int(cat_visible_count[chosen["category"]])
-    chosen["unique_in_fov"]           = chosen["fov_instance_count"] == 1
+    # Informational: how many instances of this category are visible
+    # from the partition pose? Lets downstream consumers tell when a
+    # synthesized "Walk to a fridge" is ambiguous because two fridges
+    # are in view.
+    cat_in_partition_fov = sum(
+        1 for iid, px in partition_pixels.items()
+        if px > 0 and inst_meta.get(iid, {}).get("category") == chosen["category"]
+    )
+    chosen["fov_instance_count"] = cat_in_partition_fov
+    chosen["unique_in_fov"]      = cat_in_partition_fov == 1
     print(f"{debug_prefix}  → picked iid={chosen['instance_id']} cat={chosen['category']!r} "
-          f"pix={chosen['pixel_count']} score={chosen['score']:.4f} "
+          f"approach={chosen['approach_m']:+.2f}m ratio={chosen['ratio']:.2f} "
           f"unique_in_fov={chosen['unique_in_fov']}")
-    chosen["unique_in_scene"]         = chosen["scene_instance_count"] == 1
     return chosen
 
 
@@ -456,9 +465,6 @@ def main() -> None:
         for scan, scan_drops in sorted(by_scan.items()):
             checker.load_scene(f"mp3d/{scan}/{scan}.glb")
             inst_meta = _instance_meta_from_house(cfg["scenes"]["scenes_dir"], scan)
-            scene_cat_counts: Counter = Counter(
-                m["category"] for m in inst_meta.values() if m["category"]
-            )
             scan_db = scan_db_all.get(scan) or {}
 
             scan_rescues: Dict[str, Dict[str, Dict]] = {}
@@ -507,55 +513,50 @@ def main() -> None:
                     _failed("no_pos")
                     continue
 
-                # Primary render: PARTITION pose. Selection is grounded
-                # in what the agent can see when it reads the synthesized
-                # "walk to a X" instruction.
-                obs = checker.render_observation(
-                    partition_pos.astype(np.float32), 0.0,
-                )
-                sem = obs.get("semantic")
-                if sem is None:
+                # Render at BOTH partition and end pose: selection is
+                # driven by the partition/end visibility *ratio* (must be
+                # at least MIN_VISIBILITY_RATIO) plus max distance
+                # change toward the instance, so we need both pixel
+                # counts up-front.
+                try:
+                    p_obs = checker.render_observation(
+                        partition_pos.astype(np.float32), 0.0,
+                    )
+                    e_obs = checker.render_observation(
+                        end_pos.astype(np.float32), 0.0,
+                    )
+                except Exception as exc:
+                    print(
+                        f"  WARN [{scan} ep={ep_id} sub={sub_idx}] render "
+                        f"failed: {exc}"
+                    )
                     skipped_no_pos += 1
                     _failed("no_render")
                     continue
 
-                visible_pixels = _visible_instance_pixels(sem)
+                p_sem = p_obs.get("semantic")
+                e_sem = e_obs.get("semantic")
+                if p_sem is None or e_sem is None:
+                    skipped_no_pos += 1
+                    _failed("no_render")
+                    continue
+
+                partition_pixels = _visible_instance_pixels(p_sem)
+                end_pixels       = _visible_instance_pixels(e_sem)
+
                 print(f"[{scan} ep={ep_id} sub={sub_idx}] rescue selection "
                       f"(orig_landmark={drop_rec.get('landmark')!r}):")
                 pick = _pick_replacement_landmark(
-                    visible_pixels=visible_pixels,
+                    partition_pixels=partition_pixels,
+                    end_pixels=end_pixels,
                     inst_meta=inst_meta,
                     partition_pos=partition_pos,
                     end_pos=end_pos,
-                    scene_category_counts=scene_cat_counts,
-                    debug_prefix="",
                 )
                 if pick is None:
                     skipped_no_candidate += 1
                     _failed("no_fit_candidate")
                     continue
-
-                # Secondary render at END pose — reporting only. Records
-                # whether the chosen landmark is still in view when the
-                # agent finishes the sub-path; useful for inspecting how
-                # well the synthesized instruction tracks the actual
-                # trajectory but not used for selection.
-                pick_pixels_at_end = 0
-                try:
-                    e_obs = checker.render_observation(
-                        end_pos.astype(np.float32), 0.0,
-                    )
-                    e_sem = e_obs.get("semantic")
-                    if e_sem is not None:
-                        e_vis = _visible_instance_pixels(e_sem)
-                        pick_pixels_at_end = int(
-                            e_vis.get(int(pick["instance_id"]), 0)
-                        )
-                except Exception as exc:
-                    print(
-                        f"  WARN [{scan} ep={ep_id} sub={sub_idx}] end-pose "
-                        f"visibility check failed: {exc}"
-                    )
 
                 spatial_instr = (part_sub.get("spatial_instruction") or "").strip()
                 new_landmark  = pick["category"]
@@ -615,9 +616,10 @@ def main() -> None:
                     "landmark_instruction": f"Walk to a {new_landmark}.",
                     # Same split-schema as step 07/08 records:
                     # visibility is always "visible" by construction
-                    # (selection requires partition-pose pixels ≥
-                    # MIN_VISIBLE_PIXELS); uniqueness reflects whether
-                    # the chosen category is unique in the partition FOV.
+                    # (selection requires ratio ≥ MIN_VISIBILITY_RATIO,
+                    # which implies non-zero partition pixels);
+                    # uniqueness reflects whether the chosen category
+                    # is unique in the partition FOV.
                     "visibility":           "visible",
                     "uniqueness":           bool(pick["unique_in_fov"]),
                 }
@@ -637,10 +639,8 @@ def main() -> None:
                 with open(out_path, "w") as f:
                     json.dump({
                         "scan":       scan,
-                        "approach_threshold_m": APPROACH_THRESHOLD_M,
-                        "min_visible_pixels":   MIN_VISIBLE_PIXELS,
+                        "min_visibility_ratio": MIN_VISIBILITY_RATIO,
                         "blacklist_categories": sorted(LANDMARK_BLACKLIST_CATS),
-                        "coarse_buckets":       sorted(COARSE_BUCKETS),
                         "rescues":    scan_rescues,
                     }, f, indent=2)
                 output_paths.append(out_path)
