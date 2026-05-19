@@ -1,6 +1,6 @@
 """Synthesize a replacement landmark when the original can't be grounded.
 
-Two upstream conditions feed this rescue (both treated uniformly):
+Three upstream conditions feed this rescue (all treated uniformly):
 
   • ``origin = "blacklist"`` — step 02 dropped the sub because its
     instruction-derived landmark is too generic to ground (``wall``,
@@ -10,6 +10,12 @@ Two upstream conditions feed this rescue (both treated uniformly):
     optional VLM fallback) couldn't locate the original landmark in the
     panorama. Read from the lifecycle audit's ``detection`` /
     ``rescue_failed`` events.
+  • ``origin = "visibility_not_visible"`` — step 07 matched the
+    original landmark text to a fine MPCat40 category but found no
+    instance of that category visible at the partition pose (e.g.
+    ``bath`` → ``bathtub`` matched, but no bathtub in view). Read
+    from the lifecycle audit's ``visibility`` events with
+    ``visibility == "not_visible"``.
 
 In both cases the original landmark is not recoverable, so we pick a
 **different** referrable landmark visible at the partition pose and
@@ -365,6 +371,50 @@ def _detection_failures(audit: dict) -> List[Tuple[int, int, Dict]]:
                 "landmark": last.get("landmark") or "",
                 "reason":   f"detection:{last.get('reason') or 'unknown'}",
                 "origin":   "detection_failure",
+            }))
+    return out
+
+
+def _visibility_not_visible_failures(audit: dict) -> List[Tuple[int, int, Dict]]:
+    """Return ``[(ep_id, sub_idx, drop_record), ...]`` for every sub where
+    stage 07 (visibility) labeled the original landmark ``not_visible``.
+
+    These are the "fine MPCat40 match but no instance visible at the
+    partition pose" cases — the landmark text is conceptually fine
+    (e.g. ``bath`` → ``bathtub``) but no bathtub is on screen when the
+    agent reads the instruction. Step 09 skips them because they have a
+    fine match (not coarse-only or no_match), and the blacklist channel
+    doesn't catch them either, so without an extra rescue path they
+    ended up in dataset.json with empty ``target_instance_ids`` —
+    technically included but practically unusable.
+
+    Same shape as :func:`_blacklist_drops`; ``origin`` is set to
+    ``"visibility_not_visible"``. Step 12 (consolidate) excludes the
+    original records of these subs from the dataset, so when no synth
+    succeeds the sub is left out (dataset only contains records whose
+    landmark is actually visible at the partition pose).
+    """
+    out: List[Tuple[int, int, Dict]] = []
+    for ep_id_str, ep in (audit.get("episodes") or {}).items():
+        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
+            labeled = [
+                e for e in (sp.get("events") or [])
+                if e.get("stage") == "visibility"
+                and e.get("action") == "labeled"
+                and e.get("visibility") == "not_visible"
+            ]
+            if not labeled:
+                continue
+            last = labeled[-1]
+            try:
+                ep_id = int(ep_id_str)
+                sub_idx = int(sub_idx_str)
+            except ValueError:
+                continue
+            out.append((ep_id, sub_idx, {
+                "landmark": last.get("landmark") or "",
+                "reason":   "visibility:not_visible",
+                "origin":   "visibility_not_visible",
             }))
     return out
 
@@ -953,15 +1003,17 @@ def main() -> None:
     register_stage(audit, STAGE_NAME)
     strip_stage_events(audit, STAGE_NAME)
 
-    run_dir   = get_run_dir(cfg)
-    blacklist_drops = _blacklist_drops(filt_dir)
-    detection_fails = _detection_failures(audit)
-    drops           = _merge_drops(blacklist_drops, detection_fails)
+    run_dir          = get_run_dir(cfg)
+    blacklist_drops  = _blacklist_drops(filt_dir)
+    detection_fails  = _detection_failures(audit)
+    visibility_misses = _visibility_not_visible_failures(audit)
+    drops            = _merge_drops(blacklist_drops, detection_fails, visibility_misses)
     n_bl  = len(blacklist_drops)
     n_det = len(detection_fails)
+    n_vis = len(visibility_misses)
     print(
         f"Synthesis candidates: {len(drops)}  "
-        f"({n_bl} from blacklist + {n_det} from detection-fail)"
+        f"({n_bl} blacklist + {n_det} detection-fail + {n_vis} visibility:not_visible)"
     )
     if not drops:
         print("No candidates to rescue.")
@@ -1236,7 +1288,7 @@ def main() -> None:
     print()
     print(f"=== landmark synthesis summary ===")
     print(f"  candidates total           : {len(drops)}  "
-          f"({n_bl} blacklist + {n_det} detection-fail)")
+          f"({n_bl} blacklist + {n_det} detection-fail + {n_vis} visibility:not_visible)")
     print(f"  synthesized                : {rescued_count}")
     print(f"  skipped (no partition.json): {skipped_no_partition}")
     print(f"  skipped (no node position) : {skipped_no_pos}")

@@ -342,15 +342,22 @@ def main() -> None:
         ep_audit = ensure_episode(audit, ep)
         for sub_idx in ep_subs:
             sub_label = sub_status_for(cfg, ep.instruction_id, sub_idx)
-            # Drop records where the instruction itself isn't usable:
-            #   - blacklist:* labels (instruction text problem — LLM/regex
-            #     judged the landmark non-referrable)
-            #   - visibility:no_match (the landmark text doesn't match any
-            #     MP3D category in this scene's vocabulary — the concept
-            #     doesn't ground here, regardless of pose)
-            # visibility:not_visible / partition_pos_unresolvable stay —
-            # those are valid sub-trajectories where the landmark concept
-            # exists but isn't visible from the partition pose.
+            # Drop original records whose landmark isn't usable as-is.
+            # Step 11 may have synthesized a replacement; that's added
+            # separately in the synth loop below (the sticky-synth
+            # verdict resolver in _filter_utils handles the case where
+            # excluded + included co-occur on the same audit cell).
+            #   - blacklist:* labels — instruction text problem
+            #   - visibility:no_match — landmark text has no MP3D match
+            #     in this scene's vocabulary
+            #   - visibility:not_visible — landmark matched a category
+            #     but no instance is visible at the partition pose
+            # Keeping originals in the dataset with empty target ids
+            # produced records that look "in_dataset" but were
+            # practically unusable; the simple dataset only wants
+            # records whose landmark is actually visible.
+            # partition_pos_unresolvable still passes through (there's
+            # no synthesis path for it either).
             if sub_label and sub_label.startswith("blacklist:"):
                 n_skipped_unusable += 1
                 append_sub_event(
@@ -367,6 +374,13 @@ def main() -> None:
                 append_sub_event(
                     ep_audit, sub_idx, stage=STAGE_NAME, action="excluded",
                     reason="visibility:no_match",
+                )
+                continue
+            if rec.get("visibility") == "not_visible":
+                n_skipped_unusable += 1
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="excluded",
+                    reason="visibility:not_visible",
                 )
                 continue
             records.append(rec)

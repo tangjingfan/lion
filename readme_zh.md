@@ -442,7 +442,7 @@ bash scripts/12_consolidate.sh --exp "$SEL"
 在 partition pose 挑一个能指代的 instance，改写 sub-instruction。
 合成出来的 record 进 `dataset.json` 时标 `synthesized = true`。
 
-两条上游来源，handle 方式一致：
+三条上游来源，handle 方式一致：
 
 - `origin: "blacklist"` —— step 02 判断原 landmark 太泛
   （"wall"/"door"/"room"/"doorway" 等）打了 blacklist 标签。
@@ -450,6 +450,12 @@ bash scripts/12_consolidate.sh --exp "$SEL"
 - `origin: "detection_failure"` —— step 09 YOLO / VLM 都没找到原
   landmark。从 `filters/audit.json` 里的 `detection` / `rescue_failed`
   事件读。
+- `origin: "visibility_not_visible"` —— step 07 把原 landmark 文本匹
+  配到了 fine MPCat40 类（比如 `"bath"` → `"bathtub"`），但 partition
+  pose 那一帧根本看不到这个类的任何 instance。从 `filters/audit.json`
+  里 `visibility` 事件且 `visibility == "not_visible"` 的位置读。step
+  12 也会把这类原始 record 排除——只有 step 11 找到替换 landmark 的
+  synth record 才会进入 `dataset.json`。
 
 ```bash
 bash scripts/11_rescue_blacklist.sh --exp "$SEL"

@@ -578,7 +578,7 @@ instance visible at the partition pose and rewrite the
 sub-instruction. Records flow into `dataset.json` with
 `synthesized = true`.
 
-Two upstream sources feed in, both handled uniformly:
+Three upstream sources feed in, all handled uniformly:
 
 - `origin: "blacklist"` — sub-paths labeled by step 02 because the
   instruction-derived landmark was too generic ("wall", "door",
@@ -586,6 +586,14 @@ Two upstream sources feed in, both handled uniformly:
 - `origin: "detection_failure"` — sub-paths where step 09 YOLO / VLM
   couldn't locate the original landmark. Read from the lifecycle
   audit's `detection` / `rescue_failed` events.
+- `origin: "visibility_not_visible"` — sub-paths where step 07
+  matched the original landmark to a fine MPCat40 category but found
+  no instance of it visible at the partition pose (e.g. `"bath"` →
+  `"bathtub"` matched, but no bathtub on screen). Read from the
+  lifecycle audit's `visibility` events with `visibility ==
+  "not_visible"`. Step 12 also excludes the originals for these subs
+  — only the synth replacement makes it into `dataset.json` if step
+  11 finds one.
 
 ```bash
 bash scripts/11_rescue_blacklist.sh --exp "$SEL"
