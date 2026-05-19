@@ -29,8 +29,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    append_ep_event,
+    append_sub_event,
     ensure_episode,
-    ensure_sub_path,
+    finalize_audit,
     get_filter_dir,
     get_split,
     get_survivor_path,
@@ -38,6 +40,7 @@ from src.check._filter_utils import (
     register_stage,
     resolve_exp,
     save_audit,
+    strip_stage_events,
     write_drop_yaml,
     write_survivor,
 )
@@ -73,6 +76,7 @@ def main() -> None:
 
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME)
+    strip_stage_events(audit, STAGE_NAME)
 
     instruction_ids: List[int] = []
     sub_paths: Dict[int, List[int]] = {}
@@ -85,13 +89,12 @@ def main() -> None:
         n_sub_paths += len(ep_sub_idxs)
 
         ep_audit = ensure_episode(audit, ep)
-        ep_audit["stages"][STAGE_NAME] = {
-            "status": "ok",
-            "n_sub_paths": len(ep_sub_idxs),
-        }
+        append_ep_event(
+            ep_audit, stage=STAGE_NAME, action="kept",
+            n_sub_paths=len(ep_sub_idxs),
+        )
         for sub_idx in ep_sub_idxs:
-            sp_audit = ensure_sub_path(ep_audit, sub_idx)
-            sp_audit["stages"][STAGE_NAME] = {"status": "ok"}
+            append_sub_event(ep_audit, sub_idx, stage=STAGE_NAME, action="kept")
 
     # Stage 0 only writes survivor.yaml when none exists yet — never
     # clobber an in-progress pipeline's narrower state.
@@ -113,6 +116,7 @@ def main() -> None:
         dropped={},
         extras={"note": "Stage 0 records the original selected set; no drops."},
     )
+    finalize_audit(audit)
     save_audit(audit, filt_dir)
 
     print(f"=== Stage {STAGE_NUM} — {STAGE_NAME} ===")

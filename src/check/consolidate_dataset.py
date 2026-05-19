@@ -37,11 +37,23 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    append_sub_event,
     discover_rewrite_suffix,
+    ensure_episode,
+    finalize_audit,
+    get_filter_dir,
     get_run_dir,
+    get_split,
+    load_audit,
+    register_stage,
     resolve_exp,
+    save_audit,
+    strip_stage_events,
     sub_status_for,
 )
+
+
+STAGE_NAME = "consolidate"
 from src.dataset.landmark_rxr import episodes_from_config
 
 
@@ -274,6 +286,13 @@ def main() -> None:
     if not run_dir.exists():
         raise SystemExit(f"No run_dir at {run_dir}")
 
+    filt_dir = get_filter_dir(cfg)
+    filt_dir.mkdir(parents=True, exist_ok=True)
+    split = get_split(cfg)
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, STAGE_NAME)
+    strip_stage_events(audit, STAGE_NAME)
+
     episodes = episodes_from_config(cfg)
     if not episodes:
         raise SystemExit("No surviving episodes — run the filter pipeline first.")
@@ -319,6 +338,7 @@ def main() -> None:
         part_json = _load_partition(run_dir, ep.scan, ep.instruction_id)
         rewrite_episode = _load_rewrite(run_dir, ep.scan, ep.instruction_id, suffix)
 
+        ep_audit = ensure_episode(audit, ep)
         for sub_idx in ep_subs:
             sub_label = sub_status_for(cfg, ep.instruction_id, sub_idx)
             # Drop records where the instruction itself isn't usable:
@@ -332,6 +352,10 @@ def main() -> None:
             # exists but isn't visible from the partition pose.
             if sub_label and sub_label.startswith("blacklist:"):
                 n_skipped_unusable += 1
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="excluded",
+                    reason=sub_label,
+                )
                 continue
             rec = _build_record(
                 ep, sub_idx, part_json, rewrite_episode, target_db,
@@ -339,8 +363,18 @@ def main() -> None:
             )
             if rec.get("visibility") == "no_match":
                 n_skipped_unusable += 1
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="excluded",
+                    reason="visibility:no_match",
+                )
                 continue
             records.append(rec)
+            append_sub_event(
+                ep_audit, sub_idx, stage=STAGE_NAME, action="included",
+                synthesized=False,
+                target_instance_ids=list(rec.get("target_instance_ids") or []),
+                target_status=rec.get("target_status"),
+            )
             if part_json is None or _partition_for_sub(part_json, sub_idx) is None:
                 missing.append(f"{ep.instruction_id}#{sub_idx}: no partition.json")
 
@@ -399,6 +433,13 @@ def main() -> None:
                     rescue_rec=rescue_rec,
                 )
                 syn_records.append(syn)
+                ep_audit = ensure_episode(audit, ep)
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="included",
+                    synthesized=True,
+                    new_landmark=rescue_rec.get("new_landmark"),
+                    instance_id=rescue_rec.get("new_instance_id"),
+                )
 
     records.extend(syn_records)
 
@@ -406,6 +447,9 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     # Summary print.
     n = len(records)

@@ -74,13 +74,20 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
     active_subs,
+    append_sub_event,
     discover_rewrite_suffix,
+    ensure_episode,
+    finalize_audit,
     get_filter_dir,
     get_run_dir,
     get_split,
     get_survivor_path,
     iter_rewrite_files,
+    load_audit,
+    register_stage,
     resolve_exp,
+    save_audit,
+    strip_stage_events,
 )
 from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
@@ -88,6 +95,9 @@ from src.env.connectivity import load_connectivity
 from src.process.landmark_remap import lookup_mention_labels
 from src.process.visibility import VisibilityChecker
 from src.viz import _semantic_to_rgb
+
+
+STAGE_NAME = "visibility"
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +228,10 @@ def main() -> None:
     filt_dir = get_filter_dir(cfg)
     split   = get_split(cfg)
 
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, STAGE_NAME, min_pixel_count=args.min_pixel_count)
+    strip_stage_events(audit, STAGE_NAME)
+
     survivor = get_survivor_path(cfg)
     if not survivor.exists():
         raise SystemExit(f"No survivor.yaml at {survivor} — run filter pipeline first.")
@@ -313,6 +327,7 @@ def main() -> None:
                 ep_id     = ep.instruction_id
                 ep_id_str = str(ep_id)
                 sub_idxs  = prior_subs.get(ep_id) or prior_subs.get(ep_id_str) or []
+                ep_audit  = ensure_episode(audit, ep)
 
                 ep_anno: Dict[str, Dict] = {}
 
@@ -370,6 +385,15 @@ def main() -> None:
                     )
                     uniqueness_counts[counter_key] += 1
                     n_total_candidates += len(candidates)
+
+                    append_sub_event(
+                        ep_audit, sub_idx_int, stage=STAGE_NAME, action="labeled",
+                        visibility=visibility,
+                        uniqueness=uniqueness,
+                        n_candidates=len(candidates),
+                        matched_category=matched_category,
+                        landmark=landmark,
+                    )
 
                     # Save the clean partition-pose RGB + semantic panoramas
                     # once per (ep, sub) — independent of candidates, so
@@ -485,6 +509,9 @@ def main() -> None:
             print(f"  → {scan_out}")
     finally:
         checker.close()
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     print(f"\n=== Target Instance Enumeration (partition-point FOV) ===")
     print(f"  sub-paths annotated : {n_total}")

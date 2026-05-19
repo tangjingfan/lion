@@ -46,8 +46,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
     active_subs,
+    append_ep_event,
+    append_sub_event,
     ensure_episode,
-    ensure_sub_path,
+    finalize_audit,
     get_filter_dir,
     get_split,
     get_survivor_path,
@@ -56,6 +58,7 @@ from src.check._filter_utils import (
     register_stage,
     resolve_exp,
     save_audit,
+    strip_stage_events,
     write_drop_yaml,
     write_survivor,
     _sub_status_map,
@@ -197,6 +200,7 @@ def main() -> None:
 
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME)
+    strip_stage_events(audit, STAGE_NAME)
 
     # Carry forward upstream labels (our own stripped-and-rebuilt).
     new_sub_status: Dict[int, Dict[int, str]] = {
@@ -223,13 +227,19 @@ def main() -> None:
         if rewrite_ep is None or partition_ep is None:
             n_eps_no_data += 1
             reason = "rewrite_missing" if rewrite_ep is None else "partition_missing"
-            ep_audit["stages"][STAGE_NAME] = {"status": "drop", "reason": reason}
+            append_ep_event(
+                ep_audit, stage=STAGE_NAME, action="dropped", reason=reason,
+            )
             dropped[ep_id_str] = {"scan": ep.scan, "reason": reason}
             # Label every previously-active sub of this ep with the
             # missing-data reason so they show up in inspection viz.
             for sub_idx in ep_allowed_subs:
                 n_subs_total   += 1
                 n_subs_labeled += 1
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="dropped",
+                    reason=reason,
+                )
                 new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
                     f"{STAGE_NAME}:{reason}"
                 )
@@ -252,41 +262,39 @@ def main() -> None:
                 rewrite_subs.get(sub_idx),
                 partition_subs.get(sub_idx),
             )
-            sp_audit = ensure_sub_path(ep_audit, sub_idx)
-            sp_audit["stages"][STAGE_NAME] = {
-                "status": "ok" if keep_it else "drop",
-                **payload,
-            }
             if keep_it:
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="kept", **payload,
+                )
                 ep_n_active   += 1
                 n_subs_active += 1
             else:
-                ep_drops[sub_idx] = payload
-                ep_n_labeled   += 1
-                n_subs_labeled += 1
                 # Compact reason: "rewrite_error" / "partition_error" /
                 # "rewrite_missing" / "partition_missing".
                 if payload.get("rewrite") in (None, "ok"):
                     short_reason = (
                         payload.get("partition") or "drop"
                     ).split(":")[0]
-                    short_reason = (
-                        f"partition_{short_reason}"
-                        if short_reason not in ("missing", "drop")
-                        else f"partition_{short_reason}"
-                    )
+                    short_reason = f"partition_{short_reason}"
                 else:
                     rw = payload.get("rewrite") or "drop"
                     short_reason = f"rewrite_{rw.split(':')[0]}"
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="dropped",
+                    reason=short_reason, **payload,
+                )
+                ep_drops[sub_idx] = payload
+                ep_n_labeled   += 1
+                n_subs_labeled += 1
                 new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
                     f"{STAGE_NAME}:{short_reason}"
                 )
 
-        ep_audit["stages"][STAGE_NAME] = {
-            "status":    "ok" if ep_n_active > 0 else "drop",
-            "kept_sub":  ep_n_active,
-            "total_sub": len(ep_allowed_subs),
-        }
+        append_ep_event(
+            ep_audit, stage=STAGE_NAME, action="kept",
+            kept_sub=ep_n_active,
+            total_sub=len(ep_allowed_subs),
+        )
 
         if ep_drops:
             dropped[ep_id_str] = {
@@ -305,6 +313,7 @@ def main() -> None:
         filt_dir, STAGE_NUM, STAGE_NAME, split,
         dropped=dict(sorted(dropped.items(), key=lambda kv: int(kv[0]))),
     )
+    finalize_audit(audit)
     save_audit(audit, filt_dir)
 
     n_eps_keep = len(keep_sub_paths)

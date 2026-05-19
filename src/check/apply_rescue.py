@@ -37,7 +37,21 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_exp
+from src.check._filter_utils import (
+    append_sub_event,
+    finalize_audit,
+    get_filter_dir,
+    get_run_dir,
+    get_split,
+    load_audit,
+    register_stage,
+    resolve_exp,
+    save_audit,
+    strip_stage_events,
+)
+
+
+STAGE_NAME = "apply_rescue"
 
 
 def _index_rescue(
@@ -85,12 +99,17 @@ def _index_rescue(
 
 
 def _apply_to_target_instances(
-    ti_path: Path, rescue_index: Dict[Tuple[str, str], Dict],
+    ti_path: Path,
+    rescue_index: Dict[Tuple[str, str], Dict],
+    audit: Optional[Dict] = None,
+    scan: str = "",
 ) -> Tuple[int, int]:
     """Merge rescue hits into a single ``target_instances.json`` in place.
 
     Returns ``(n_filled, n_confirmed)`` — how many empty sub-paths got
     filled, and how many already-targeted sub-paths got an annotation.
+    Also pushes one ``applied`` event per (ep, sub) into ``audit`` when
+    provided.
     """
     with open(ti_path) as f:
         data = json.load(f)
@@ -142,6 +161,16 @@ def _apply_to_target_instances(
                 else:
                     if key not in seen_keys:
                         n_confirmed += 1
+                if audit is not None and key not in seen_keys:
+                    ep_audit = audit["episodes"].setdefault(str(ep_id), {
+                        "scan": scan, "events": [], "sub_paths": {},
+                    })
+                    append_sub_event(
+                        ep_audit, sub_idx, stage=STAGE_NAME, action="applied",
+                        instance_id=int(hit["instance_id"]),
+                        filled=(not current_ids),
+                        landmark=hit.get("landmark"),
+                    )
                 seen_keys.add(key)
     with open(ti_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -169,6 +198,13 @@ def main() -> None:
             f"No target_instances/ at {ti_root}. Run 07/08 first."
         )
 
+    filt_dir = get_filter_dir(cfg)
+    filt_dir.mkdir(parents=True, exist_ok=True)
+    split = get_split(cfg)
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, STAGE_NAME)
+    strip_stage_events(audit, STAGE_NAME)
+
     # scan dirs are those holding a target_instances.json; everything
     # else under ti_root (viz/, viz_partition/, viz_last_frame/, ...) is
     # render output.
@@ -191,7 +227,9 @@ def main() -> None:
         if not rescue_index:
             print(f"  [{scan_dir.name}] rescue file has no examples — skip")
             continue
-        filled, confirmed = _apply_to_target_instances(ti_path, rescue_index)
+        filled, confirmed = _apply_to_target_instances(
+            ti_path, rescue_index, audit=audit, scan=scan_dir.name,
+        )
         total_filled    += filled
         total_confirmed += confirmed
         print(
@@ -199,6 +237,9 @@ def main() -> None:
             f" → filled {filled}, confirmed {confirmed}"
         )
         print(f"    updated: {ti_path}")
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     print()
     print(f"=== apply_rescue summary ===")

@@ -35,13 +35,16 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
+    append_ep_event,
     ensure_episode,
+    finalize_audit,
     get_filter_dir,
     get_split,
     load_audit,
     register_stage,
     resolve_exp,
     save_audit,
+    strip_stage_events,
     write_drop_yaml,
     write_survivor,
 )
@@ -90,6 +93,7 @@ def main() -> None:
 
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME, y_range_m=args.threshold_m)
+    strip_stage_events(audit, STAGE_NAME)
 
     keep:    List[int]       = []
     dropped: Dict[int, Dict] = {}
@@ -117,13 +121,13 @@ def main() -> None:
             cross   = False  # passthrough on missing data
 
         ep_audit = ensure_episode(audit, ep)
-        ep_audit["stages"][STAGE_NAME] = {
-            "status":    "drop" if cross else "ok",
-            "y_range_m": round(y_range, 3),
-            **({"missing_node": missing} if missing else {}),
-        }
-
         if cross:
+            append_ep_event(
+                ep_audit, stage=STAGE_NAME, action="dropped",
+                reason="cross_floor",
+                y_range_m=round(y_range, 3),
+                **({"missing_node": missing} if missing else {}),
+            )
             n_subs_drop += n_ep_subs
             dropped[ep.instruction_id] = {
                 "scan":      ep.scan,
@@ -131,6 +135,11 @@ def main() -> None:
                 "n_sub_paths": n_ep_subs,
             }
         else:
+            append_ep_event(
+                ep_audit, stage=STAGE_NAME, action="kept",
+                y_range_m=round(y_range, 3),
+                **({"missing_node": missing} if missing else {}),
+            )
             n_subs_keep += n_ep_subs
             keep.append(ep.instruction_id)
 
@@ -140,6 +149,7 @@ def main() -> None:
         dropped={str(k): v for k, v in sorted(dropped.items())},
         extras={"threshold_m": args.threshold_m},
     )
+    finalize_audit(audit)
     save_audit(audit, filt_dir)
 
     n_total  = len(episodes)

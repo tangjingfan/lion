@@ -28,7 +28,18 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_run_dir, resolve_exp
+from src.check._filter_utils import (
+    append_sub_event,
+    finalize_audit,
+    get_filter_dir,
+    get_run_dir,
+    get_split,
+    load_audit,
+    register_stage,
+    resolve_exp,
+    save_audit,
+    strip_stage_events,
+)
 from src.check.query_scene_instance import (
     _draw_house_instance_viz,
     _render_mask_for_rollout_frame,
@@ -517,6 +528,16 @@ def main() -> None:
         source_paths = _resolve_target_instance_paths(ti_path)
         source_kind = "target_instances_json"
 
+    # Audit log (only when running through the standard pipeline path —
+    # legacy --visibility_json / --target_instances_json invocations
+    # write to whichever run_dir they infer from those paths).
+    filt_dir = run_dir / "filters"
+    filt_dir.mkdir(parents=True, exist_ok=True)
+    split = get_split(cfg) if cfg else "unknown"
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, "select")
+    strip_stage_events(audit, "select")
+
     selections: Dict[str, Dict[str, Any]] = {}
     counts: Counter = Counter()
     written_paths: List[Path] = []
@@ -776,6 +797,20 @@ def main() -> None:
                 counts[selected["status"]] += 1
                 source_counts[selected["status"]] += 1
 
+                # Audit cell. Episode metadata is filled lazily — we
+                # don't have a LandmarkRxREpisode here, only ids.
+                ep_audit = audit["episodes"].setdefault(str(ep_id), {
+                    "scan": scan, "events": [], "sub_paths": {},
+                })
+                tids = selected.get("target_instance_ids") or []
+                append_sub_event(
+                    ep_audit, sub_idx, stage="select", action="selected",
+                    status=selected.get("status"),
+                    target_instance_ids=tids,
+                    instance_id=(int(tids[0]) if tids else None),
+                    selection_distance=selected.get("selection_distance"),
+                )
+
             if args.out is None:
                 annotations["selection_rule"] = (
                     "single -> view_unique; multi -> nearest-to-subpath-end"
@@ -786,6 +821,9 @@ def main() -> None:
                 written_paths.append(source_path)
     finally:
         checker.close()
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     if args.out:
         out_path = Path(args.out)

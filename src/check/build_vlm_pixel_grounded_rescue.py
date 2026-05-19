@@ -44,7 +44,23 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_filter_dir, get_run_dir, get_survivor_path, load_keep, resolve_exp
+from src.check._filter_utils import (
+    append_sub_event,
+    finalize_audit,
+    get_filter_dir,
+    get_run_dir,
+    get_split,
+    get_survivor_path,
+    load_audit,
+    load_keep,
+    register_stage,
+    resolve_exp,
+    save_audit,
+    strip_stage_events,
+)
+
+
+STAGE_NAME = "detection"
 from src.process.coarse_labels import (
     DEFAULT_COARSE_LABELS,
     _is_only_coarse_label,
@@ -823,6 +839,12 @@ def main() -> None:
 
     run_dir = get_run_dir(cfg)
     filt_dir = get_filter_dir(cfg)
+    filt_dir.mkdir(parents=True, exist_ok=True)
+    split = get_split(cfg)
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, STAGE_NAME, yolo_model=args.yolo_model, yolo_conf=args.yolo_conf)
+    strip_stage_events(audit, STAGE_NAME)
+
     source_yaml = Path(args.dropped_yaml).expanduser() if args.dropped_yaml else (
         get_survivor_path(cfg)
     )
@@ -999,9 +1021,17 @@ def main() -> None:
                 "source": source,
                 "rgb_path": str(rgb_path),
             }
+            ep_audit = audit["episodes"].setdefault(rec["episode_id"], {
+                "scan": scan, "events": [], "sub_paths": {},
+            })
             if grounding is None:
                 print(f"  -> not visible (no detection above {args.yolo_conf})")
                 summaries[scan].append({**summary_base, "status": "not_visible"})
+                append_sub_event(
+                    ep_audit, rec["sub_idx"], stage=STAGE_NAME,
+                    action="rescue_failed", reason="no_detection",
+                    landmark=rec.get("landmark"),
+                )
                 processed += 1
                 continue
 
@@ -1039,6 +1069,12 @@ def main() -> None:
                     "bbox_path": str(bbox_path),
                     "pixel_instance": pixel_info,
                 })
+                append_sub_event(
+                    ep_audit, rec["sub_idx"], stage=STAGE_NAME,
+                    action="rescue_failed", reason="no_instance_in_bbox",
+                    landmark=rec.get("landmark"),
+                    bbox=grounding.get("bbox"),
+                )
                 processed += 1
                 continue
 
@@ -1097,6 +1133,13 @@ def main() -> None:
                 "mask_path": str(mask_path) if mask_path else None,
                 "pixel_instance": pixel_info,
             })
+            append_sub_event(
+                ep_audit, rec["sub_idx"], stage=STAGE_NAME,
+                action="rescued", method=source,
+                instance_id=int(instance_id),
+                category=recorded_category,
+                landmark=rec.get("landmark"),
+            )
             extra_paths = [str(rgb_path), str(debug_path), str(bbox_path)]
             if mask_path:
                 extra_paths.append(str(mask_path))
@@ -1110,6 +1153,9 @@ def main() -> None:
             processed += 1
     finally:
         checker.close()
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     for scan, payload in sorted(payloads.items()):
         out_path = run_dir / "target_instances" / scan / "semantic_rescue_categories.json"

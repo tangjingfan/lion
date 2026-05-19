@@ -50,7 +50,21 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import get_filter_dir, get_run_dir, resolve_exp
+from src.check._filter_utils import (
+    append_sub_event,
+    finalize_audit,
+    get_filter_dir,
+    get_run_dir,
+    get_split,
+    load_audit,
+    register_stage,
+    resolve_exp,
+    save_audit,
+    strip_stage_events,
+)
+
+
+STAGE_NAME = "rescue_blacklist"
 from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import _mp3d_to_habitat, load_connectivity
@@ -309,6 +323,11 @@ def main() -> None:
     if not filt_dir.exists():
         raise SystemExit(f"No filters/ at {filt_dir}; run pipeline first.")
 
+    split = get_split(cfg)
+    audit = load_audit(filt_dir, split)
+    register_stage(audit, STAGE_NAME)
+    strip_stage_events(audit, STAGE_NAME)
+
     run_dir   = get_run_dir(cfg)
     drops     = _blacklist_drops(filt_dir)
     if not drops:
@@ -358,9 +377,21 @@ def main() -> None:
             scan_rescues: Dict[str, Dict[str, Dict]] = {}
             for ep_id, sub_idx, drop_rec in scan_drops:
                 ep = episodes[ep_id]
+                ep_audit = audit["episodes"].setdefault(str(ep_id), {
+                    "scan": scan, "events": [], "sub_paths": {},
+                })
+
+                def _failed(reason: str) -> None:
+                    append_sub_event(
+                        ep_audit, sub_idx, stage=STAGE_NAME,
+                        action="rescue_failed", reason=reason,
+                        original_landmark=drop_rec.get("landmark"),
+                    )
+
                 part_path = run_dir / "partition" / scan / str(ep_id) / "partition.json"
                 if not part_path.exists():
                     skipped_no_partition += 1
+                    _failed("no_partition")
                     continue
                 with open(part_path) as f:
                     part_json = json.load(f)
@@ -372,17 +403,20 @@ def main() -> None:
                 )
                 if part_sub is None:
                     skipped_no_partition += 1
+                    _failed("no_partition")
                     continue
 
                 spatial_path  = part_sub.get("spatial_path") or []
                 landmark_path = part_sub.get("landmark_path") or []
                 if not spatial_path or not landmark_path:
                     skipped_no_pos += 1
+                    _failed("no_pos")
                     continue
                 partition_pos = _resolve_node_pos(spatial_path[-1], virtual_nodes, scan_db)
                 end_pos       = _resolve_node_pos(landmark_path[-1], virtual_nodes, scan_db)
                 if partition_pos is None or end_pos is None:
                     skipped_no_pos += 1
+                    _failed("no_pos")
                     continue
 
                 # Primary render: PARTITION pose. Selection is grounded
@@ -394,6 +428,7 @@ def main() -> None:
                 sem = obs.get("semantic")
                 if sem is None:
                     skipped_no_pos += 1
+                    _failed("no_render")
                     continue
 
                 visible_pixels = _visible_instance_pixels(sem)
@@ -409,6 +444,7 @@ def main() -> None:
                 )
                 if pick is None:
                     skipped_no_candidate += 1
+                    _failed("no_fit_candidate")
                     continue
 
                 # Secondary render at END pose — reporting only. Records
@@ -495,6 +531,13 @@ def main() -> None:
                     "visibility":           "visible",
                     "uniqueness":           bool(pick["unique_in_fov"]),
                 }
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="synthesized",
+                    new_landmark=new_landmark,
+                    instance_id=int(pick["instance_id"]),
+                    original_landmark=drop_rec.get("landmark"),
+                    unique_in_fov=bool(pick["unique_in_fov"]),
+                )
                 rescued_count += 1
 
             if scan_rescues:
@@ -512,6 +555,9 @@ def main() -> None:
                 output_paths.append(out_path)
     finally:
         checker.close()
+
+    finalize_audit(audit)
+    save_audit(audit, filt_dir)
 
     print()
     print(f"=== blacklist rescue summary ===")

@@ -39,8 +39,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
     active_subs,
+    append_ep_event,
+    append_sub_event,
     ensure_episode,
-    ensure_sub_path,
+    finalize_audit,
     get_filter_dir,
     get_split,
     get_survivor_path,
@@ -49,6 +51,7 @@ from src.check._filter_utils import (
     register_stage,
     resolve_exp,
     save_audit,
+    strip_stage_events,
     write_drop_yaml,
     write_survivor,
     _sub_status_map,
@@ -275,6 +278,7 @@ def main() -> None:
 
     audit = load_audit(filt_dir, split)
     register_stage(audit, STAGE_NAME, blacklist=list(blacklist))
+    strip_stage_events(audit, STAGE_NAME)
 
     # Carry forward upstream labels (our own stripped-and-rebuilt).
     new_sub_status: Dict[int, Dict[int, str]] = {
@@ -296,7 +300,7 @@ def main() -> None:
         ep_audit = (
             ensure_episode(audit, ep)
             if ep is not None
-            else audit["episodes"].setdefault(ep_id_str, {"stages": {}})
+            else audit["episodes"].setdefault(ep_id_str, {"events": [], "sub_paths": {}})
         )
         rewrite_subs = (
             {int(s["sub_idx"]): s for s in rewrite_ep.get("sub_paths", [])}
@@ -327,14 +331,20 @@ def main() -> None:
                     "category": rw.get("landmark_category"),
                 }
 
-            sp_audit = ensure_sub_path(ep_audit, sub_idx)
-            sp_audit["stages"][STAGE_NAME] = {
-                "status": "ok" if keep_it else "drop",
-                **payload,
-            }
             if keep_it:
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="kept",
+                    landmark=payload.get("landmark"),
+                    category=payload.get("category"),
+                )
                 n_subs_active += 1
             else:
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="dropped",
+                    reason=payload["reason"],
+                    landmark=payload.get("landmark"),
+                    category=payload.get("category"),
+                )
                 ep_drops[sub_idx] = payload
                 n_subs_labeled += 1
                 ep_n_labeled += 1
@@ -345,11 +355,11 @@ def main() -> None:
                     reason_counts.get(payload["reason"], 0) + 1
 
         n_remaining_active = len(ep_active_subs) - ep_n_labeled
-        ep_audit["stages"][STAGE_NAME] = {
-            "status":    "ok" if n_remaining_active > 0 else "drop",
-            "kept_sub":  n_remaining_active,
-            "total_sub": len(ep_active_subs),
-        }
+        append_ep_event(
+            ep_audit, stage=STAGE_NAME, action="kept",
+            kept_sub=n_remaining_active,
+            total_sub=len(ep_active_subs),
+        )
         if ep_drops:
             dropped[ep_id_str] = {
                 "subs": {str(k): v for k, v in sorted(ep_drops.items())},
@@ -366,6 +376,7 @@ def main() -> None:
         dropped=dict(sorted(dropped.items(), key=lambda kv: int(kv[0]))),
         extras={"blacklist": list(blacklist)},
     )
+    finalize_audit(audit)
     save_audit(audit, filt_dir)
 
     n_eps_in   = len(allowed_subs)
