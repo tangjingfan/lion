@@ -91,6 +91,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
     append_sub_event,
+    detection_rescued,
     finalize_audit,
     get_filter_dir,
     get_run_dir,
@@ -397,13 +398,21 @@ def _visibility_not_visible_failures(audit: dict) -> List[Tuple[int, int, Dict]]
     out: List[Tuple[int, int, Dict]] = []
     for ep_id_str, ep in (audit.get("episodes") or {}).items():
         for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
+            events = sp.get("events") or []
             labeled = [
-                e for e in (sp.get("events") or [])
+                e for e in events
                 if e.get("stage") == "visibility"
                 and e.get("action") == "labeled"
                 and e.get("visibility") == "not_visible"
             ]
             if not labeled:
+                continue
+            # Step 09 may have grounded the original landmark after the
+            # visibility label (semantic sensor missed it, detector found
+            # it). The rescued original is usable as-is — synthesizing a
+            # replacement on top would put the same (ep, sub) into
+            # dataset.json twice.
+            if detection_rescued(events):
                 continue
             last = labeled[-1]
             try:

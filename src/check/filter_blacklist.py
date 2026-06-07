@@ -48,6 +48,7 @@ from src.check._filter_utils import (
     get_survivor_path,
     load_audit,
     load_rewrite_episodes,
+    make_status_label,
     register_stage,
     resolve_exp,
     save_audit,
@@ -349,7 +350,7 @@ def main() -> None:
                 n_subs_labeled += 1
                 ep_n_labeled += 1
                 new_sub_status.setdefault(ep_id, {})[int(sub_idx)] = (
-                    f"{STAGE_NAME}:{payload['reason']}"
+                    make_status_label(STAGE_NAME, payload["reason"])
                 )
                 reason_counts[payload["reason"]] = \
                     reason_counts.get(payload["reason"], 0) + 1

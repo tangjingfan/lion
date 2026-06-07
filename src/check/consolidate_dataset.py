@@ -325,6 +325,11 @@ def main() -> None:
     records: List[Dict[str, Any]] = []
     missing: List[str] = []
     n_skipped_unusable = 0
+    # Cells whose *original* record made it into the dataset. A synth
+    # replacement for the same (ep, sub) is redundant — the original
+    # (e.g. grounded by the step-09 detection rescue after a not_visible
+    # label) wins over the template rewrite.
+    included_original_cells: set = set()
     for ep in episodes:
         ep_subs = sub_paths_filter.get(int(ep.instruction_id))
         if ep_subs is None:
@@ -384,6 +389,7 @@ def main() -> None:
                 )
                 continue
             records.append(rec)
+            included_original_cells.add((int(ep.instruction_id), int(sub_idx)))
             append_sub_event(
                 ep_audit, sub_idx, stage=STAGE_NAME, action="included",
                 synthesized=False,
@@ -439,6 +445,24 @@ def main() -> None:
                 try:
                     sub_idx = int(sub_idx_str)
                 except ValueError:
+                    continue
+                if (ep_id, sub_idx) in included_original_cells:
+                    # The original record for this cell is already in the
+                    # dataset (typically rescued by step 09 after the
+                    # visibility label that put it on step 11's work
+                    # list). Real human language wins over the template
+                    # rewrite — skip the synth duplicate.
+                    print(
+                        f"  [dedup] {scan} ep={ep_id} sub={sub_idx}: "
+                        "original already included — skipping synth record"
+                    )
+                    ep_audit = ensure_episode(audit, ep)
+                    append_sub_event(
+                        ep_audit, sub_idx, stage=STAGE_NAME,
+                        action="synth_superseded",
+                        reason="original_already_included",
+                        new_landmark=rescue_rec.get("new_landmark"),
+                    )
                     continue
                 syn = _build_record(
                     ep, sub_idx,

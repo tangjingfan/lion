@@ -55,6 +55,7 @@ from src.check._filter_utils import (
     get_survivor_path,
     load_audit,
     load_rewrite_episodes,
+    make_status_label,
     register_stage,
     resolve_exp,
     save_audit,
@@ -241,7 +242,7 @@ def main() -> None:
                     reason=reason,
                 )
                 new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
-                    f"{STAGE_NAME}:{reason}"
+                    make_status_label(STAGE_NAME, reason)
                 )
             continue
 
@@ -287,7 +288,7 @@ def main() -> None:
                 ep_n_labeled   += 1
                 n_subs_labeled += 1
                 new_sub_status.setdefault(int(ep.instruction_id), {})[int(sub_idx)] = (
-                    f"{STAGE_NAME}:{short_reason}"
+                    make_status_label(STAGE_NAME, short_reason)
                 )
 
         append_ep_event(

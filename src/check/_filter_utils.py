@@ -356,26 +356,24 @@ def resolve_exp(cfg: dict, exp_arg=None, apply_current: bool = True) -> dict:
 
 
 # ── Audit ────────────────────────────────────────────────────────────────
-def load_audit(filt_dir: Path, split: str) -> dict:
-    """Load existing audit.json or initialize a new one."""
-    audit_path = filt_dir / "audit.json"
-    if audit_path.exists():
-        with open(audit_path) as f:
-            return json.load(f)
-    return {"_meta": {"split": split, "stages": []}, "episodes": {}}
-
-
-def save_audit(audit: dict, filt_dir: Path) -> None:
-    with open(filt_dir / "audit.json", "w") as f:
-        json.dump(audit, f, indent=2)
-
-
-def register_stage(audit: dict, stage_name: str, **meta) -> None:
-    """Append the stage to the meta list (idempotent) and stash any params."""
-    if stage_name not in audit["_meta"]["stages"]:
-        audit["_meta"]["stages"].append(stage_name)
-    if meta:
-        audit["_meta"].setdefault("thresholds", {})[stage_name] = meta
+# Moved to src/pipeline/audit.py — re-exported here so existing imports
+# (`from src.check._filter_utils import load_audit, ...`) keep working
+# while call sites migrate to `from src.pipeline.audit import ...`.
+from src.pipeline.audit import (  # noqa: F401  (re-exports)
+    load_audit,
+    save_audit,
+    register_stage,
+    make_status_label,
+    ensure_episode,
+    ensure_sub_path,
+    append_ep_event,
+    append_sub_event,
+    strip_stage_events,
+    detection_rescued,
+    finalize_audit,
+    _sub_verdict,
+    _ep_verdict,
+)
 
 
 # ── Survivor / drop YAMLs ────────────────────────────────────────────────
@@ -536,151 +534,5 @@ def active_subs(cfg: dict) -> Dict[int, List[int]]:
     return out
 
 
-# ── Audit cell helpers ───────────────────────────────────────────────────
-#
-# audit.json is the single per-(ep, sub) lifecycle log. Every pipeline
-# stage from 00 (record_original) through 12 (consolidate) appends one
-# event per touched cell describing what it did:
-#
-#   events: [
-#     {"stage": "blacklist",   "action": "dropped",   "reason": "llm_keep_false"},
-#     {"stage": "rescue_blacklist", "action": "synthesized", "new_landmark": "fridge"},
-#     {"stage": "consolidate", "action": "included"}
-#   ]
-#
-# ``finalize_audit`` resolves the event list into a short ``verdict``
-# string + ``in_dataset`` bool per cell. ``strip_stage_events`` lets a
-# stage drop its own previous events so re-runs are idempotent.
-def ensure_episode(audit: dict, ep) -> dict:
-    """Get-or-create the audit slot for one episode."""
-    return audit["episodes"].setdefault(str(ep.instruction_id), {
-        "scan":        ep.scan,
-        "language":    ep.language,
-        "n_sub_paths": len(ep.sub_paths),
-        "events":      [],
-        "sub_paths":   {},
-    })
-
-
-def ensure_sub_path(ep_audit: dict, sub_idx) -> dict:
-    """Get-or-create the audit slot for one sub-path within an episode."""
-    sp_map = ep_audit.setdefault("sub_paths", {})
-    return sp_map.setdefault(str(sub_idx), {"events": []})
-
-
-def append_ep_event(ep_audit: dict, *, stage: str, action: str, **payload) -> None:
-    """Push one event onto an episode's lifecycle log."""
-    event = {"stage": stage, "action": action}
-    if payload:
-        event.update(payload)
-    ep_audit.setdefault("events", []).append(event)
-
-
-def append_sub_event(
-    ep_audit: dict, sub_idx, *, stage: str, action: str, **payload,
-) -> None:
-    """Push one event onto a sub-path's lifecycle log."""
-    sp = ensure_sub_path(ep_audit, sub_idx)
-    event = {"stage": stage, "action": action}
-    if payload:
-        event.update(payload)
-    sp["events"].append(event)
-
-
-def strip_stage_events(audit: dict, stage: str) -> None:
-    """Drop all events emitted by ``stage`` from every cell.
-
-    Call once at the top of a stage so re-running it doesn't accumulate
-    duplicate events. Upstream events from other stages are preserved.
-    """
-    for ep in audit.get("episodes", {}).values():
-        ep["events"] = [e for e in ep.get("events", []) if e.get("stage") != stage]
-        for sp in (ep.get("sub_paths") or {}).values():
-            sp["events"] = [e for e in sp.get("events", []) if e.get("stage") != stage]
-
-
-def _sub_verdict(events: List[dict]) -> Tuple[str, bool]:
-    """Walk events in order and resolve to ``(verdict, in_dataset)``.
-
-    State machine:
-      - ``dropped``        → verdict := dropped:<stage>:<reason>
-      - ``labeled``        → verdict := labeled:<visibility>
-      - ``selected``       → verdict := kept:<status>  (target found)
-                             or labeled:<status>       (no target)
-      - ``rescued``        → verdict := rescued:<method>
-      - ``synthesized``    → verdict := synthesized:<new_landmark> (sticky:
-                             later ``excluded`` events from step 12 refer
-                             to the *original* record being skipped, not
-                             the synth replacement — they don't override)
-      - ``rescue_failed``  → (informational; leaves prior verdict)
-      - ``applied``        → (informational)
-      - ``included``       → in_dataset := True
-      - ``excluded``       → verdict := excluded:<reason>, in_dataset := False
-                             (suppressed when a ``synthesized`` event has
-                             already fired for the same cell)
-    """
-    verdict = "active"
-    in_dataset = False
-    synth_seen = False
-    for e in events:
-        a = e.get("action")
-        if a == "dropped":
-            verdict = f"dropped:{e.get('stage') or '?'}:{e.get('reason') or 'drop'}"
-            in_dataset = False
-        elif a == "labeled":
-            v = e.get("visibility") or "labeled"
-            verdict = f"labeled:{v}"
-        elif a == "selected":
-            s = e.get("status") or "selected"
-            if e.get("target_instance_ids"):
-                verdict = f"kept:{s}"
-            else:
-                verdict = f"labeled:{s}"
-        elif a == "rescued":
-            verdict = f"rescued:{e.get('method') or 'rescued'}"
-        elif a == "synthesized":
-            verdict = f"synthesized:{e.get('new_landmark') or 'synth'}"
-            synth_seen = True
-        elif a == "included":
-            in_dataset = True
-        elif a == "excluded":
-            # Step 12 emits one excluded event per skipped original
-            # record. When the same (ep, sub) was synthesized at step 11,
-            # the synth row replaces the original in dataset.json, so the
-            # excluded event isn't the final word.
-            if not synth_seen:
-                verdict = f"excluded:{e.get('reason') or 'excluded'}"
-                in_dataset = False
-        # `kept`, `rescue_failed`, `applied` are informational; no-op.
-    return verdict, in_dataset
-
-
-def _ep_verdict(events: List[dict]) -> str:
-    for e in events:
-        if e.get("action") == "dropped":
-            return f"dropped:{e.get('stage') or '?'}:{e.get('reason') or 'drop'}"
-    return "kept"
-
-
-def finalize_audit(audit: dict) -> None:
-    """Compute the convenience ``verdict`` / ``in_dataset`` summary on
-    every audit cell from its event list.
-
-    Idempotent — overwrites the summary fields. The events list stays
-    the source of truth; the summary is for grep / jq / human reading.
-    A sub whose episode was dropped inherits the episode's verdict and
-    ``in_dataset = False``.
-    """
-    for ep_id, ep in audit.get("episodes", {}).items():
-        ep_events = ep.get("events", [])
-        ep_verdict = _ep_verdict(ep_events)
-        ep["verdict"] = ep_verdict
-        ep_dropped = ep_verdict.startswith("dropped:")
-        for _sub_idx, sp in (ep.get("sub_paths") or {}).items():
-            if ep_dropped:
-                sp["verdict"]    = ep_verdict
-                sp["in_dataset"] = False
-            else:
-                v, in_ds = _sub_verdict(sp.get("events", []))
-                sp["verdict"]    = v
-                sp["in_dataset"] = in_ds
+# (Audit cell helpers + verdict resolver live in src/pipeline/audit.py;
+#  re-exported above.)
