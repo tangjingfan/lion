@@ -13,18 +13,19 @@
 
 dataset:
   # Path to the Landmark-RxR split JSON (a selection YAML may override).
-  data_path: /home/fan/project/Landmark-RxR/LandmarkRxR_val_unseen.json
+  # Relative paths resolve against the repo root (scripts/*.sh cd there).
+  data_path: ../Landmark-RxR/LandmarkRxR_val_unseen.json
 
   # Optional: directory of {scan}_connectivity.json files (R2R standard).
   # When set, positions come from the JSON height field (accurate navmesh level).
   # Falls back to .house file parsing when a scan's JSON is missing.
-  connectivity_json_dir: /home/fan/project/data/connectivity/
+  connectivity_json_dir: ../data/connectivity/
 
 # ============================================================
 #  Scenes — root path for MP3D scene assets
 # ============================================================
 scenes:
-  scenes_dir: /home/fan/project/VLN_dataset/data/scene_datasets/
+  scenes_dir: ../VLN_dataset/data/scene_datasets/
 
 # ============================================================
 #  Environment  (Habitat rgbds_agent: RGB + depth + semantic)
@@ -35,7 +36,7 @@ env:
   habitat_config: configs/habitat/rgbds_sim.yaml
   # Must point at MP3D's scene_dataset_config.json so Habitat-Sim loads the
   # `<scan>_semantic.ply` meshes — otherwise the semantic sensor returns zeros.
-  scene_dataset: /home/fan/project/VLN_dataset/data/scene_datasets/mp3d/mp3d.scene_dataset_config.json
+  scene_dataset: ../VLN_dataset/data/scene_datasets/mp3d/mp3d.scene_dataset_config.json
 
   # Navmesh agent geometry
   height: 0.88      # metres
@@ -70,4 +71,4 @@ env:
 #  save_json / save_replay_yaml) belong in a selection YAML.
 # ============================================================
 output:
-  base_dir: /home/fan/project/LION/results/
+  base_dir: results/
