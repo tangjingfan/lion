@@ -1,5 +1,12 @@
 """Synthesize a replacement landmark when the original can't be grounded.
 
+CLI + per-scan orchestration for pipeline step 11
+(``scripts/11_rescue_blacklist.sh``).  The selection algorithm, source
+collection, referrability table, and VLM naming live in
+:mod:`src.process.synthesis`; equirect unprojection + voxel counting in
+:mod:`src.env.geometry`; ``.house`` instance metadata in
+:mod:`src.env.mp3d_house`.
+
 Three upstream conditions feed this rescue (all treated uniformly):
 
   • ``origin = "blacklist"`` — step 02 dropped the sub because its
@@ -15,45 +22,16 @@ Three upstream conditions feed this rescue (all treated uniformly):
     instance of that category visible at the partition pose (e.g.
     ``bath`` → ``bathtub`` matched, but no bathtub in view). Read
     from the lifecycle audit's ``visibility`` events with
-    ``visibility == "not_visible"``.
+    ``visibility == "not_visible"``.  Subs later grounded by the
+    step-09 detection rescue are skipped — their original record is
+    usable as-is.
 
-In both cases the original landmark is not recoverable, so we pick a
+In all cases the original landmark is not recoverable, so we pick a
 **different** referrable landmark visible at the partition pose and
 emit a synthesized sub-instruction. Records flow through the rest of
 the pipeline marked ``synthesized = True`` with ``synthesized_from.origin``
 recording which upstream branch fed them, so downstream consumers can
 filter as they like.
-
-Selection algorithm (per candidate sub-path):
-
-  1. Render an RGB + depth + semantic equirectangular panorama at BOTH
-     the partition pose and the end pose. Unproject depth + semantic
-     to a world-frame point cloud per instance, downsample at
-     ``VOXEL_SIZE_M`` (10 cm), and count unique voxels per instance.
-     Voxel counts (vs. pixel counts) decouple "spatial extent visible"
-     from "how close we happen to be" — pixel counts conflate the two.
-  2. Visibility filter — require
-     ``partition_voxels[iid] / end_voxels[iid] >= MIN_VISIBILITY_RATIO``
-     (10%). The agent reads "walk to a X" at the partition pose, so X
-     must already cover at least 10% of its eventual voxel footprint
-     from there.
-  3. Approach filter — require ``dist_partition > dist_end`` (geometric,
-     using ``.house`` instance centers in Habitat coords).
-  4. Tier filter (referrability table in
-     ``configs/landmark_referrable.yaml``) — categories tagged
-     ``too_generic`` (wall, floor, ceiling, door, window, ...) are
-     dropped.
-  5. Sort survivors by descending approach distance and walk them in
-     order:
-       - ``fine`` tier → use the MPCat40 token directly as the new
-         landmark and commit.
-       - ``collective`` tier (appliances / furniture / lighting /
-         objects / ...) → render the highlighted instance, ask the
-         VLM what the object actually is. Accept when confidence is
-         ``high``; otherwise fall through to the next candidate.
-     Returns the first candidate that produces a usable name; if all
-     collective candidates come back ``unknown``, the sub gets
-     ``rescue_failed: no_fit_candidate``.
 
 Per-(scan, instance_id) VLM responses are cached in
 ``target_instances/<scan>/vlm_instance_labels.json`` so repeated runs
@@ -61,7 +39,7 @@ don't re-pay the VLM cost.
 
 Output: ``target_instances/{scan}/blacklist_rescue.json`` — one record
 per synthesized sub-path. The ``origin`` field on each record
-distinguishes the two upstream sources. The consolidate step (12) reads
+distinguishes the upstream sources. The consolidate step (12) reads
 this file and emits synthesized rows into ``dataset.json`` alongside
 the original ones.
 
@@ -75,867 +53,57 @@ Usage
 from __future__ import annotations
 
 import argparse
-import base64
 import json
-import mimetypes
 import os
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.check._filter_utils import (
+from src.pipeline.audit import (
     append_sub_event,
-    detection_rescued,
     finalize_audit,
-    get_filter_dir,
-    get_run_dir,
-    get_split,
     load_audit,
     register_stage,
-    resolve_exp,
     save_audit,
     strip_stage_events,
 )
-
+from src.pipeline.config import (
+    get_filter_dir,
+    get_run_dir,
+    get_split,
+    resolve_exp,
+)
 
 STAGE_NAME = "rescue_blacklist"
 
 from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
-from src.env.connectivity import _mp3d_to_habitat, load_connectivity
+from src.env.connectivity import load_connectivity
+from src.env.geometry import VOXEL_SIZE_M, visible_instance_voxels
+from src.env.mp3d_house import instance_meta_from_house
 from src.process.rewriter import make_client
-from src.process.visibility import VisibilityChecker
-
-
-# Path to the 3-tier MPCat40 classification (regenerated by
-# scripts/build_landmark_referrable.sh). Categories absent from this
-# file default to ``fine``.
-REFERRABLE_TABLE_PATH = (
-    Path(__file__).resolve().parents[2] / "configs" / "landmark_referrable.yaml"
+from src.process.synthesis import (
+    MIN_VISIBILITY_RATIO,
+    REFERRABLE_TABLE_PATH,
+    SIZE_SATURATION_VOXELS,
+    blacklist_drops,
+    detection_failures,
+    load_referrability_table,
+    load_vlm_cache,
+    merge_drops,
+    pick_replacement_landmark,
+    resolve_node_pos,
+    save_vlm_cache,
+    synth_sub_instruction,
+    visibility_not_visible_failures,
 )
-
-# A candidate landmark must be at least this fraction as visible at
-# the partition pose as it is at the end pose. The intuition: when the
-# agent reads "walk to a X", they must already be able to see X
-# clearly enough — a destination that's invisible from where the
-# instruction is read isn't a usable landmark. 0.10 means "at least
-# 10% of the eventual voxel coverage is already on screen at
-# instruction-read time."
-MIN_VISIBILITY_RATIO = 0.10
-
-# Voxel size for downsampling the unprojected point cloud (metres in
-# world coordinates). 0.1 m = 10 cm cells — small enough to capture
-# the shape of furniture and people, large enough that nearby points
-# collapse into the same cell so a 1-m-wide fridge surface contributes
-# tens of voxels rather than thousands of unique pixels.
-VOXEL_SIZE_M = 0.10
-
-# Score saturation point on partition-pose voxel count. Above this the
-# soft-size penalty contributes ``1.0``; below it the candidate's score
-# is linearly discounted. 200 voxels at 0.10 m ≈ a 0.5-m-cube object's
-# visible surface — the smallest area we still treat as "clearly
-# visible". Below that an instance is small enough that a huge approach
-# distance no longer means it's a confident destination.
-SIZE_SATURATION_VOXELS = 200
-
-# Confidence values from the VLM that count as "accept and use the
-# refined name". Anything else falls through to the next candidate.
-_VLM_ACCEPT_CONFIDENCES = {"high"}
-
-
-def _load_yaml(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
-
-
-# ── Referrability table ──────────────────────────────────────────────────
-def _load_referrability_table() -> Dict[str, str]:
-    """Read ``configs/landmark_referrable.yaml`` → ``{category: tier}``.
-
-    Returns an empty dict if the file is missing — every category will
-    then default to ``fine`` (the old behaviour minus the structural
-    blacklist), so the pipeline still runs but with no smart filtering.
-    Print a warning in that case so the user knows to regenerate.
-    """
-    payload = _load_yaml(REFERRABLE_TABLE_PATH)
-    cats = (payload or {}).get("categories") or {}
-    if not cats:
-        print(
-            f"  WARN [referrability table] no entries at {REFERRABLE_TABLE_PATH}; "
-            "every MPCat40 category will default to 'fine'. Regenerate via "
-            "scripts/build_landmark_referrable.sh."
-        )
-    return {str(k).strip().lower(): str(v).strip().lower() for k, v in cats.items()}
-
-
-def _tier(referrability: Dict[str, str], cat: str) -> str:
-    """Look up the tier for an MPCat40 category, defaulting to ``fine``."""
-    key = (cat or "").strip().lower()
-    return referrability.get(key, "fine")
-
-
-# ── VLM instance naming (used for `collective` tier) ─────────────────────
-def _image_data_url(path: Path) -> str:
-    mime = mimetypes.guess_type(str(path))[0] or "image/png"
-    data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{data}"
-
-
-def _extract_json_object(raw: str) -> Dict:
-    raw = (raw or "").strip()
-    if raw.startswith("```"):
-        body = raw[3:]
-        if body.startswith("json"):
-            body = body[4:]
-        if body.endswith("```"):
-            body = body[:-3]
-        raw = body.strip()
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first < 0 or last <= first:
-        return {}
-    try:
-        out = json.loads(raw[first:last + 1])
-        return out if isinstance(out, dict) else {}
-    except json.JSONDecodeError:
-        return {}
-
-
-_VLM_NAMING_SYSTEM = """\
-You identify the highlighted object in an indoor scene panorama so it
-can be used as a navigation landmark in a synthesized instruction of
-the form "... walk to a X.".
-
-Return JSON only (no markdown):
-
-  {"name": "<short noun phrase, 1-3 words>",
-   "confidence": "high" | "low",
-   "reason": "<one short sentence>"}
-
-Rules:
-  - confidence=high ONLY when you can clearly identify the object.
-  - The name must read naturally in "walk to a <name>" — prefer
-    concrete everyday English ("refrigerator", "office chair",
-    "ceiling lamp"). Do NOT return the bucket name verbatim
-    ("appliance", "furniture", "lighting") — those are too generic;
-    set confidence=low if you can't be more specific.
-  - If the highlighted object is unclear, occluded, or you would only
-    be guessing, set confidence=low.
-"""
-
-
-def _name_instance_via_vlm(
-    client,
-    *,
-    model: str,
-    image_path: Path,
-    coarse_category: str,
-    max_retries: int = 2,
-    temperature: float = 0.0,
-    max_tokens: int = 256,
-) -> Dict:
-    """Ask the VLM what the highlighted instance is.
-
-    Returns a dict with ``name`` / ``confidence`` / ``reason`` keys
-    (possibly empty strings on parse failure or transport error).
-    """
-    user_text = (
-        f"The highlighted region shows a single instance whose coarse "
-        f"MPCat40 category is '{coarse_category}'. Identify the object "
-        f"more specifically."
-    )
-    content = [
-        {"type": "text",      "text": user_text},
-        {"type": "image_url", "image_url": {"url": _image_data_url(image_path)}},
-    ]
-    last_err: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": _VLM_NAMING_SYSTEM},
-                        {"role": "user",   "content": content},
-                    ],
-                )
-            except TypeError:
-                # Older clients without response_format support.
-                resp = client.chat.completions.create(
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    messages=[
-                        {"role": "system", "content": _VLM_NAMING_SYSTEM},
-                        {"role": "user",   "content": content},
-                    ],
-                )
-            raw = (resp.choices[0].message.content or "").strip()
-            parsed = _extract_json_object(raw)
-            name = (parsed.get("name") or "").strip()
-            conf = (parsed.get("confidence") or "").strip().lower()
-            return {
-                "name":       name,
-                "confidence": conf,
-                "reason":     (parsed.get("reason") or "").strip(),
-                "raw":        raw,
-                "model":      model,
-            }
-        except Exception as exc:
-            last_err = exc
-    return {"name": "", "confidence": "low",
-            "reason": f"vlm error: {last_err}", "raw": "", "model": model}
-
-
-def _load_vlm_cache(scan_dir: Path) -> Dict[str, Dict]:
-    p = scan_dir / "vlm_instance_labels.json"
-    if not p.exists():
-        return {}
-    try:
-        with open(p) as f:
-            data = json.load(f) or {}
-    except json.JSONDecodeError:
-        return {}
-    return data.get("labels") or {}
-
-
-def _save_vlm_cache(scan_dir: Path, scan: str, labels: Dict[str, Dict]) -> None:
-    if not labels:
-        return
-    scan_dir.mkdir(parents=True, exist_ok=True)
-    p = scan_dir / "vlm_instance_labels.json"
-    with open(p, "w") as f:
-        json.dump({"scan": scan, "labels": labels}, f, indent=2, ensure_ascii=False)
-
-
-def _blacklist_drops(filt_dir: Path) -> List[Tuple[int, int, Dict]]:
-    """Return ``[(ep_id, sub_idx, drop_record), ...]`` from
-    ``02_blacklist_dropped.yaml``.
-
-    Each ``drop_record`` carries ``landmark`` + ``reason`` + ``origin =
-    "blacklist"`` so the synthesis loop can treat blacklist drops and
-    detection failures uniformly downstream.
-    """
-    payload = _load_yaml(filt_dir / "02_blacklist_dropped.yaml")
-    out: List[Tuple[int, int, Dict]] = []
-    for ep_id_str, info in (payload.get("dropped") or {}).items():
-        for sub_idx_str, rec in ((info or {}).get("subs") or {}).items():
-            try:
-                out.append((
-                    int(ep_id_str),
-                    int(sub_idx_str),
-                    {**(rec or {}), "origin": "blacklist"},
-                ))
-            except ValueError:
-                continue
-    return out
-
-
-def _detection_failures(audit: dict) -> List[Tuple[int, int, Dict]]:
-    """Return ``[(ep_id, sub_idx, drop_record), ...]`` for every sub where
-    stage 09 (detection) emitted a ``rescue_failed`` event.
-
-    Same shape as :func:`_blacklist_drops` so they can be merged into one
-    candidate list. The original landmark and YOLO failure reason come
-    from the event payload (stage 09 records both); ``origin`` is set to
-    ``"detection_failure"`` so the synthesis output can distinguish the
-    two sources.
-    """
-    out: List[Tuple[int, int, Dict]] = []
-    for ep_id_str, ep in (audit.get("episodes") or {}).items():
-        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
-            failed = [
-                e for e in (sp.get("events") or [])
-                if e.get("stage") == "detection"
-                and e.get("action") == "rescue_failed"
-            ]
-            if not failed:
-                continue
-            last = failed[-1]
-            try:
-                ep_id = int(ep_id_str)
-                sub_idx = int(sub_idx_str)
-            except ValueError:
-                continue
-            out.append((ep_id, sub_idx, {
-                "landmark": last.get("landmark") or "",
-                "reason":   f"detection:{last.get('reason') or 'unknown'}",
-                "origin":   "detection_failure",
-            }))
-    return out
-
-
-def _visibility_not_visible_failures(audit: dict) -> List[Tuple[int, int, Dict]]:
-    """Return ``[(ep_id, sub_idx, drop_record), ...]`` for every sub where
-    stage 07 (visibility) labeled the original landmark ``not_visible``.
-
-    These are the "fine MPCat40 match but no instance visible at the
-    partition pose" cases — the landmark text is conceptually fine
-    (e.g. ``bath`` → ``bathtub``) but no bathtub is on screen when the
-    agent reads the instruction. Step 09 skips them because they have a
-    fine match (not coarse-only or no_match), and the blacklist channel
-    doesn't catch them either, so without an extra rescue path they
-    ended up in dataset.json with empty ``target_instance_ids`` —
-    technically included but practically unusable.
-
-    Same shape as :func:`_blacklist_drops`; ``origin`` is set to
-    ``"visibility_not_visible"``. Step 12 (consolidate) excludes the
-    original records of these subs from the dataset, so when no synth
-    succeeds the sub is left out (dataset only contains records whose
-    landmark is actually visible at the partition pose).
-    """
-    out: List[Tuple[int, int, Dict]] = []
-    for ep_id_str, ep in (audit.get("episodes") or {}).items():
-        for sub_idx_str, sp in (ep.get("sub_paths") or {}).items():
-            events = sp.get("events") or []
-            labeled = [
-                e for e in events
-                if e.get("stage") == "visibility"
-                and e.get("action") == "labeled"
-                and e.get("visibility") == "not_visible"
-            ]
-            if not labeled:
-                continue
-            # Step 09 may have grounded the original landmark after the
-            # visibility label (semantic sensor missed it, detector found
-            # it). The rescued original is usable as-is — synthesizing a
-            # replacement on top would put the same (ep, sub) into
-            # dataset.json twice.
-            if detection_rescued(events):
-                continue
-            last = labeled[-1]
-            try:
-                ep_id = int(ep_id_str)
-                sub_idx = int(sub_idx_str)
-            except ValueError:
-                continue
-            out.append((ep_id, sub_idx, {
-                "landmark": last.get("landmark") or "",
-                "reason":   "visibility:not_visible",
-                "origin":   "visibility_not_visible",
-            }))
-    return out
-
-
-def _merge_drops(
-    *sources: List[Tuple[int, int, Dict]],
-) -> List[Tuple[int, int, Dict]]:
-    """Concatenate drop lists and keep the first occurrence per (ep, sub).
-
-    Blacklist drops take precedence over detection failures (we list them
-    first at the call site), since a blacklisted sub never reaches step
-    09 — but guarding anyway in case the upstream order changes.
-    """
-    seen: set = set()
-    merged: List[Tuple[int, int, Dict]] = []
-    for source in sources:
-        for ep, sub, rec in source:
-            key = (ep, sub)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append((ep, sub, rec))
-    return merged
-
-
-def _instance_meta_from_house(scenes_dir: str, scan: str) -> Dict[int, Dict]:
-    """Map ``instance_id -> {category, center_habitat}`` from a scan's .house.
-
-    Habitat's ``sim.semantic_annotations()`` is unreliable through the
-    LION ``VisibilityChecker`` wrapper (returns empty objects list in our
-    setup), so we read the same data straight from ``.house``:
-
-      * ``C`` rows define ``category_index -> mpcat40_name``.
-      * ``O`` rows define ``instance_id, category_index, x, y, z`` in MP3D
-        coordinates (x=right, y=forward, z=up).
-
-    Centers are converted to Habitat coordinates via
-    :func:`src.env.connectivity._mp3d_to_habitat` so they're comparable
-    with node positions returned by ``load_connectivity``.
-    """
-    house_path = Path(scenes_dir) / "mp3d" / scan / f"{scan}.house"
-    if not house_path.exists():
-        return {}
-
-    cat_index_to_mpcat40: Dict[int, str] = {}
-    out: Dict[int, Dict] = {}
-    with open(house_path) as f:
-        for line in f:
-            parts = line.split()
-            if not parts:
-                continue
-            if parts[0] == "C" and len(parts) >= 6:
-                try:
-                    cat_index = int(parts[1])
-                except ValueError:
-                    continue
-                name = parts[5].replace("#", " ").strip().lower()
-                if name:
-                    cat_index_to_mpcat40[cat_index] = name
-            elif parts[0] == "O" and len(parts) >= 7:
-                try:
-                    iid = int(parts[1])
-                    cat_index = int(parts[3])
-                    x, y, z = float(parts[4]), float(parts[5]), float(parts[6])
-                except ValueError:
-                    continue
-                out[iid] = {
-                    "_cat_index": cat_index,
-                    "center":     _mp3d_to_habitat(x, y, z),
-                }
-    for iid, meta in out.items():
-        meta["category"] = cat_index_to_mpcat40.get(meta.pop("_cat_index"), "")
-    return out
-
-
-def _resolve_node_pos(
-    node_id: str, virtual_nodes: Dict[str, List[float]], scan_db: Dict[str, np.ndarray],
-) -> Optional[np.ndarray]:
-    if isinstance(node_id, str) and node_id.startswith("virt:"):
-        pos = virtual_nodes.get(node_id)
-        return np.asarray(pos, dtype=np.float32) if pos is not None else None
-    if node_id in scan_db:
-        return np.asarray(scan_db[node_id], dtype=np.float32)
-    return None
-
-
-def _unproject_equirect(
-    depth:     np.ndarray,
-    semantic:  np.ndarray,
-    pos:       np.ndarray,
-    heading:   float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Unproject an equirectangular depth + semantic panorama into a
-    flat 3-D point cloud in **world** coordinates.
-
-    Habitat's equirectangular sensor returns radial distance to first
-    hit along each pixel's ray. For pixel ``(u, v)`` on a ``(H, W)``
-    panorama:
-
-      θ = 2π · u / W − π        ∈ [-π, π]   (yaw, +x = right of agent)
-      φ = π/2 − π · v / H       ∈ [-π/2, π/2] (pitch, +y = up)
-
-    The sensor frame at heading=0 has the agent facing −z, so:
-
-      x_local =  d · cos(φ) · sin(θ)
-      y_local =  d · sin(φ)
-      z_local = -d · cos(φ) · cos(θ)
-
-    A heading rotation around y maps local → world before adding ``pos``.
-    Returns ``(points (N, 3) float32, instance_ids (N,) int32)`` with
-    invalid pixels (non-finite depth, zero, or unannotated) filtered
-    out so downstream consumers can voxelise directly.
-    """
-    H, W  = depth.shape[:2]
-    u     = np.arange(W, dtype=np.float32).reshape(1, W)
-    v     = np.arange(H, dtype=np.float32).reshape(H, 1)
-    theta = 2.0 * np.pi * (u / W) - np.pi
-    phi   = 0.5 * np.pi - np.pi * (v / H)
-    cos_phi = np.cos(phi)
-    d       = depth.astype(np.float32, copy=False)
-
-    x_local = d * cos_phi * np.sin(theta)
-    y_local = d * np.sin(phi)
-    z_local = -d * cos_phi * np.cos(theta)
-
-    valid = np.isfinite(d) & (d > 1e-3) & (d < 1e3) & (semantic >= 0)
-    pts_local = np.stack([x_local[valid], y_local[valid], z_local[valid]], axis=1)
-    iids      = semantic[valid].astype(np.int32, copy=False)
-    if pts_local.size == 0:
-        return pts_local.astype(np.float32), iids
-
-    cos_h, sin_h = float(np.cos(heading)), float(np.sin(heading))
-    rot = np.array([[ cos_h, 0.0, sin_h],
-                    [   0.0, 1.0,   0.0],
-                    [-sin_h, 0.0, cos_h]], dtype=np.float32)
-    pts_world = pts_local @ rot.T + np.asarray(pos, dtype=np.float32)
-    return pts_world.astype(np.float32, copy=False), iids
-
-
-def _voxelise_per_instance(
-    points:    np.ndarray,
-    iids:      np.ndarray,
-    voxel_size: float,
-) -> Dict[int, int]:
-    """Return ``{instance_id: unique_voxel_count}``.
-
-    Each 3-D point is binned into a voxel by ``floor(p / voxel_size)``;
-    for each instance, count how many distinct cells its points occupy.
-    Empty inputs return ``{}``.
-    """
-    if points.size == 0:
-        return {}
-    vox = np.floor(points / float(voxel_size)).astype(np.int64)
-    # Combine instance id + (vx, vy, vz) into a single key so np.unique
-    # gives us (iid, voxel) pairs in one shot.
-    key = np.empty((points.shape[0], 4), dtype=np.int64)
-    key[:, 0]  = iids.astype(np.int64, copy=False)
-    key[:, 1:] = vox
-    uniq = np.unique(key, axis=0)
-    out: Dict[int, int] = {}
-    for row in uniq:
-        i = int(row[0])
-        out[i] = out.get(i, 0) + 1
-    return out
-
-
-def _visible_instance_voxels(
-    depth:    np.ndarray,
-    semantic: np.ndarray,
-    pos:      np.ndarray,
-    heading:  float,
-    voxel_size: float = VOXEL_SIZE_M,
-) -> Dict[int, int]:
-    """Render-time helper: depth + semantic panorama → ``{iid: voxels}``.
-
-    Pipeline: unproject equirect depth into world-frame points, drop
-    invalid pixels, voxel-downsample at ``voxel_size`` metres, count
-    distinct voxels per instance id.
-    """
-    points, iids = _unproject_equirect(depth, semantic, pos, heading)
-    return _voxelise_per_instance(points, iids, voxel_size)
-
-
-def _size_weight(partition_voxels: int) -> float:
-    """Soft penalty for spatially-small instances at the partition pose.
-
-    Returns a multiplier in ``[0, 1]`` that saturates at
-    ``SIZE_SATURATION_VOXELS``. A 5-voxel speck gets weight 0.025, a
-    200+ voxel landmark gets weight 1.0. Multiplied into the candidate
-    score so a huge approach distance no longer compensates for a
-    barely-visible destination.
-    """
-    return min(1.0, max(0.0, partition_voxels) / float(SIZE_SATURATION_VOXELS))
-
-
-def _candidate_score(c: Dict) -> float:
-    """Selection score for one candidate.
-
-    ``approach × size_weight``. Maximised to pick the best landmark:
-    we still want the instance the agent walks toward the most, but
-    that signal is muted when the instance occupies few voxels at the
-    instruction-read pose (i.e. is spatially small from there).
-    """
-    return c["approach_m"] * _size_weight(c["voxel_count"])
-
-
-def _rank_candidates(
-    partition_voxels: Dict[int, int],
-    end_voxels:       Dict[int, int],
-    inst_meta:        Dict[int, Dict],
-    partition_pos:    np.ndarray,
-    end_pos:          np.ndarray,
-    referrability:    Dict[str, str],
-    debug_prefix:     str = "",
-) -> List[Dict]:
-    """Geometric-filter all instances and return candidates sorted by
-    descending score.
-
-    Per-candidate filters (all must pass):
-      1. instance has a known MPCat40 category
-      2. ratio = partition_voxels / end_voxels >= MIN_VISIBILITY_RATIO
-      3. dist_partition > dist_end (agent walks toward the instance)
-      4. tier(cat) != "too_generic"
-
-    Survivors are ranked by ``score = approach_m × size_weight``, where
-    ``size_weight`` saturates at ``SIZE_SATURATION_VOXELS`` so tiny
-    instances can't ride a long approach to the top of the list.
-
-    No VLM is called here — that happens at pick time in
-    :func:`_pick_replacement_landmark`, only for the candidate(s) we
-    actually want to commit to.
-    """
-    candidates: List[Dict] = []
-    all_iids = set(partition_voxels) | set(end_voxels)
-
-    print(f"{debug_prefix}  end-pose visible instances (top 10 by voxel count):")
-    top = sorted(end_voxels.items(), key=lambda kv: -kv[1])[:10]
-    for iid, end_vx in top:
-        meta = inst_meta.get(iid) or {}
-        cat = meta.get("category") or "?"
-        p_vx = partition_voxels.get(iid, 0)
-        ratio = (p_vx / end_vx) if end_vx > 0 else 0.0
-        center = meta.get("center")
-        if center is not None:
-            dist_p = float(np.linalg.norm(partition_pos - center))
-            dist_e = float(np.linalg.norm(end_pos - center))
-            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} tier={_tier(referrability, cat):<11s} "
-                  f"e_vx={end_vx:>5d} p_vx={p_vx:>5d} ratio={ratio:.2f} "
-                  f"approach={dist_p-dist_e:+.2f}m")
-        else:
-            print(f"{debug_prefix}    iid={iid:>4} cat={cat:<14s} "
-                  f"e_vx={end_vx:>5d} p_vx={p_vx:>5d} ratio={ratio:.2f} "
-                  f"(no .house center)")
-
-    for iid in all_iids:
-        if iid not in inst_meta:
-            continue
-        cat = inst_meta[iid]["category"]
-        if not cat:
-            continue
-        tier = _tier(referrability, cat)
-        if tier == "too_generic":
-            continue
-        end_vx = end_voxels.get(iid, 0)
-        if end_vx <= 0:
-            continue
-        p_vx = partition_voxels.get(iid, 0)
-        ratio = p_vx / end_vx
-        if ratio < MIN_VISIBILITY_RATIO:
-            continue
-        center = inst_meta[iid]["center"]
-        dist_p = float(np.linalg.norm(partition_pos - center))
-        dist_e = float(np.linalg.norm(end_pos - center))
-        approach = dist_p - dist_e
-        if approach <= 0:
-            continue
-        candidates.append({
-            "instance_id":      iid,
-            "category":         cat,
-            "tier":             tier,
-            "voxel_count":      p_vx,
-            "voxels_at_end":    end_vx,
-            "ratio":            ratio,
-            "dist_partition_m": dist_p,
-            "dist_end_m":       dist_e,
-            "approach_m":       approach,
-        })
-
-    if not candidates:
-        print(f"{debug_prefix}  → no fit candidate "
-              f"(too_generic, ratio < {MIN_VISIBILITY_RATIO:.2f}, or not approaching)")
-        return []
-
-    # Sort by descending score (approach × size_weight). Tie-break on
-    # raw partition voxel count so a spatially-clear candidate beats an
-    # equally-scored barely-visible one.
-    for c in candidates:
-        c["score"] = _candidate_score(c)
-    candidates.sort(key=lambda c: (-c["score"], -c["voxel_count"]))
-    print(f"{debug_prefix}  candidates ranked by score "
-          f"(approach × min(1, p_vx/{SIZE_SATURATION_VOXELS})) — {len(candidates)} total:")
-    for c in candidates:
-        print(f"{debug_prefix}    iid={c['instance_id']:>4} cat={c['category']:<14s} "
-              f"tier={c['tier']:<11s} p_vx={c['voxel_count']:>5d} e_vx={c['voxels_at_end']:>5d} "
-              f"ratio={c['ratio']:.2f} approach={c['approach_m']:+.2f}m "
-              f"score={c['score']:+.2f}")
-    return candidates
-
-
-def _resolve_label(
-    candidate:   Dict,
-    *,
-    partition_pos:    np.ndarray,
-    scan:        str,
-    ep_id:       int,
-    sub_idx:     int,
-    sub_total:   int,
-    checker:     VisibilityChecker,
-    vlm_client,
-    vlm_model:   str,
-    vlm_cache:   Dict[str, Dict],
-    viz_dir:     Path,
-    debug_prefix: str = "",
-) -> Optional[Dict]:
-    """Decide the human-facing landmark name for one candidate.
-
-    Returns ``None`` if the candidate must be skipped (collective + no
-    VLM available, or collective + VLM unable to identify). Otherwise
-    returns ``{"name": ..., "source": "mpcat40" | "vlm", "vlm": ...}``.
-
-    Per-instance VLM responses are cached in ``vlm_cache`` and persist
-    across runs at ``target_instances/<scan>/vlm_instance_labels.json``,
-    so calling this function many times for the same instance pays the
-    VLM cost only once.
-    """
-    cat = candidate["category"]
-    tier = candidate["tier"]
-    if tier == "fine":
-        return {"name": cat, "source": "mpcat40", "vlm": None}
-    if tier != "collective":
-        return None  # too_generic — shouldn't reach here, but be safe.
-
-    if vlm_client is None:
-        print(f"{debug_prefix}    iid={candidate['instance_id']} "
-              f"collective(cat={cat!r}) — VLM disabled, skipping")
-        return None
-
-    cache_key = str(candidate["instance_id"])
-    cached = vlm_cache.get(cache_key)
-    if cached and cached.get("name") is not None:
-        result = cached
-        print(f"{debug_prefix}    iid={candidate['instance_id']} cat={cat!r} "
-              f"(VLM cache) → name={result.get('name')!r} "
-              f"conf={result.get('confidence')!r}")
-    else:
-        # Render the highlighted instance at the partition pose so the
-        # VLM sees what the agent sees when reading the instruction.
-        mask_path = viz_dir / f"sub_{sub_idx:03d}_iid_{candidate['instance_id']}_vlm.png"
-        try:
-            _render_mask_for_rollout_frame(
-                checker=checker,
-                scan=scan,
-                instance_id=int(candidate["instance_id"]),
-                frame_record={
-                    "position":       [float(x) for x in partition_pos],
-                    "heading":        0.0,
-                    "instruction_id": ep_id,
-                    "instruction":    f"identify the highlighted {cat}",
-                    "landmark":       cat,
-                    "sub_idx":        sub_idx,
-                    "sub_total":      sub_total,
-                    "step":           0,
-                    "action":         "VLM_NAMING",
-                },
-                out_path=mask_path,
-                info_width=300,
-            )
-        except Exception as exc:
-            print(f"{debug_prefix}    iid={candidate['instance_id']} "
-                  f"mask render failed: {exc}; skipping")
-            return None
-
-        result = _name_instance_via_vlm(
-            client=vlm_client,
-            model=vlm_model,
-            image_path=mask_path,
-            coarse_category=cat,
-        )
-        # Persist into the cache regardless of confidence — repeated
-        # uncertainty is a real signal we want to remember.
-        vlm_cache[cache_key] = {
-            "instance_id":     int(candidate["instance_id"]),
-            "coarse_category": cat,
-            "name":            result.get("name") or "",
-            "confidence":      result.get("confidence") or "",
-            "reason":          result.get("reason") or "",
-            "model":           result.get("model") or vlm_model,
-            "mask_path":       str(mask_path),
-        }
-        print(f"{debug_prefix}    iid={candidate['instance_id']} cat={cat!r} "
-              f"→ VLM name={result.get('name')!r} conf={result.get('confidence')!r}")
-
-    name = (result.get("name") or "").strip()
-    conf = (result.get("confidence") or "").strip().lower()
-    bucket_norm = cat.strip().lower()
-    if (conf in _VLM_ACCEPT_CONFIDENCES
-            and name
-            and name.strip().lower() != bucket_norm):
-        return {
-            "name":   name,
-            "source": "vlm",
-            "vlm":    {
-                "confidence": conf,
-                "model":      result.get("model"),
-                "reason":     result.get("reason"),
-            },
-        }
-    return None
-
-
-def _pick_replacement_landmark(
-    partition_voxels: Dict[int, int],
-    end_voxels:       Dict[int, int],
-    inst_meta:        Dict[int, Dict],
-    partition_pos:    np.ndarray,
-    end_pos:          np.ndarray,
-    referrability:    Dict[str, str],
-    *,
-    scan:        str,
-    ep_id:       int,
-    sub_idx:     int,
-    sub_total:   int,
-    checker:     VisibilityChecker,
-    vlm_client,
-    vlm_model:   str,
-    vlm_cache:   Dict[str, Dict],
-    viz_dir:     Path,
-    debug_prefix: str = "",
-) -> Optional[Dict]:
-    """Pick one replacement landmark or return ``None``.
-
-    Two-stage selection:
-
-      1. :func:`_rank_candidates` filters every visible instance by
-         visibility ratio (>= 10%), approach (> 0), and tier
-         (drops ``too_generic``), then sorts the survivors by max
-         approach.
-      2. Walk the sorted list in order. For each candidate,
-         :func:`_resolve_label` decides what to call it:
-             - ``fine``       → use the MPCat40 token directly,
-             - ``collective`` → render a mask, ask the VLM; accept the
-                                VLM's specific name if it's confident,
-                                else fall through to the next candidate.
-      Return the first candidate that yields a usable label.
-    """
-    candidates = _rank_candidates(
-        partition_voxels=partition_voxels,
-        end_voxels=end_voxels,
-        inst_meta=inst_meta,
-        partition_pos=partition_pos,
-        end_pos=end_pos,
-        referrability=referrability,
-        debug_prefix=debug_prefix,
-    )
-    if not candidates:
-        return None
-
-    for c in candidates:
-        label = _resolve_label(
-            c,
-            partition_pos=partition_pos,
-            scan=scan, ep_id=ep_id, sub_idx=sub_idx, sub_total=sub_total,
-            checker=checker,
-            vlm_client=vlm_client, vlm_model=vlm_model,
-            vlm_cache=vlm_cache, viz_dir=viz_dir,
-            debug_prefix=debug_prefix,
-        )
-        if label is None:
-            continue
-        chosen = dict(c)
-        chosen["new_landmark"]        = label["name"]
-        chosen["new_landmark_source"] = label["source"]
-        chosen["vlm"]                 = label["vlm"]
-
-        # Informational: how many instances of the chosen MPCat40
-        # category are visible at the partition pose? Tells downstream
-        # consumers whether the synthesized landmark is ambiguous.
-        cat_in_partition_fov = sum(
-            1 for iid, vx in partition_voxels.items()
-            if vx > 0 and inst_meta.get(iid, {}).get("category") == chosen["category"]
-        )
-        chosen["fov_instance_count"] = cat_in_partition_fov
-        chosen["unique_in_fov"]      = cat_in_partition_fov == 1
-        print(f"{debug_prefix}  → picked iid={chosen['instance_id']} "
-              f"name={chosen['new_landmark']!r} "
-              f"(source={chosen['new_landmark_source']}, "
-              f"cat={chosen['category']!r}, "
-              f"approach={chosen['approach_m']:+.2f}m, "
-              f"score={chosen.get('score', 0.0):+.2f})")
-        return chosen
-
-    print(f"{debug_prefix}  → no candidate produced a usable label "
-          "(all collective candidates were VLM-uncertain)")
-    return None
-
-
-def _synth_sub_instruction(spatial: str, landmark_category: str) -> str:
-    spatial = (spatial or "").strip().rstrip(".")
-    article = "an" if landmark_category[:1] in "aeiou" else "a"
-    if spatial:
-        return f"{spatial}. Walk to {article} {landmark_category}."
-    return f"Walk to {article} {landmark_category}."
+from src.process.visibility import VisibilityChecker
 
 
 def main() -> None:
@@ -976,7 +144,7 @@ def main() -> None:
     if not filt_dir.exists():
         raise SystemExit(f"No filters/ at {filt_dir}; run pipeline first.")
 
-    referrability = _load_referrability_table()
+    referrability = load_referrability_table()
     n_too_generic = sum(1 for v in referrability.values() if v == "too_generic")
     n_collective  = sum(1 for v in referrability.values() if v == "collective")
     n_fine        = sum(1 for v in referrability.values() if v == "fine")
@@ -1012,12 +180,12 @@ def main() -> None:
     register_stage(audit, STAGE_NAME)
     strip_stage_events(audit, STAGE_NAME)
 
-    run_dir          = get_run_dir(cfg)
-    blacklist_drops  = _blacklist_drops(filt_dir)
-    detection_fails  = _detection_failures(audit)
-    visibility_misses = _visibility_not_visible_failures(audit)
-    drops            = _merge_drops(blacklist_drops, detection_fails, visibility_misses)
-    n_bl  = len(blacklist_drops)
+    run_dir           = get_run_dir(cfg)
+    bl_drops          = blacklist_drops(filt_dir)
+    detection_fails   = detection_failures(audit)
+    visibility_misses = visibility_not_visible_failures(audit)
+    drops             = merge_drops(bl_drops, detection_fails, visibility_misses)
+    n_bl  = len(bl_drops)
     n_det = len(detection_fails)
     n_vis = len(visibility_misses)
     print(
@@ -1062,7 +230,7 @@ def main() -> None:
     try:
         for scan, scan_drops in sorted(by_scan.items()):
             checker.load_scene(f"mp3d/{scan}/{scan}.glb")
-            inst_meta = _instance_meta_from_house(cfg["scenes"]["scenes_dir"], scan)
+            inst_meta = instance_meta_from_house(cfg["scenes"]["scenes_dir"], scan)
             scan_db = scan_db_all.get(scan) or {}
 
             scan_rescues: Dict[str, Dict[str, Dict]] = {}
@@ -1104,8 +272,8 @@ def main() -> None:
                     skipped_no_pos += 1
                     _failed("no_pos")
                     continue
-                partition_pos = _resolve_node_pos(spatial_path[-1], virtual_nodes, scan_db)
-                end_pos       = _resolve_node_pos(landmark_path[-1], virtual_nodes, scan_db)
+                partition_pos = resolve_node_pos(spatial_path[-1], virtual_nodes, scan_db)
+                end_pos       = resolve_node_pos(landmark_path[-1], virtual_nodes, scan_db)
                 if partition_pos is None or end_pos is None:
                     skipped_no_pos += 1
                     _failed("no_pos")
@@ -1142,10 +310,10 @@ def main() -> None:
                     _failed("no_render")
                     continue
 
-                partition_voxels = _visible_instance_voxels(
+                partition_voxels = visible_instance_voxels(
                     p_depth, p_sem, partition_pos, heading=0.0,
                 )
-                end_voxels = _visible_instance_voxels(
+                end_voxels = visible_instance_voxels(
                     e_depth, e_sem, end_pos, heading=0.0,
                 )
 
@@ -1154,7 +322,7 @@ def main() -> None:
                 vlm_viz_dir = (
                     run_dir / "viz_blacklist_rescue" / scan / str(ep_id)
                 )
-                pick = _pick_replacement_landmark(
+                pick = pick_replacement_landmark(
                     partition_voxels=partition_voxels,
                     end_voxels=end_voxels,
                     inst_meta=inst_meta,
@@ -1168,10 +336,11 @@ def main() -> None:
                     checker=checker,
                     vlm_client=vlm_client,
                     vlm_model=vlm_model,
-                    vlm_cache=vlm_cache_by_scan.setdefault(scan, _load_vlm_cache(
+                    vlm_cache=vlm_cache_by_scan.setdefault(scan, load_vlm_cache(
                         run_dir / "target_instances" / scan,
                     )),
                     viz_dir=vlm_viz_dir,
+                    render_mask_fn=_render_mask_for_rollout_frame,
                 )
                 if pick is None:
                     skipped_no_candidate += 1
@@ -1180,7 +349,7 @@ def main() -> None:
 
                 spatial_instr = (part_sub.get("spatial_instruction") or "").strip()
                 new_landmark  = pick["new_landmark"]
-                new_sub_instr = _synth_sub_instruction(spatial_instr, new_landmark)
+                new_sub_instr = synth_sub_instruction(spatial_instr, new_landmark)
 
                 if args.save_viz:
                     # partition + end poses for the chosen replacement
@@ -1272,7 +441,7 @@ def main() -> None:
 
             # Persist per-instance VLM labels for this scan (idempotent).
             scan_dir = run_dir / "target_instances" / scan
-            _save_vlm_cache(scan_dir, scan, vlm_cache_by_scan.get(scan) or {})
+            save_vlm_cache(scan_dir, scan, vlm_cache_by_scan.get(scan) or {})
     finally:
         checker.close()
 

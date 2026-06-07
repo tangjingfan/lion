@@ -289,12 +289,12 @@ class TestVisibilityNotVisibleSource:
         }
 
     def test_unrescued_cell_is_candidate(self):
-        from src.check.rescue_blacklist import _visibility_not_visible_failures
-        out = _visibility_not_visible_failures(self._make_audit(rescued=False))
+        from src.process.synthesis import visibility_not_visible_failures
+        out = visibility_not_visible_failures(self._make_audit(rescued=False))
         assert [(ep, sub) for ep, sub, _ in out] == [(98672, 2)]
         assert out[0][2]["origin"] == "visibility_not_visible"
 
     def test_detection_rescued_cell_is_skipped(self):
-        from src.check.rescue_blacklist import _visibility_not_visible_failures
-        out = _visibility_not_visible_failures(self._make_audit(rescued=True))
+        from src.process.synthesis import visibility_not_visible_failures
+        out = visibility_not_visible_failures(self._make_audit(rescued=True))
         assert out == []
