@@ -89,7 +89,7 @@ from src.check._filter_utils import (
     save_audit,
     strip_stage_events,
 )
-from src.check.query_scene_instance import _render_mask_for_rollout_frame
+from src.instance_viz import render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import load_connectivity
 from src.process.landmark_remap import lookup_mention_labels
@@ -449,7 +449,7 @@ def main() -> None:
                                 / f"sub_{sub_idx_int:03d}_cand_{cand_id}.png"
                             )
                             try:
-                                rv = _render_mask_for_rollout_frame(
+                                rv = render_mask_for_rollout_frame(
                                     checker=checker,
                                     scan=scan,
                                     instance_id=cand_id,

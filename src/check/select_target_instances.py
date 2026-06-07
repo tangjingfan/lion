@@ -40,9 +40,9 @@ from src.check._filter_utils import (
     save_audit,
     strip_stage_events,
 )
-from src.check.query_scene_instance import (
-    _draw_house_instance_viz,
-    _render_mask_for_rollout_frame,
+from src.instance_viz import (
+    draw_house_instance_viz,
+    render_mask_for_rollout_frame,
 )
 from src.env.connectivity import load_connectivity
 from src.process.visibility import VisibilityChecker
@@ -675,7 +675,7 @@ def main() -> None:
                         partition_viz_count += 1
                     elif habitat_loaded and partition_pos is not None:
                         try:
-                            rv = _render_mask_for_rollout_frame(
+                            rv = render_mask_for_rollout_frame(
                                 checker=checker,
                                 scan=scan,
                                 instance_id=target_id,
@@ -721,7 +721,7 @@ def main() -> None:
                     else:
                         try:
                             if args.viz_mode == "topdown":
-                                _draw_house_instance_viz(
+                                draw_house_instance_viz(
                                     scenes_dir=scenes_dir,
                                     scan=scan,
                                     instance_id=target_id,
@@ -754,7 +754,7 @@ def main() -> None:
                                     render_frame["sub_total"] = int(
                                         render_frame.get("sub_total") or sub_total
                                     )
-                                rv = _render_mask_for_rollout_frame(
+                                rv = render_mask_for_rollout_frame(
                                     checker=checker,
                                     scan=scan,
                                     instance_id=target_id,

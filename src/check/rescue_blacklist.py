@@ -82,8 +82,8 @@ from src.pipeline.config import (
 
 STAGE_NAME = "rescue_blacklist"
 
-from src.check.query_scene_instance import _render_mask_for_rollout_frame
 from src.dataset.landmark_rxr import episodes_from_config
+from src.instance_viz import render_mask_for_rollout_frame
 from src.env.connectivity import load_connectivity
 from src.env.geometry import VOXEL_SIZE_M, visible_instance_voxels
 from src.env.mp3d_house import instance_meta_from_house
@@ -340,7 +340,7 @@ def main() -> None:
                         run_dir / "target_instances" / scan,
                     )),
                     viz_dir=vlm_viz_dir,
-                    render_mask_fn=_render_mask_for_rollout_frame,
+                    render_mask_fn=render_mask_for_rollout_frame,
                 )
                 if pick is None:
                     skipped_no_candidate += 1
@@ -368,7 +368,7 @@ def main() -> None:
                         (end_pos,       "end",       "BLACKLIST_RESCUE_E"),
                     ):
                         try:
-                            _render_mask_for_rollout_frame(
+                            render_mask_for_rollout_frame(
                                 checker=checker,
                                 scan=scan,
                                 instance_id=int(pick["instance_id"]),
