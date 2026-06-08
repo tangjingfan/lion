@@ -168,7 +168,7 @@ def main() -> None:
             )
         else:
             try:
-                vlm_client = make_client(api_key=api_key, model=vlm_model)
+                vlm_client = make_client(api_key=api_key)
                 print(f"VLM refinement: enabled (model={vlm_model})")
             except Exception as exc:
                 print(f"VLM refinement: DISABLED (client init failed: {exc})")

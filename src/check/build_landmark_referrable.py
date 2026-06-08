@@ -104,7 +104,7 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
 
-    client = make_client(api_key=args.api_key, model=args.model)
+    client = make_client(api_key=args.api_key)
     resp = client.chat.completions.create(
         model=args.model,
         temperature=args.temperature,
