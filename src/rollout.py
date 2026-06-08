@@ -28,11 +28,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import yaml
@@ -464,7 +463,7 @@ def main() -> None:
 
     # --- run ---
     t0 = time.time()
-    results = run_rollout(episodes, env, agent, cfg, out_dir)
+    run_rollout(episodes, env, agent, cfg, out_dir)
     elapsed = time.time() - t0
     print(f"\nTotal time: {elapsed:.1f}s  ({elapsed/len(episodes):.1f}s per episode)")
 

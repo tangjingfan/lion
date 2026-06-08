@@ -45,7 +45,6 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.check._filter_utils import (
-    active_subs,
     append_ep_event,
     append_sub_event,
     ensure_episode,

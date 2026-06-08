@@ -464,7 +464,6 @@ def main() -> None:
                 if not ep_targets:
                     continue
 
-                ep_records: Dict[str, Dict] = {}
                 for sub_idx in sub_idxs:
                     sub_idx     = int(sub_idx)
                     sub_idx_str = str(sub_idx)

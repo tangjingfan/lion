@@ -9,7 +9,6 @@ mask strip appended — the visual used by step 07 (candidate viz), step 08
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple

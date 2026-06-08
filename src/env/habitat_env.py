@@ -36,7 +36,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -115,10 +115,6 @@ class HabitatEnv:
         self._place_agent(path_positions[0], rotation_xyzw)
 
         return self._get_obs()
-
-    def get_pathfinder(self):
-        """Expose pathfinder so agents (e.g. OracleAgent) can use it."""
-        return self._sim.pathfinder if self._sim else None
 
     def step(self, action: int) -> Tuple[Dict[str, Any], bool, Dict[str, Any]]:
         """Execute one discrete action.
@@ -321,7 +317,6 @@ class HabitatEnv:
         pos = np.array(agent_state.position, dtype=np.float32)
 
         # Extract heading from quaternion  (rotation around Y axis)
-        import quaternion as qt
         q = agent_state.rotation   # numpy quaternion [w, x, y, z]
         # heading = 2 * arctan2(q.y, q.w), negated for clockwise convention
         heading = -2.0 * math.atan2(q.y, q.w)

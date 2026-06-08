@@ -26,7 +26,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import yaml
@@ -39,7 +39,7 @@ from src.check._filter_utils import (
     resolve_exp,
 )
 from src.dataset.landmark_rxr import episodes_from_config
-from src.env.connectivity import _mp3d_to_habitat, load_connectivity
+from src.env.connectivity import load_connectivity
 from src.process.partition import partition_episode
 
 
@@ -56,7 +56,6 @@ def load_adjacency(
 
     included = [n for n in nodes if n.get("included", True)]
     id_of = {i: n["image_id"] for i, n in enumerate(included)}
-    idx_of = {n["image_id"]: i for i, n in enumerate(included)}
 
     edges: set = set()
     for i, node in enumerate(included):
@@ -317,7 +316,6 @@ def _draw_subpath_panel(fig, outer_gs_cell, part: Dict,
     _draw_tape(ax_tape, part)
     _draw_subpath_map(ax_map, part, scan_db)
 
-    kind    = part["kind"]
     spatial = (part.get("geometric_spatial_instruction") or "").strip()
     lm      = part.get("landmark") or ""
     title   = f"[{part['sub_idx']}] {spatial}"

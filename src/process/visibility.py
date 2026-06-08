@@ -3,14 +3,10 @@ Sub-path visibility checker for Landmark-RxR.
 
 Uses Habitat-Lab's ``rgbds_agent`` (same setup as rollout) so visibility /
 uniqueness checks render exactly what the rollout agent perceives — RGB and
-semantic equirectangular panoramas at eye height.  Two complementary
-strategies are exposed:
-
-  • ``check`` / ``check_landmark_uniqueness`` — raycast-based line-of-sight
-    and AABB visibility (precise, slower).
-  • ``check_landmark_visibility_semantic`` — counts distinct instance ids
-    of the landmark category in the semantic panorama (fast, matches what
-    the agent's semantic sensor would actually report).
+semantic equirectangular panoramas at eye height.
+``check_landmark_visibility_semantic`` counts distinct instance ids of
+the landmark category in the semantic panorama — fast, and it matches
+what the agent's semantic sensor would actually report.
 
 API
 ---
@@ -18,7 +14,6 @@ API
 
     checker = VisibilityChecker(env_cfg, scenes_dir)
     checker.load_scene(scene_file)
-    los  = checker.check(pos_a, pos_b)              # raycast line-of-sight
     vis  = checker.check_landmark_visibility_semantic(pos_end, "bath",
                                                        ["bath"])
     checker.close()
@@ -74,8 +69,7 @@ class VisibilityChecker:
 
     The simulator is created the same way as :class:`HabitatEnv`: load the
     same ``rgbds_sim.yaml``, strip the depth sensor, configure RGB and
-    semantic equirectangular sensors at eye height.  Physics is enabled so
-    raycasts (``check`` and ``check_landmark_uniqueness``) still work.
+    semantic equirectangular sensors at eye height.
 
     Parameters
     ----------
@@ -228,180 +222,6 @@ class VisibilityChecker:
         self._sem_name_map = name_map
 
     # ------------------------------------------------------------------
-    #  Core visibility check
-    # ------------------------------------------------------------------
-
-    def check(
-        self,
-        pos_start: np.ndarray,
-        pos_end:   np.ndarray,
-    ) -> Dict[str, Any]:
-        """Back-trace a ray from pos_end toward pos_start at eye level.
-
-        Both positions should be at navmesh height; sensor_height is added
-        internally to get eye-level positions.
-
-        Returns
-        -------
-        dict with:
-          visible         bool
-          distance        float  — straight-line eye-to-eye distance (m)
-          obstacle        None | dict
-            hit_distance  float  — distance along ray to first obstacle
-            hit_fraction  float  — hit_distance / distance
-            hit_point     list   — 3-D world coordinate of hit
-            object_id     int
-            semantic_cat  str
-        """
-        if self._sim is None:
-            raise RuntimeError("Call load_scene() before check().")
-
-        import habitat_sim
-
-        eye_start = np.array(pos_start, dtype=np.float32)
-        eye_start[1] += self._sensor_h
-        eye_end = np.array(pos_end, dtype=np.float32)
-        eye_end[1] += self._sensor_h
-
-        vec  = eye_start - eye_end
-        dist = float(np.linalg.norm(vec))
-
-        if dist < 1e-4:
-            return {"visible": True, "distance": 0.0, "obstacle": None}
-
-        ray    = habitat_sim.geo.Ray(origin=eye_end, direction=vec / dist)
-        result = self._sim.cast_ray(ray, max_distance=dist)
-
-        if not result.has_hits():
-            return {"visible": True, "distance": dist, "obstacle": None}
-
-        hit = result.hits[0]
-        return {
-            "visible": False,
-            "distance": dist,
-            "obstacle": {
-                "hit_distance": float(hit.ray_distance),
-                "hit_fraction": float(hit.ray_distance / dist),
-                "hit_point":    list(hit.point),
-                "object_id":    hit.object_id,
-                "semantic_cat": self._semantic_cat(hit.object_id),
-            },
-        }
-
-    # ------------------------------------------------------------------
-    #  Landmark uniqueness check
-    # ------------------------------------------------------------------
-
-    def check_landmark_uniqueness(
-        self,
-        pos_end:         np.ndarray,
-        landmark:        str,
-        semantic_labels: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """From the end position, count how many instances of the landmark
-        category are visible to the agent.
-
-        Matching strategy (in priority order):
-          1. Exact category match against each label in *semantic_labels*
-             (grounded MP3D labels from the LLM rewriter components).
-          2. Substring match on the raw *landmark* phrase as a fallback.
-
-        For each matching object a ray is cast from the eye position to the
-        object's AABB centre; the object is considered visible if the ray
-        reaches it without being blocked by a different object first.
-
-        Parameters
-        ----------
-        pos_end:
-            Navmesh-level 3-D position of the sub-path end node.
-        landmark:
-            Landmark noun phrase (used as fallback when semantic_labels fail).
-        semantic_labels:
-            Ordered list of grounded MP3D category labels to try first
-            (e.g. ["stair", "door"]).  Each is tried in turn; the first
-            that finds at least one scene object wins.
-
-        Returns
-        -------
-        dict with:
-          unique           bool | None  — True if exactly one instance visible;
-                                         None when no matching objects found
-          visible_count    int          — visible matching instances
-          total_in_scene   int          — all matching instances in scene
-          matched_category str | None   — the semantic category that was matched
-          matched_by       str          — "semantic_label" | "phrase_fallback"
-          visible_ids      list[int]    — object_ids of visible instances
-        """
-        if self._sim is None:
-            raise RuntimeError("Call load_scene() before check_landmark_uniqueness().")
-
-        eye = np.array(pos_end, dtype=np.float32)
-        eye[1] += self._sensor_h
-
-        scene_objects = [
-            obj for obj in self._sim.semantic_scene.objects
-            if obj is not None and obj.category is not None
-            and obj.category.name()
-        ]
-
-        candidates:  List     = []
-        matched_cat: Optional[str] = None
-        matched_by:  str      = "phrase_fallback"
-
-        # ── 1. Try each grounded semantic label (exact / near-exact) ────
-        for label in (semantic_labels or []):
-            if not label or label.lower() in ("unknown", ""):
-                continue
-            label_lower = label.lower().strip()
-            hits = [
-                obj for obj in scene_objects
-                if label_lower == obj.category.name().lower().strip()
-                or label_lower in obj.category.name().lower()
-                or obj.category.name().lower() in label_lower
-            ]
-            if hits:
-                candidates  = hits
-                matched_cat = hits[0].category.name()
-                matched_by  = "semantic_label"
-                break
-
-        # ── 2. Phrase substring fallback ─────────────────────────────────
-        if not candidates:
-            lm_lower = landmark.lower().strip()
-            for obj in scene_objects:
-                cat = obj.category.name().lower()
-                if lm_lower in cat or cat in lm_lower:
-                    candidates.append(obj)
-                    matched_cat = obj.category.name()
-
-        if not candidates:
-            return {
-                "unique":           None,
-                "visible_count":    0,
-                "total_in_scene":   0,
-                "matched_category": None,
-                "matched_by":       matched_by,
-                "visible_ids":      [],
-                "note": f"no objects found matching '{landmark}'",
-            }
-
-        # ── cast rays to AABB centre + 6 face centres per candidate ─────
-        visible_ids: list = []
-        for obj in candidates:
-            if self._aabb_visible_from(eye, obj):
-                visible_ids.append(obj.id)
-
-        n_visible = len(visible_ids)
-        return {
-            "unique":           n_visible == 1,
-            "visible_count":    n_visible,
-            "total_in_scene":   len(candidates),
-            "matched_category": matched_cat,
-            "matched_by":       matched_by,
-            "visible_ids":      visible_ids,
-        }
-
-    # ------------------------------------------------------------------
     #  Semantic-image visibility (panorama-based, rgbds_agent native)
     # ------------------------------------------------------------------
 
@@ -417,8 +237,8 @@ class VisibilityChecker:
         instance ids whose MP40 category matches the landmark.
 
         Faster and more aligned with what the rollout agent perceives than
-        the raycast-based :meth:`check_landmark_uniqueness`: a single render
-        replaces N raycasts.  Heading mostly only changes which side of the
+        a per-instance raycast scheme: a single render replaces N raycasts.
+        Heading mostly only changes which side of the
         panorama the landmark falls on, so any heading works for visibility
         / counting (default 0.0).
 
@@ -558,47 +378,6 @@ class VisibilityChecker:
         }
 
     # ------------------------------------------------------------------
-    #  Episode-level helper
-    # ------------------------------------------------------------------
-
-    def check_episode(
-        self,
-        episode,
-        db: Dict,
-    ) -> List[Dict[str, Any]]:
-        """Check visibility for every sub_path in one episode."""
-        scan_db = db.get(episode.scan, {})
-        results = []
-
-        for sub_path in episode.sub_paths:
-            if len(sub_path) < 2:
-                continue
-            start_node = sub_path[0]
-            end_node   = sub_path[-1]
-
-            if start_node not in scan_db or end_node not in scan_db:
-                results.append({
-                    "start_node": start_node,
-                    "end_node":   end_node,
-                    "error":      "node not found in connectivity DB",
-                })
-                continue
-
-            pos_start = scan_db[start_node]
-            pos_end   = scan_db[end_node]
-
-            vis = self.check(pos_start, pos_end)
-            results.append({
-                "start_node": start_node,
-                "end_node":   end_node,
-                "start_pos":  pos_start.tolist(),
-                "end_pos":    pos_end.tolist(),
-                **vis,
-            })
-
-        return results
-
-    # ------------------------------------------------------------------
     #  Rendering helpers
     # ------------------------------------------------------------------
 
@@ -652,13 +431,6 @@ class VisibilityChecker:
             obs["depth"] = d
         return obs
 
-    def render_rgb(self, pos: np.ndarray, heading: float) -> np.ndarray:
-        """Capture the RGB equirectangular panorama at *pos*."""
-        rgb = self.render_observation(pos, heading).get("rgb")
-        if rgb is None:
-            raise RuntimeError("RGB sensor not in observation.")
-        return rgb
-
     def render_semantic(self, pos: np.ndarray, heading: float = 0.0) -> np.ndarray:
         """Capture the raw semantic equirectangular panorama at *pos*.
 
@@ -669,67 +441,4 @@ class VisibilityChecker:
         if sem is None:
             raise RuntimeError("Semantic sensor not in observation.")
         return sem
-
-    # ------------------------------------------------------------------
-    #  Internal
-    # ------------------------------------------------------------------
-
-    def _aabb_visible_from(self, eye: np.ndarray, obj) -> bool:
-        """Return True if any probe ray from *eye* reaches *obj*.
-
-        Probes: AABB centre + 6 face centres (one per axis direction).
-        The face centres are shrunk 10 % inward so they stay inside the
-        object surface rather than sitting exactly on the boundary.
-
-        Two hit conditions are accepted:
-          1. the first raycast hit uses the same object id
-          2. the first hit point lands inside this object's AABB, with a
-             small margin to tolerate thin wall-mounted objects such as
-             mirrors or panels whose collision ids may differ
-        """
-        import habitat_sim
-
-        c = np.array(obj.aabb.center, dtype=np.float32)
-        h = np.array(obj.aabb.sizes,  dtype=np.float32) * 0.4  # 80 % of half-extent
-        half = np.array(obj.aabb.sizes, dtype=np.float32) * 0.5
-        margin = np.maximum(0.05, 0.25 * half)
-        aabb_lo = c - half - margin
-        aabb_hi = c + half + margin
-
-        probes = [
-            c,
-            c + np.array([h[0],    0,    0], dtype=np.float32),
-            c - np.array([h[0],    0,    0], dtype=np.float32),
-            c + np.array([   0, h[1],    0], dtype=np.float32),
-            c - np.array([   0, h[1],    0], dtype=np.float32),
-            c + np.array([   0,    0, h[2]], dtype=np.float32),
-            c - np.array([   0,    0, h[2]], dtype=np.float32),
-        ]
-
-        for pt in probes:
-            vec  = pt - eye
-            dist = float(np.linalg.norm(vec))
-            if dist < 0.05:          # agent is essentially inside the object
-                return True
-            ray    = habitat_sim.geo.Ray(origin=eye, direction=vec / dist)
-            result = self._sim.cast_ray(ray, max_distance=dist + 0.5)
-            if not result.has_hits():
-                return True                       # unobstructed
-            hit = result.hits[0]
-            if hit.object_id == obj.id:
-                return True                       # first hit is the target
-            hp = np.array(hit.point, dtype=np.float32)
-            if np.all(hp >= aabb_lo) and np.all(hp <= aabb_hi):
-                return True                       # collision landed on target region
-        return False
-
-    def _semantic_cat(self, object_id: int) -> str:
-        try:
-            obj = self._sim.semantic_scene.objects[object_id]
-            if obj is not None and obj.category is not None:
-                return obj.category.name()
-        except Exception:
-            pass
-        return "unknown"
-
 

@@ -27,12 +27,9 @@ import json
 import math
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
-
-if TYPE_CHECKING:
-    from src.process.visibility import VisibilityChecker
 
 # Accent colour for the small label bar drawn over rollout panoramas.
 _VIS_ACCENT  = (100, 200, 255)

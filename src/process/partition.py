@@ -74,28 +74,6 @@ _KIND_TO_INSTRUCTION = {
 }
 
 
-def _classify_by_geometry(
-    turn_deltas: Sequence[float],
-    turn_thresh_deg: float,
-    around_thresh_deg: float,
-) -> Tuple[str, Optional[int]]:
-    """Infer ``(kind, turn_k)`` from edge-heading deltas.
-
-    Returns the first edge whose ``|Δ|`` exceeds ``turn_thresh_deg``, and
-    the kind inferred from that edge's signed delta (positive ⇒ right,
-    negative ⇒ left, ``|Δ| > around_thresh_deg`` ⇒ around).  If no such
-    edge exists, returns ``("forward", None)``.
-    """
-    turn_rad   = math.radians(turn_thresh_deg)
-    around_rad = math.radians(around_thresh_deg)
-    for k, d in enumerate(turn_deltas):
-        if abs(d) > turn_rad:
-            if abs(d) > around_rad:
-                return "around", k
-            return ("right" if d > 0 else "left"), k
-    return "forward", None
-
-
 def _classify_turn_delta(
     delta_deg: float,
     turn_thresh_deg: float,
@@ -118,7 +96,6 @@ def _classify_rollout_turn_delta(delta_deg: float, around_thresh_deg: float) -> 
 def _classify_reference_partition_kind(
     turn_deltas: Sequence[float],
     partition_idx: int,
-    partition_alpha: float,
     turn_thresh_deg: float,
     around_thresh_deg: float,
 ) -> Tuple[str, Optional[int]]:
@@ -428,7 +405,7 @@ def partition_subpath(
         partition_source = "rollout_frames"
         partition_virtual = True
         reference_kind, turn_k = _classify_reference_partition_kind(
-            turn_deltas, p, alpha, turn_thresh_deg, around_thresh_deg,
+            turn_deltas, p, turn_thresh_deg, around_thresh_deg,
         )
         kind = rollout_partition.get("rollout_kind") or reference_kind
     else:
@@ -436,7 +413,7 @@ def partition_subpath(
             0, positions, edge_lengths, forward_distance_m,
         )
         reference_kind, turn_k = _classify_reference_partition_kind(
-            turn_deltas, p, alpha, turn_thresh_deg, around_thresh_deg,
+            turn_deltas, p, turn_thresh_deg, around_thresh_deg,
         )
         total_len = sum(edge_lengths)
         if forward_distance_m >= total_len:
