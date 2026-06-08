@@ -27,15 +27,15 @@ Usage
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from src.process.rewriter import make_client
+from src.process.vlm_common import extract_json_object_strict
 
 
 # MPCat40 categories (matterport / habitat-mp3d). Keeping the list here
@@ -92,24 +92,6 @@ def _build_user_text(categories: List[str]) -> str:
     )
 
 
-def _extract_json(raw: str) -> Dict:
-    """Pull a JSON object out of an LLM response that may be wrapped in
-    code fences or text."""
-    raw = (raw or "").strip()
-    if raw.startswith("```"):
-        body = raw[3:]
-        if body.startswith("json"):
-            body = body[4:]
-        if body.endswith("```"):
-            body = body[:-3]
-        raw = body.strip()
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first < 0 or last <= first:
-        raise ValueError(f"no JSON object in: {raw[:200]}")
-    return json.loads(raw[first:last + 1])
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", default="gemini-2.5-pro",
@@ -133,7 +115,7 @@ def main() -> None:
         ],
     )
     raw = resp.choices[0].message.content
-    parsed = _extract_json(raw)
+    parsed = extract_json_object_strict(raw)
 
     # Order: too_generic block, collective block, fine block — matches
     # the hand-curated YAML's layout so diffs are readable.

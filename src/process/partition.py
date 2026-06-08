@@ -30,6 +30,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from src.env.geometry import heading_from_to
+
 
 # ── Hyper-parameters (tunable; see configs/partition/partition.yaml) ──────
 TURN_THRESH_DEG    = 45.0
@@ -38,13 +40,6 @@ FORWARD_DISTANCE_M = 0.5      # metres of forward motion defining spatial part
 MOVE_FORWARD = 1
 TURN_LEFT = 2
 TURN_RIGHT = 3
-
-
-def heading_of_edge(p_from: np.ndarray, p_to: np.ndarray) -> float:
-    """Clockwise heading from north (−Z) in radians, in Habitat frame."""
-    dx = float(p_to[0] - p_from[0])
-    dz = float(p_to[2] - p_from[2])
-    return math.atan2(dx, -dz)
 
 
 def signed_angle_diff(a: float, b: float) -> float:
@@ -384,7 +379,7 @@ def partition_subpath(
         }
 
     edge_headings: List[float] = [
-        heading_of_edge(positions[k], positions[k + 1]) for k in range(K)
+        heading_from_to(positions[k], positions[k + 1]) for k in range(K)
     ]
     edge_lengths: List[float] = _edge_lengths(positions)
     turn_deltas: List[float] = [

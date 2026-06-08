@@ -24,7 +24,6 @@ Config (under output.viz):
 from __future__ import annotations
 
 import json
-import math
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -400,13 +399,6 @@ def _compose(
 # ---------------------------------------------------------------------------
 #  Shared geometry / label helpers
 # ---------------------------------------------------------------------------
-
-def heading_toward(pos_from: np.ndarray, pos_to: np.ndarray) -> float:
-    """Clockwise heading from north (−Z) in radians, to face pos_to from pos_from."""
-    dx = float(pos_to[0] - pos_from[0])
-    dz = float(pos_to[2] - pos_from[2])
-    return math.atan2(dx, -dz)
-
 
 def _draw_label(img, text: str) -> None:
     from PIL import ImageDraw, ImageFont

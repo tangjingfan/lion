@@ -14,8 +14,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
 from src.env.connectivity import load_connectivity
+from src.env.geometry import heading_from_to
 from src.env.mp3d_house import parse_house_categories
-from src.viz import _compose, heading_toward
+from src.viz import _compose
 
 
 def nearest_viewpoint(
@@ -70,7 +71,7 @@ def render_rollout_style_instance_viz(
 
     target_pos = instance_center_habitat
     viewpoint_id, pos = nearest_viewpoint(cfg, scenes_dir, scan, target_pos)
-    heading = heading_toward(pos, target_pos)
+    heading = heading_from_to(pos, target_pos)
 
     checker.load_scene(f"mp3d/{scan}/{scan}.glb")
     obs = checker.render_observation(pos, heading)

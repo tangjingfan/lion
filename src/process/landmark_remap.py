@@ -20,6 +20,8 @@ import json
 import time
 from typing import Any, Dict, List, Sequence
 
+from src.process.vlm_common import extract_json_object_strict
+
 
 _REMAP_SYSTEM = """\
 You are a spatial navigation assistant for an indoor robot.
@@ -91,50 +93,6 @@ def _build_remap_message(
     )
 
 
-def _extract_json_object(raw: str) -> Any:
-    """Best-effort JSON-object parser tolerant to LLM output noise.
-
-    Tries (in order):
-      1. ``json.loads`` on the raw string.
-      2. Strip a leading markdown fence (``\\`\\`\\`json`` / ``\\`\\`\\``) and
-         the matching trailing fence if present.
-      3. Take the slice between the first ``{`` and the last ``}``.
-
-    Raises ``ValueError`` with the original error text if none succeed.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        raise ValueError("empty response")
-
-    last_err: Exception = ValueError("no attempt")
-    candidates: List[str] = [raw]
-
-    if raw.startswith("```"):
-        body = raw[3:]
-        if body.startswith("json"):
-            body = body[4:]
-        elif body.startswith("\n"):
-            pass
-        if body.endswith("```"):
-            body = body[:-3]
-        candidates.append(body.strip())
-
-    first = raw.find("{")
-    last  = raw.rfind("}")
-    if first >= 0 and last > first:
-        candidates.append(raw[first:last + 1])
-
-    for c in candidates:
-        c = c.strip()
-        if not c:
-            continue
-        try:
-            return json.loads(c)
-        except Exception as exc:
-            last_err = exc
-    raise ValueError(f"could not parse JSON: {last_err}")
-
-
 def _call_llm_json(
     client,
     model: str,
@@ -181,7 +139,7 @@ def _call_llm_json(
                     ],
                 )
             last_raw = (resp.choices[0].message.content or "").strip()
-            return _extract_json_object(last_raw)
+            return extract_json_object_strict(last_raw)
         except Exception as exc:
             print(f"  [attempt {attempt}/{max_retries}] {label} error: {exc}")
             if attempt < max_retries:

@@ -10,6 +10,7 @@ with proximity.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Tuple
 
 import numpy as np
@@ -20,6 +21,17 @@ import numpy as np
 # collapse into the same cell so a 1-m-wide fridge surface contributes
 # tens of voxels rather than thousands of unique pixels.
 VOXEL_SIZE_M = 0.10
+
+
+def heading_from_to(pos_from: np.ndarray, pos_to: np.ndarray) -> float:
+    """Clockwise heading from north (−Z) in radians, to face pos_to from pos_from.
+
+    Habitat frame: +X is east and −Z is north, so heading 0 looks toward −Z
+    and increases clockwise (toward +X).
+    """
+    dx = float(pos_to[0] - pos_from[0])
+    dz = float(pos_to[2] - pos_from[2])
+    return math.atan2(dx, -dz)
 
 
 def unproject_equirect(
