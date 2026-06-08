@@ -143,7 +143,7 @@ def _call_llm_json(
         except Exception as exc:
             print(f"  [attempt {attempt}/{max_retries}] {label} error: {exc}")
             if attempt < max_retries:
-                time.sleep(retry_delay)
+                time.sleep(retry_delay * (2 ** (attempt - 1)))
     print(f"  [DEBUG] {label} final raw response (truncated to 1000 chars):")
     print("  " + last_raw[:1000].replace("\n", "\n  "))
     raise RuntimeError(f"LLM failed after {max_retries} retries ({label})")

@@ -66,7 +66,7 @@ def main() -> None:
         with open(rw_path) as f:
             rw_cfg = yaml.safe_load(f) or {}
 
-    model            = rw_cfg.get("model",            "gemini-2.0-flash")
+    model            = rw_cfg.get("model",            "gemini-3-flash-preview")
     max_workers      = rw_cfg.get("max_workers",       4)
     temperature      = float(rw_cfg.get("temperature",      0.2))
     max_tokens       = int(rw_cfg.get("max_tokens",        4096))

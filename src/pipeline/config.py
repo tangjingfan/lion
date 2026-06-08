@@ -194,7 +194,12 @@ def resolve_exp(cfg: dict, exp_arg=None, apply_current: bool = True) -> dict:
     if apply_current:
         try:
             survivor = get_survivor_path(cfg)
-        except Exception:
+        except Exception as exc:
+            # Don't silently skip the survivor merge — a missing/renamed config
+            # key here would make downstream stages run on the full set instead
+            # of the prior survivors. Surface it loudly rather than masking it.
+            print(f"[resolve_exp] WARNING: could not resolve survivor path; "
+                  f"skipping survivor merge: {exc!r}")
             return cfg
         if survivor.exists():
             apply_selection_yaml(cfg, survivor)

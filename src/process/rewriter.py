@@ -23,7 +23,7 @@ API
     client = make_client(api_key)
     all_results, mapping = run_rewriter(
         episodes, client, scenes_dir,
-        model="gemini-2.0-flash", max_workers=4,
+        model="gemini-3-flash-preview", max_workers=4,
     )
 """
 
@@ -44,12 +44,27 @@ from src.dataset.landmark_rxr import LandmarkRxREpisode
 #  Client
 # ---------------------------------------------------------------------------
 
-def make_client(api_key: str):
-    """Return an OpenAI client pointed at Gemini's OpenAI-compatible endpoint."""
+def make_client(
+    api_key: str,
+    *,
+    timeout: float = 120.0,
+    connect_timeout: float = 10.0,
+    max_retries: int = 0,
+):
+    """Return an OpenAI client pointed at Gemini's OpenAI-compatible endpoint.
+
+    ``timeout`` caps each HTTP request (default 120 s read/write vs the SDK's
+    600 s default) so a hung local proxy can't stall a whole stage for minutes.
+    ``max_retries=0`` disables the SDK's internal retries so the callers' manual
+    retry loops (with backoff) are the single source of retry truth.
+    """
+    import httpx
     from openai import OpenAI
     return OpenAI(
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=httpx.Timeout(timeout, connect=connect_timeout),
+        max_retries=max_retries,
     )
 
 
@@ -360,7 +375,7 @@ def _call_llm(
         except Exception as exc:
             print(f"  [attempt {attempt}/{max_retries}] {label} error: {exc}")
             if attempt < max_retries:
-                time.sleep(retry_delay)
+                time.sleep(retry_delay * (2 ** (attempt - 1)))
     raise RuntimeError(f"LLM failed after {max_retries} retries ({label})")
 
 
@@ -459,6 +474,7 @@ def process_episode(
     ]
 
     decompose_map: Dict[str, List[Dict]] = {}
+    step2_failed = False
     if landmarks_to_decompose:
         try:
             raw_map = _call_llm(
@@ -471,6 +487,7 @@ def process_episode(
                 for lm, comps in raw_map.items():
                     decompose_map[lm] = _validate_components(comps)
         except Exception as exc:
+            step2_failed = True
             print(f"  [FAIL step2] {ep_label}: {exc}")
 
     # ---- Assemble results --------------------------------------------------
@@ -505,6 +522,12 @@ def process_episode(
         }
         if "error" in ex:
             entry["error"] = ex["error"]
+        elif step2_failed and category != "spatial":
+            # The decompose call itself failed (infra/transient), so this
+            # landmark fell back to an "unknown" component. Tag it so the
+            # blacklist stage records it as an LLM failure rather than
+            # silently dropping it as "unmapped" (a vocabulary verdict).
+            entry["error"] = "step2_failed"
         sub_path_results.append(entry)
 
     return {
@@ -554,7 +577,7 @@ def run_rewriter(
     episodes: List[LandmarkRxREpisode],
     client,
     scenes_dir: str,
-    model: str = "gemini-2.0-flash",
+    model: str = "gemini-3-flash-preview",
     max_workers: int = 4,
     temperature: float = 0.2,
     max_tokens: int = 4096,

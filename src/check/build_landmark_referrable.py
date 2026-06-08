@@ -20,7 +20,7 @@ Usage
   bash scripts/build_landmark_referrable.sh
   # or
   python src/check/build_landmark_referrable.py \
-      --model gemini-2.5-pro \
+      --model gemini-3-flash-preview \
       --out configs/landmark_referrable.yaml
 """
 
@@ -94,8 +94,8 @@ def _build_user_text(categories: List[str]) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="gemini-2.5-pro",
-                    help="LLM model name (default gemini-2.5-pro).")
+    ap.add_argument("--model", default="gemini-3-flash-preview",
+                    help="LLM model name (default gemini-3-flash-preview).")
     ap.add_argument("--api_key", default=None,
                     help="LLM API key; defaults to GEMINI_API_KEY env var.")
     ap.add_argument("--out", default="configs/landmark_referrable.yaml",

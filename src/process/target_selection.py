@@ -95,7 +95,6 @@ def select_target(
 ) -> Dict[str, Any]:
     instances = record_candidates(record)
     visibility = record_visibility_status(record)
-    is_unique = record_is_unique(record)
 
     base = {
         "landmark": record.get("landmark"),
@@ -118,7 +117,10 @@ def select_target(
         return {**base, "status": f"visibility:{visibility}"}
     if not instances:
         return {**base, "status": "no_visible_instance"}
-    if is_unique is True or len(instances) == 1:
+    # Exactly one visible candidate → unambiguous target. A record claiming
+    # uniqueness but carrying multiple candidates is NOT trusted here; it falls
+    # through to the distance-based disambiguation below.
+    if len(instances) == 1:
         return {
             **base,
             "status": "view_unique",

@@ -186,6 +186,15 @@ def main() -> None:
                     reason="visibility:not_visible",
                 )
                 continue
+            if rec.get("visibility") == "partition_pos_unresolvable":
+                # End-pose couldn't be resolved → empty target and no synthesis
+                # path. Exclude rather than emit an unusable empty-target record.
+                n_skipped_unusable += 1
+                append_sub_event(
+                    ep_audit, sub_idx, stage=STAGE_NAME, action="excluded",
+                    reason="visibility:partition_pos_unresolvable",
+                )
+                continue
             records.append(rec)
             included_original_cells.add((int(ep.instruction_id), int(sub_idx)))
             append_sub_event(

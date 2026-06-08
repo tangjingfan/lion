@@ -2,12 +2,11 @@
 #  LION-Bench — Sub-instruction rewrite config
 # ============================================================
 
-# Gemini model to use.
-# `gemini-2.5-flash` is a thinking model — its internal reasoning is billed
-# against `max_tokens`, so `max_tokens` is set generously below to leave room
-# for both the thinking trace and the actual JSON output. Older non-thinking
-# models like `gemini-2.0-flash` are no longer available to new API accounts.
-model: gemini-2.5-flash
+# Gemini model to use (shared by steps 02 rewrite / 06 refine / 09 detection
+# VLM fallback). Thinking models bill internal reasoning against `max_tokens`,
+# so `max_tokens` is set generously below to leave room for both the thinking
+# trace and the actual JSON output.
+model: gemini-3-flash-preview
 
 # Parallel API workers
 max_workers: 4

@@ -154,6 +154,12 @@ def _classify(rewrite_sub: Dict, blacklist: Tuple[str, ...]) -> Tuple[bool, str]
     landmark   = (rewrite_sub.get("landmark") or "").strip().lower()
     components = rewrite_sub.get("components") or []
 
+    # 0. LLM failure (step1/step2 raised after retries) — an infra/transient
+    #    problem, NOT a vocabulary verdict. Surface it as llm_failure instead
+    #    of mislabeling it "unmapped" below.
+    if rewrite_sub.get("error"):
+        return False, "llm_failure"
+
     # 1. Primary: trust the LLM's keep verdict.
     if not bool(rewrite_sub.get("keep", True)):
         return False, "llm_keep_false"
