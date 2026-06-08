@@ -22,46 +22,15 @@ API
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-
-# ── Habitat-Lab bootstrapping ────────────────────────────────────────────
-def _ensure_habitat_lab_importable() -> None:
-    """Add the vendored habitat-lab/ to sys.path if not already importable."""
-    try:
-        import habitat  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-
-    habitat_lab_src = (
-        Path(__file__).resolve().parents[2]
-        / "external" / "habitat-lab" / "habitat-lab"
-    )
-    if habitat_lab_src.exists():
-        sys.path.insert(0, str(habitat_lab_src))
-
-
-def _configure_sensor(
-    sensor_cfg: Any,
-    overrides:  Dict[str, Any],
-    sensor_height: float,
-) -> None:
-    """Patch a Habitat-Lab sensor config in place: position + size/fov fields."""
-    sensor_cfg.position = overrides.get("position", [0.0, sensor_height, 0.0])
-    for key in (
-        "width", "height", "hfov", "orientation",
-        "min_depth", "max_depth", "normalize_depth", "sensor_subtype",
-    ):
-        if key in overrides and hasattr(sensor_cfg, key):
-            value = overrides[key]
-            if key in {"width", "height", "hfov"}:
-                value = int(round(value))
-            setattr(sensor_cfg, key, value)
+from src.env.habitat_setup import (
+    build_semantic_tables,
+    configure_sensor,
+    ensure_habitat_lab_importable,
+)
 
 
 class VisibilityChecker:
@@ -117,7 +86,7 @@ class VisibilityChecker:
         if self._sim is not None:
             self._sim.close()
 
-        _ensure_habitat_lab_importable()
+        ensure_habitat_lab_importable()
         from habitat.config import read_write
         from habitat.config.default import get_config
         from habitat.sims import make_sim
@@ -146,18 +115,18 @@ class VisibilityChecker:
             pano_h = pano_w // 2  # equirect: 2:1 aspect
             pano_overrides = {"width": pano_w, "height": pano_h}
 
-            _configure_sensor(agent_cfg.sim_sensors.rgb_sensor,
-                              pano_overrides, self._sensor_h)
-            _configure_sensor(agent_cfg.sim_sensors.semantic_sensor,
-                              pano_overrides, self._sensor_h)
+            configure_sensor(agent_cfg.sim_sensors.rgb_sensor,
+                             pano_overrides, self._sensor_h)
+            configure_sensor(agent_cfg.sim_sensors.semantic_sensor,
+                             pano_overrides, self._sensor_h)
             # Depth sensor (configured as equirectangular by
             # configs/habitat/rgbds_sim.yaml). Used by point-cloud /
             # voxel-based visibility scoring downstream — unproject
             # equirect depth + semantic to get per-instance point
             # clouds, then voxelise.
             if "depth_sensor" in agent_cfg.sim_sensors:
-                _configure_sensor(agent_cfg.sim_sensors.depth_sensor,
-                                  pano_overrides, self._sensor_h)
+                configure_sensor(agent_cfg.sim_sensors.depth_sensor,
+                                 pano_overrides, self._sensor_h)
 
         self._sim        = make_sim(sim_cfg.type, config=sim_cfg)
         self._scene_file = full_path
@@ -177,49 +146,18 @@ class VisibilityChecker:
     # ------------------------------------------------------------------
 
     def _build_semantic_mapping(self) -> None:
-        """Cache instance-id → (category_id, category_name) tables.
+        """Cache instance-id → MP40 (category_id, category_name) tables.
 
-        Mirrors :meth:`HabitatEnv._build_semantic_mapping` so that
-        Habitat-Sim's raw semantic sensor (instance ids) can be translated
-        to MP40 category names per pixel.
+        Translates Habitat-Sim's raw semantic sensor (instance ids) to MP40
+        category names per pixel; also builds the name → cat_id lookup used by
+        the semantic visibility check.
         """
-        self._sem_id_map     = None
-        self._sem_name_map   = None
-        self._name_to_cat_id = {}
-        if self._sim is None:
-            return
-
-        scene = self._sim.semantic_annotations()
-        if scene is None or not getattr(scene, "objects", None):
-            return
-
-        pairs: List[tuple] = []
-        for obj in scene.objects:
-            if obj is None:
-                continue
-            try:
-                inst_id = int(obj.id.split("_")[-1])
-            except (AttributeError, ValueError):
-                continue
-            cat = obj.category
-            cat_id   = cat.index()
-            cat_name = cat.name()
-            pairs.append((inst_id, cat_id, cat_name))
-            if cat_name:
-                self._name_to_cat_id[cat_name.lower()] = cat_id
-
-        if not pairs:
-            return
-
-        max_id = max(p[0] for p in pairs)
-        id_map   = np.full(max_id + 1, -1, dtype=np.int32)
-        name_map = np.full(max_id + 1, "", dtype=object)
-        for inst_id, cat_id, cat_name in pairs:
-            id_map[inst_id]   = cat_id
-            name_map[inst_id] = cat_name
-
-        self._sem_id_map   = id_map
-        self._sem_name_map = name_map
+        scene = self._sim.semantic_annotations() if self._sim is not None else None
+        (
+            self._sem_id_map,
+            self._sem_name_map,
+            self._name_to_cat_id,
+        ) = build_semantic_tables(scene)
 
     # ------------------------------------------------------------------
     #  Semantic-image visibility (panorama-based, rgbds_agent native)

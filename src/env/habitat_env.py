@@ -34,8 +34,6 @@ Info dict (only meaningful after step / on done=True)
 from __future__ import annotations
 
 import math
-import sys
-from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -45,6 +43,11 @@ from src.env.connectivity import (
     ConnectivityDB,
     heading_to_rotation,
     path_to_positions,
+)
+from src.env.habitat_setup import (
+    build_semantic_tables,
+    configure_sensor,
+    ensure_habitat_lab_importable,
 )
 HABITAT_AGENT_NAME = "rgbds_agent"
 
@@ -149,7 +152,7 @@ class HabitatEnv:
 
     def _init_sim(self, scene_file: str) -> None:
         """Create the Habitat-Lab simulator for a scene."""
-        _ensure_habitat_lab_importable()
+        ensure_habitat_lab_importable()
 
         from habitat.config import read_write
         from habitat.config.default import get_config
@@ -182,12 +185,12 @@ class HabitatEnv:
             pano_h = pano_w // 2  # equirect: 360° horizontal, 180° vertical
             pano_overrides = {"width": pano_w, "height": pano_h}
 
-            self._configure_sensor(
+            configure_sensor(
                 agent_cfg.sim_sensors.rgb_sensor,
                 pano_overrides,
                 sensor_height,
             )
-            self._configure_sensor(
+            configure_sensor(
                 agent_cfg.sim_sensors.semantic_sensor,
                 pano_overrides,
                 sensor_height,
@@ -196,29 +199,6 @@ class HabitatEnv:
         if self._sim is not None:
             self._sim.close()
         self._sim = make_sim(sim_cfg.type, config=sim_cfg)
-
-    @staticmethod
-    def _configure_sensor(
-        sensor_cfg: Any,
-        overrides: Dict[str, Any],
-        sensor_height: float,
-    ) -> None:
-        sensor_cfg.position = overrides.get("position", [0.0, sensor_height, 0.0])
-        for key in (
-            "width",
-            "height",
-            "hfov",
-            "orientation",
-            "min_depth",
-            "max_depth",
-            "normalize_depth",
-            "sensor_subtype",
-        ):
-            if key in overrides and hasattr(sensor_cfg, key):
-                value = overrides[key]
-                if key in {"width", "height", "hfov"}:
-                    value = int(round(value))
-                setattr(sensor_cfg, key, value)
 
     def _place_agent(self, position: np.ndarray, rotation_xyzw: np.ndarray) -> None:
         """Place agent on the navmesh below the viewpoint camera position.
@@ -253,43 +233,9 @@ class HabitatEnv:
         return np.array(position, dtype=np.float32)
 
     def _build_semantic_mapping(self) -> None:
-        """Cache instance-id → (category_id, category_name) tables for this scene.
-
-        MP3D instance ids are not always dense, so we size the table to
-        ``max_id + 1`` and leave gaps as -1 / "".
-        """
-        self._sem_id_map = None
-        self._sem_name_map = None
-        if self._sim is None:
-            return
-
-        scene = self._sim.semantic_annotations()
-        if scene is None or not getattr(scene, "objects", None):
-            return
-
-        pairs = []
-        for obj in scene.objects:
-            if obj is None:
-                continue
-            try:
-                inst_id = int(obj.id.split("_")[-1])
-            except (AttributeError, ValueError):
-                continue
-            cat = obj.category
-            pairs.append((inst_id, cat.index(), cat.name()))
-
-        if not pairs:
-            return
-
-        max_id = max(p[0] for p in pairs)
-        id_map = np.full(max_id + 1, -1, dtype=np.int32)
-        name_map = np.full(max_id + 1, "", dtype=object)
-        for inst_id, cat_id, cat_name in pairs:
-            id_map[inst_id] = cat_id
-            name_map[inst_id] = cat_name
-
-        self._sem_id_map = id_map
-        self._sem_name_map = name_map
+        """Cache instance-id → (category_id, category_name) tables for this scene."""
+        scene = self._sim.semantic_annotations() if self._sim is not None else None
+        self._sem_id_map, self._sem_name_map, _ = build_semantic_tables(scene)
 
     def _map_semantic(
         self, semantic: np.ndarray
@@ -353,20 +299,3 @@ class HabitatEnv:
         info["distance_to_goal"] = dist
         info["success"] = dist <= success_dist
         return info
-
-
-def _ensure_habitat_lab_importable() -> None:
-    try:
-        import habitat  # noqa: F401
-        return
-    except ModuleNotFoundError:
-        pass
-
-    habitat_lab_src = (
-        Path(__file__).resolve().parents[2]
-        / "external"
-        / "habitat-lab"
-        / "habitat-lab"
-    )
-    if habitat_lab_src.exists():
-        sys.path.insert(0, str(habitat_lab_src))
