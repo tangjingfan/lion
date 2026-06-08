@@ -39,11 +39,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import yaml
@@ -60,6 +59,14 @@ from src.check._filter_utils import (
 from src.dataset.landmark_rxr import episodes_from_config
 from src.env.connectivity import load_connectivity
 from src.process.visibility import VisibilityChecker
+from src.process.visibility_analysis import (
+    check_same_category_instances,
+    check_targets_visible,
+    overlay_target,
+    perturbed_positions,
+    target_categories as resolve_target_categories,
+    target_required_pixels,
+)
 
 
 def _load_target_instances(
@@ -91,32 +98,6 @@ def _load_target_instances(
     return out
 
 
-def _perturbed_positions(
-    start_pos: np.ndarray, radius: float, n: int,
-) -> List[Dict[str, Any]]:
-    """``n`` points on a circle of radius ``radius`` in the X-Z plane.
-
-    Habitat is Y-up, so the floor lies in X-Z; perturbations stay
-    coplanar with the start node.  Angle 0° points toward +X.
-    """
-    out: List[Dict[str, Any]] = []
-    for k in range(n):
-        theta = 2.0 * math.pi * k / n
-        dx = radius * math.cos(theta)
-        dz = radius * math.sin(theta)
-        pos = np.asarray(
-            [start_pos[0] + dx, start_pos[1], start_pos[2] + dz],
-            dtype=np.float32,
-        )
-        out.append({
-            "k":          k,
-            "angle_deg":  round(math.degrees(theta), 1),
-            "raw_pos":    [float(pos[0]), float(pos[1]), float(pos[2])],
-            "raw_pos_np": pos,
-        })
-    return out
-
-
 def _maybe_snap(
     sim, pos: np.ndarray, snap: bool,
 ) -> Dict[str, Any]:
@@ -140,163 +121,6 @@ def _maybe_snap(
         "snapped": dx > 1e-4,
         "snap_dx": dx,
     }
-
-
-def _check_targets_visible(
-    sem:          np.ndarray,
-    target_ids:   List[int],
-    min_pixel:    int,
-    required_pixels: Optional[Dict[int, int]] = None,
-) -> Dict[str, Any]:
-    """Count pixels per target instance id in ``sem``.
-
-    Returns ``{"hits": [...]}`` with one entry per target id whose pixel
-    count meets the target-specific threshold, and aggregate counts.
-    """
-    if not target_ids:
-        return {"hits": [], "n_visible_targets": 0, "any_visible": False,
-                "max_pixels": 0, "target_mask": None, "required_pixels": {}}
-    required_pixels = required_pixels or {}
-    hits: List[Dict[str, Any]] = []
-    max_pixels = 0
-    target_mask = np.zeros_like(sem, dtype=bool)
-    for tid in target_ids:
-        threshold = int(required_pixels.get(int(tid), min_pixel))
-        m = (sem == int(tid))
-        n = int(m.sum())
-        if n > max_pixels:
-            max_pixels = n
-        if n >= threshold:
-            hits.append({
-                "id": int(tid),
-                "n_pixels": n,
-                "required_pixels": threshold,
-            })
-            target_mask |= m
-    return {
-        "hits":              hits,
-        "n_visible_targets": len(hits),
-        "any_visible":       bool(hits),
-        "max_pixels":        max_pixels,
-        "target_mask":       target_mask,
-        "required_pixels":   {str(k): int(v) for k, v in required_pixels.items()},
-    }
-
-
-def _target_required_pixels(
-    entry: Dict[str, Any],
-    target_ids: List[int],
-    min_pixel: int,
-    original_fraction: float,
-) -> Dict[int, int]:
-    """Per-target threshold: max(min_pixel, fraction of original pixels)."""
-    by_id = {
-        int(c.get("id")): int(c.get("n_pixels") or 0)
-        for c in (entry.get("candidates") or [])
-        if c.get("id") is not None
-    }
-    out: Dict[int, int] = {}
-    for tid in target_ids:
-        original = by_id.get(int(tid), 0)
-        rel = int(math.ceil(float(original) * original_fraction)) if original > 0 else 0
-        out[int(tid)] = max(int(min_pixel), rel)
-    return out
-
-
-def _category_for_instance(
-    checker: VisibilityChecker,
-    instance_id: int,
-) -> Optional[str]:
-    name_map = getattr(checker, "_sem_name_map", None)
-    if name_map is None:
-        return None
-    if instance_id < 0 or instance_id >= len(name_map):
-        return None
-    name = str(name_map[int(instance_id)] or "").strip()
-    return name or None
-
-
-def _target_categories(
-    entry: Dict[str, Any],
-    target_ids: List[int],
-    checker: VisibilityChecker,
-) -> List[str]:
-    """Resolve target instance ids to semantic category names."""
-    cats: List[str] = []
-
-    def add(cat: Optional[str]) -> None:
-        s = (cat or "").strip()
-        if s and s.lower() not in {c.lower() for c in cats}:
-            cats.append(s)
-
-    candidates = entry.get("candidates") or []
-    for tid in target_ids:
-        for cand in candidates:
-            if int(cand.get("id") or -1) == int(tid):
-                add(cand.get("category"))
-                break
-        add(_category_for_instance(checker, int(tid)))
-
-    if not cats:
-        add(entry.get("matched_category"))
-        for cat in entry.get("matched_categories") or []:
-            add(cat)
-    return cats
-
-
-def _check_same_category_instances(
-    sem: np.ndarray,
-    target_ids: List[int],
-    target_categories: List[str],
-    checker: VisibilityChecker,
-    min_pixel: int,
-) -> Dict[str, Any]:
-    """Find visible non-target instances sharing the target category."""
-    target_set = {int(x) for x in target_ids}
-    cat_set = {(c or "").strip().lower() for c in target_categories if c}
-    if sem is None or not cat_set:
-        return {
-            "hits": [],
-            "n_other_same_category": 0,
-            "category_unique": None,
-            "same_category_mask": None,
-        }
-
-    hits: List[Dict[str, Any]] = []
-    same_category_mask = np.zeros_like(sem, dtype=bool)
-    instance_ids, counts = np.unique(sem, return_counts=True)
-    for iid_raw, n_raw in zip(instance_ids, counts):
-        iid = int(iid_raw)
-        if iid in target_set:
-            continue
-        n = int(n_raw)
-        if n < min_pixel:
-            continue
-        cat = _category_for_instance(checker, iid)
-        if (cat or "").strip().lower() not in cat_set:
-            continue
-        hits.append({"id": iid, "category": cat, "n_pixels": n})
-        same_category_mask |= (sem == iid)
-
-    hits.sort(key=lambda x: int(x.get("n_pixels") or 0), reverse=True)
-    return {
-        "hits": hits,
-        "n_other_same_category": len(hits),
-        "category_unique": len(hits) == 0,
-        "same_category_mask": same_category_mask,
-    }
-
-
-def _overlay_target(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Blend a red highlight over pixels where ``mask`` is True."""
-    out = rgb.copy()
-    if mask is None or not mask.any():
-        return out
-    red = np.array([240, 70, 70], dtype=np.uint8)
-    blend = (0.55 * out[mask].astype(np.float32)
-             + 0.45 * red.astype(np.float32)).astype(np.uint8)
-    out[mask] = blend
-    return out
 
 
 def _save_perturbation_png(
@@ -443,6 +267,7 @@ def main() -> None:
             print(f"\n[{scan}] loading scene  ({len(scan_eps)} episode(s)) …")
             checker.load_scene(scan_eps[0].scene_file)
             sim = checker._sim  # noqa: SLF001 - we need pathfinder for snapping
+            sem_name_map = getattr(checker, "_sem_name_map", None)
 
             scan_dir = out_root / scan
             scan_dir.mkdir(parents=True, exist_ok=True)
@@ -540,8 +365,10 @@ def main() -> None:
                         })
                         continue
 
-                    target_categories = _target_categories(entry, target_ids, checker)
-                    required_pixels = _target_required_pixels(
+                    target_categories = resolve_target_categories(
+                        entry, target_ids, sem_name_map,
+                    )
+                    required_pixels = target_required_pixels(
                         entry,
                         target_ids,
                         args.min_pixel_count,
@@ -551,7 +378,7 @@ def main() -> None:
                     n_visible = 0
                     n_category_unique = 0
                     sub_viz_dir = sub_dir
-                    for p in _perturbed_positions(start_pos, args.radius, args.n):
+                    for p in perturbed_positions(start_pos, args.radius, args.n):
                         snap = _maybe_snap(sim, p["raw_pos_np"], snap_to_navmesh)
                         obs  = checker.render_observation(snap["pos"], heading=0.0)
                         sem  = obs.get("semantic")
@@ -562,17 +389,17 @@ def main() -> None:
                                    "target_mask": None,
                                    "required_pixels": {str(k): int(v) for k, v in required_pixels.items()}}
                         else:
-                            vis = _check_targets_visible(
+                            vis = check_targets_visible(
                                 sem,
                                 target_ids,
                                 args.min_pixel_count,
                                 required_pixels=required_pixels,
                             )
-                        same_cat = _check_same_category_instances(
+                        same_cat = check_same_category_instances(
                             sem,
                             target_ids,
                             target_categories,
-                            checker,
+                            sem_name_map,
                             args.min_pixel_count,
                         ) if sem is not None else {
                             "hits": [],
@@ -612,7 +439,7 @@ def main() -> None:
                         if args.save_viz and rgb is not None:
                             viz_path = sub_viz_dir / f"k_{int(p['k']):02d}.png"
                             try:
-                                rgb_overlay = _overlay_target(
+                                rgb_overlay = overlay_target(
                                     rgb, vis.get("target_mask"),
                                 )
                                 verdict = "VIS" if vis["any_visible"] else "—  "
