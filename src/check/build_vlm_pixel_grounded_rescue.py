@@ -319,13 +319,13 @@ def main() -> None:
         source_kind = "stage3_survivors"
     records_with_pose = [
         rec for rec in records
-        if (rec["scan"], rec["episode_id"], rec["sub_idx"]) in frames
+        if rec.get("partition_pos") is not None
     ]
     print("=== YOLO-World pixel-grounded semantic rescue ===")
     print(f"  source yaml      : {source_yaml}")
     print(f"  source kind      : {source_kind}")
     print(f"  records          : {len(records)}")
-    print(f"  with pose        : {len(records_with_pose)}")
+    print(f"  with partition pose: {len(records_with_pose)}")
     print(f"  yolo model       : {args.yolo_model}")
     print(f"  yolo conf / imgsz: {args.yolo_conf} / {args.yolo_imgsz}")
     print(f"  vlm fallback     : {'on' if args.enable_vlm_fallback else 'off'}")
@@ -360,15 +360,18 @@ def main() -> None:
             if args.limit is not None and processed >= args.limit:
                 break
             scan = rec["scan"]
-            frame = frames[(scan, rec["episode_id"], rec["sub_idx"])]
+            # Ground the landmark at the SAME partition (see-then-go) pose that
+            # step 07 judged visibility at — NOT the rollout end pose, where the
+            # agent stands on top of the landmark and it is trivially visible.
+            # A YOLO hit here means the landmark is genuinely visible from where
+            # the agent sets off toward it (the simple-tier gate).
+            partition_pos = np.asarray(rec["partition_pos"], dtype=np.float32)
+            frame = frames.get((scan, rec["episode_id"], rec["sub_idx"]))  # optional VLM-ctx image
             if current_scan != scan:
                 checker.load_scene(f"mp3d/{scan}/{scan}.glb")
                 current_scan = scan
 
-            obs = checker.render_observation(
-                np.asarray(frame["position"], dtype=np.float32),
-                float(frame["heading"]),
-            )
+            obs = checker.render_observation(partition_pos, 0.0)
             rgb = obs.get("rgb")
             sem = obs.get("semantic")
             if rgb is None or sem is None:
@@ -433,7 +436,7 @@ def main() -> None:
             # Optional VLM fallback when YOLO finds nothing usable.
             if grounding is None and args.enable_vlm_fallback and client is not None:
                 image_paths = [rgb_path]
-                rel_path = frame.get("rel_path")
+                rel_path = frame.get("rel_path") if frame else None
                 if rel_path:
                     rollout_frame = run_dir / "rollout_viz" / scan / rel_path
                     if rollout_frame.exists():

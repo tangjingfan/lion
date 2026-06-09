@@ -420,6 +420,9 @@ def collect_from_survivors(
                     "coarse_label": coarse_label or None,
                     "semantic_labels": labels,
                     "previous_target_instance_ids": rec.get("target_instance_ids") or [],
+                    # Partition (see-then-go) pose from step 07 — detection
+                    # grounds the landmark here, not at the rollout end pose.
+                    "partition_pos": rec.get("partition_pos"),
                 })
                 break
     return records

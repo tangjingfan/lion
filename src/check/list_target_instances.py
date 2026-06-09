@@ -349,6 +349,12 @@ def main() -> None:
                         "pixel_count":        int((visibility_result or {}).get("pixel_count") or 0),
                         "pixel_fraction":     float((visibility_result or {}).get("pixel_fraction") or 0.0),
                         "candidates":         candidates,
+                        # Partition (see-then-go) pose this annotation was
+                        # evaluated at. Persisted so detection rescue (step 09)
+                        # grounds the landmark at the SAME pose, not the
+                        # sub-path end pose. None when unresolvable.
+                        "partition_pos":      ([float(x) for x in pos]
+                                               if pos is not None else None),
                         # Split fields: visibility decides whether the
                         # landmark is reachable from this pose at all;
                         # uniqueness is a bool only when visible, else

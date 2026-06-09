@@ -149,8 +149,10 @@ def _apply_to_target_instances(
                     rec["rescued"]            = True
                     # Update visibility/uniqueness to reflect the
                     # post-rescue state — same split schema as a normal
-                    # step 07/08 record. By construction YOLO landed on
-                    # a single MP3D instance, so uniqueness=True.
+                    # step 07/08 record. Detection now grounds at the
+                    # partition (see-then-go) pose, so a hit means the
+                    # landmark is genuinely visible there; uniqueness=True
+                    # since YOLO landed on a single MP3D instance.
                     rec["visibility"]         = "visible"
                     rec["uniqueness"]         = True
                     rec["visibility_status"]  = "visible"
