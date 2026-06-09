@@ -3,8 +3,9 @@
 > 中文版见 [readme_zh.md](readme_zh.md).
 
 Landmark-RxR rollout + dataset-curation pipeline adapted from LION-Bench.
-Habitat-Lab's `rgbds_agent` provides `rgb`, `depth`, and `semantic`
-observations.
+Habitat-Lab's `rgbds_agent` provides `rgb` and `semantic` observations
+(equirectangular); depth is disabled (the `depth_sensor` is stripped at
+runtime).
 
 This README walks through the five core stages end-to-end:
 
@@ -50,9 +51,9 @@ selection used throughout this README is:
 
 ```bash
 SEL=configs/selection/val_unseen/one_scene_partial.yaml
-# split: val_unseen, expname: partial_one_scene
+# split: val_unseen, expname: one_scene_partial
 # scan : X7HyMhZNoso, ~19 instructions
-# → results/val_unseen_partial_one_scene/
+# → results/val_unseen_one_scene_partial/
 ```
 
 Inside `results/{run}/`, the pipeline's canonical state is a single
@@ -61,13 +62,14 @@ so a single experiment touching multiple scenes keeps their artifacts
 isolated; `filters/` (drop diagnostics + audit) stays cross-scan:
 
 ```
-results/val_unseen_partial_one_scene/
+results/val_unseen_one_scene_partial/
   survivor.yaml            # canonical post-pipeline state (each
                            # filter stage overwrites this in place)
   rollout_viz/X7HyMhZNoso/...
   rewrite/X7HyMhZNoso/...
   scene_categories/X7HyMhZNoso/...
   partition/X7HyMhZNoso/...
+  partition_obs/X7HyMhZNoso/...   # partition-pose RGB+semantic panoramas
   target_instances/X7HyMhZNoso/...
   filters/                 # per-stage NN_*_dropped.yaml + audit.json
 ```
@@ -83,10 +85,10 @@ bash scripts/rollout.sh \
     --selection "$SEL"
 ```
 
-Writes to `results/val_unseen_partial_one_scene/rollout_viz/X7HyMhZNoso/`:
+Writes to `results/val_unseen_one_scene_partial/rollout_viz/X7HyMhZNoso/`:
 
 ```
-{instruction_id}/{sub_idx:03d}/{step:04d}.png    # RGB+depth+semantic frames
+{instruction_id}/{sub_idx:03d}/{step:04d}.png    # RGB + semantic frames (equirectangular; depth disabled) + info panel
 frames.jsonl                                      # per-frame metadata
 results.json                                      # per-episode metrics + agg
 replay.yaml                                       # exact instruction_ids run
@@ -228,8 +230,16 @@ Produces:
 
 ```
 partition/X7HyMhZNoso/{instruction_id}/partition.json
-partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png
+partition/X7HyMhZNoso/{instruction_id}/{instruction_id}.png   # only with --save_png
+partition_obs/X7HyMhZNoso/{ep_id}/sub_{idx:03d}.png           # RGB+semantic panorama at the partition pose
 ```
+
+`partition.json` is always written; the per-instruction PNG only with
+`--save_png` (off by default, and `04_partition.sh` does not pass it).
+Step 04 also runs `render_partition_obs.py`, which renders an
+RGB + semantic panorama at every `(ep, sub)` partition pose into
+`partition_obs/{scan}/{ep_id}/sub_{idx:03d}.png` — one per surviving
+sub-path past cross-floor.
 
 After step 04, `survivor.yaml` holds the sub-path-level survivor set
 used as input by target instance selection.
@@ -387,11 +397,16 @@ Reads:
 - `partition/X7HyMhZNoso/{ep}/partition.json`
 
 Writes:
-- `target_instances/X7HyMhZNoso/target_instances.json` — per (ep, sub):
+- `target_instances/X7HyMhZNoso/target_instances.json` — a dict with
+  top-level keys `split`, `scan`, `expname`, `run_name`,
+  `min_pixel_count`, `source_keep`, and `annotations`. The per-(ep, sub)
+  records live under `annotations[ep_id][sub_idx]`, each carrying:
   `landmark`, `semantic_labels`, `matched_category`,
   `matched_categories`, `matched_by`, `pixel_count`, `pixel_fraction`,
   `candidates[]` (each `{id, category, n_pixels}` plus `viz_path` and
-  `viz_visible_pixels` when viz is on), and two split fields:
+  `viz_visible_pixels` when viz is on), `partition_pos` (the
+  see-then-go pose this annotation was evaluated at; `null` when
+  unresolvable), and two split fields:
   - `visibility` ∈ {`visible`, `not_visible`, `no_match`,
     `partition_pos_unresolvable`} — whether the landmark is reachable
     from this pose at all.
@@ -402,7 +417,10 @@ Writes:
 - `target_instances/viz/X7HyMhZNoso/{ep}/sub_{NNN}_cand_{IID}.png` —
   one RGB + semantic panorama per visible candidate, rendered at the
   partition point with a target-mask strip below. **Default off** —
-  pass `--save_viz` to opt in.
+  pass `--save_viz` to opt in. With `--save_viz`, the clean
+  partition-pose RGB + semantic panoramas are also written once per
+  sub-path under `target_instances/partition_obs/X7HyMhZNoso/{ep}/
+  sub_{NNN}_{rgb,semantic}.png`.
 
 ### 3d. Choose the target instance
 
@@ -425,14 +443,15 @@ Rule:
 bash scripts/08_get_potential_instance.sh --exp "$SEL"
 # list every multi-candidate sub-path with its chosen id + distances:
 bash scripts/08_get_potential_instance.sh --exp "$SEL" --print_multi
+# viz is OFF by default; opt in with --save_viz:
+bash scripts/08_get_potential_instance.sh --exp "$SEL" --save_viz
 # lighter .house-only debug image instead of the Habitat render:
-bash scripts/08_get_potential_instance.sh --exp "$SEL" --viz_mode topdown
-# skip viz altogether:
-bash scripts/08_get_potential_instance.sh --exp "$SEL" --no_save_viz
+bash scripts/08_get_potential_instance.sh --exp "$SEL" --save_viz --viz_mode topdown
 ```
 
 Writes:
-- `target_instances/X7HyMhZNoso/target_instances.json` — per (ep, sub):
+- `target_instances/X7HyMhZNoso/target_instances.json` — extends each
+  per-(ep, sub) record under `annotations[ep_id][sub_idx]` with:
   `target_instance_ids`, `status` (one of the verdicts above),
   `selection_distance` (chosen instance's distance to the sub-path
   end, metres), `candidate_distances` (per-id distance map), plus the
@@ -444,6 +463,10 @@ Writes:
 - `target_instances/viz_last_frame_instance/X7HyMhZNoso/{ep}/sub_{NNN}_id_{IID}.png`
   — when Habitat rendering is available, an RGB + semantic panorama at
   the sub-path end node with the chosen instance highlighted.
+
+The three `viz_*` outputs above are **off by default** — pass
+`--save_viz` to opt in. (`--no_save_viz` is a deprecated no-op kept for
+backward compatibility.)
 
 ## 4. Detection rescue (step 09)
 
@@ -678,7 +701,7 @@ CLI:
 
 - `--no_vlm_refine` — skip the VLM step (collective candidates always
   fall through; only `fine` candidates can win).
-- `--vlm_model` — default `gemini-2.5-pro`.
+- `--vlm_model` — default `gemini-2.5-flash`.
 - `--vlm_api_key` — falls back to `GEMINI_API_KEY` env var. With no
   key configured, VLM silently disables itself and pipeline runs as
   if `--no_vlm_refine` was set.

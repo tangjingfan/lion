@@ -7,7 +7,7 @@
 #
 # Usage:
 #   GEMINI_API_KEY=... bash scripts/build_landmark_referrable.sh
-#   bash scripts/build_landmark_referrable.sh --model gemini-2.0-flash
+#   bash scripts/build_landmark_referrable.sh --model gemini-2.5-flash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
