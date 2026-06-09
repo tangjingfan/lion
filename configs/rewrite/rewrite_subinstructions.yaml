@@ -6,10 +6,12 @@
 # VLM fallback). Thinking models bill internal reasoning against `max_tokens`,
 # so `max_tokens` is set generously below to leave room for both the thinking
 # trace and the actual JSON output.
-model: gemini-3-flash-preview
+model: gemini-2.5-flash
 
-# Parallel API workers
-max_workers: 4
+# Parallel API workers. Forced to 1 (sequential) because the local proxy
+# intermittently drops connections and concurrent rewrite calls then hang on
+# recovery. Sequential is reliable; bump back up on a stable network.
+max_workers: 1
 
 # Sampling temperature (lower = more deterministic)
 temperature: 0.2
@@ -20,9 +22,11 @@ temperature: 0.2
 # this budget, so we keep it well above what the raw JSON would need.
 max_tokens: 32768
 
-# Retry settings for failed API calls
+# Manual retry loop on top of the SDK's built-in connection-level retries
+# (see make_client). The SDK recovers connection errors on a fresh connection;
+# this outer loop just adds a few more attempts with exponential backoff.
 max_retries: 3
-retry_delay: 2.0   # seconds between retries
+retry_delay: 2.0   # base seconds; backoff is retry_delay * 2**(attempt-1)
 
 # Keep the LLM's own ambiguity flag in the rewrite JSON for downstream audit.
 # Stage 2 decides what to drop using explicit landmark/referrability rules.

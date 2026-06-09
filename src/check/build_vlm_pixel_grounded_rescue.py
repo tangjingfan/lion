@@ -289,7 +289,7 @@ def main() -> None:
     resolve_exp(cfg, args.exp, apply_current=True)
 
     rw_cfg = _load_yaml(Path(args.rewrite_config)) if Path(args.rewrite_config).exists() else {}
-    vlm_model = args.model or rw_cfg.get("model", "gemini-3-flash-preview")
+    vlm_model = args.model or rw_cfg.get("model", "gemini-2.5-flash")
     temperature = float(rw_cfg.get("temperature", 0.1))
     max_tokens = min(int(rw_cfg.get("max_tokens", 2048)), 4096)
     max_retries = int(rw_cfg.get("max_retries", 3))

@@ -23,7 +23,7 @@ API
     client = make_client(api_key)
     all_results, mapping = run_rewriter(
         episodes, client, scenes_dir,
-        model="gemini-3-flash-preview", max_workers=4,
+        model="gemini-2.5-flash", max_workers=4,
     )
 """
 
@@ -47,23 +47,37 @@ from src.dataset.landmark_rxr import LandmarkRxREpisode
 def make_client(
     api_key: str,
     *,
-    timeout: float = 120.0,
+    timeout: float = 180.0,
     connect_timeout: float = 10.0,
-    max_retries: int = 0,
+    max_retries: int = 4,
 ):
     """Return an OpenAI client pointed at Gemini's OpenAI-compatible endpoint.
 
-    ``timeout`` caps each HTTP request (default 120 s read/write vs the SDK's
-    600 s default) so a hung local proxy can't stall a whole stage for minutes.
-    ``max_retries=0`` disables the SDK's internal retries so the callers' manual
-    retry loops (with backoff) are the single source of retry truth.
+    ``connect_timeout`` (default 10 s) fails fast when the local proxy is dead,
+    and ``timeout`` caps each request's read/write (default 180 s vs the SDK's
+    600 s default) so a genuinely hung response can't stall a stage for minutes.
+
+    ``max_retries`` is the SDK's *built-in* retry count and MUST stay > 0: the
+    SDK recovers from connection errors / timeouts by retrying on a FRESH
+    connection. Disabling it (max_retries=0) makes the callers' manual retry
+    loops reuse a poisoned pooled connection, which then hangs indefinitely.
+
+    Keep-alive is disabled (``max_keepalive_connections=0``): the local proxy
+    intermittently drops idle connections, and reusing such a poisoned pooled
+    connection hangs forever (the read timeout does not fire). A fresh
+    connection per request sidesteps that failure mode entirely.
     """
     import httpx
     from openai import OpenAI
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(timeout, connect=connect_timeout),
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=20),
+        trust_env=True,  # honour HTTP(S)_PROXY from the environment
+    )
     return OpenAI(
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        timeout=httpx.Timeout(timeout, connect=connect_timeout),
+        http_client=http_client,
         max_retries=max_retries,
     )
 
@@ -577,7 +591,7 @@ def run_rewriter(
     episodes: List[LandmarkRxREpisode],
     client,
     scenes_dir: str,
-    model: str = "gemini-3-flash-preview",
+    model: str = "gemini-2.5-flash",
     max_workers: int = 4,
     temperature: float = 0.2,
     max_tokens: int = 4096,

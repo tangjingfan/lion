@@ -115,7 +115,7 @@ def main() -> None:
     if rw_path.exists():
         with open(rw_path) as f:
             rw_cfg = yaml.safe_load(f) or {}
-    model       = rw_cfg.get("model",        "gemini-3-flash-preview")
+    model       = rw_cfg.get("model",        "gemini-2.5-flash")
     temperature = float(rw_cfg.get("temperature", 0.1))
     # The remap response is one big JSON object covering every mention
     # in the scene, so it benefits from a much larger output window than

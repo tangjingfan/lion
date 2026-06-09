@@ -127,9 +127,9 @@ def main() -> None:
                          "lighting / ...). With this flag, collective "
                          "candidates are skipped and only `fine`-tier "
                          "categories from the referrability table can win.")
-    ap.add_argument("--vlm_model", default="gemini-3-flash-preview",
+    ap.add_argument("--vlm_model", default="gemini-2.5-flash",
                     help="VLM model used to name collective instances "
-                         "(default gemini-3-flash-preview).")
+                         "(default gemini-2.5-flash).")
     ap.add_argument("--vlm_api_key", default=None,
                     help="API key for the VLM; defaults to GEMINI_API_KEY env.")
     args = ap.parse_args()
